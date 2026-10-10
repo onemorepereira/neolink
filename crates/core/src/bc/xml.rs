@@ -466,22 +466,37 @@ pub struct RfAlarmCfg {
     #[serde(rename = "@version")]
     pub version: String,
     /// Rfid
-    #[serde(rename = "rfID")]
-    pub rf_id: u8,
+    ///
+    /// Absent on newer firmwares (e.g. Argus PT Ultra v3.0.0)
+    #[serde(rename = "rfID", skip_serializing_if = "Option::is_none")]
+    pub rf_id: Option<u8>,
     /// PIR status
     pub enable: u8,
     /// PIR sensitivity
-    pub sensitivity: u8,
+    ///
+    /// Absent on newer firmwares
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<u8>,
     /// PIR sensivalue
     pub sensiValue: u8,
     /// reduce False alarm boolean
     pub reduceFalseAlarm: u8,
+    /// Seen on newer firmwares, purpose unknown
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u32>,
+    /// Seen on newer firmwares, purpose unknown
+    #[serde(rename = "maxAlarmTime", skip_serializing_if = "Option::is_none")]
+    pub max_alarm_time: Option<u32>,
     /// XML time block for all week days
-    #[serde(rename = "timeBlockList")]
-    pub time_block_list: TimeBlockList,
+    ///
+    /// Absent on newer firmwares
+    #[serde(rename = "timeBlockList", skip_serializing_if = "Option::is_none")]
+    pub time_block_list: Option<TimeBlockList>,
     /// The alarm handle to attach to this Rf
-    #[serde(rename = "alarmHandle")]
-    pub alarm_handle: AlarmHandle,
+    ///
+    /// Absent on newer firmwares
+    #[serde(rename = "alarmHandle", skip_serializing_if = "Option::is_none")]
+    pub alarm_handle: Option<AlarmHandle>,
 }
 
 /// TimeBlockList XML
@@ -1963,4 +1978,42 @@ fn test_empty_floodlight_status_list() {
         } if version == "1.1" && floodlight_status_list.is_empty() => {}
         _ => panic!(),
     }
+}
+
+#[test]
+// Argus PT Ultra firmware v3.0.0.5808_26041006 omits rfID, sensitivity,
+// timeBlockList and alarmHandle and adds interval and maxAlarmTime
+fn test_rfalarmcfg_v3_firmware() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <rfAlarmCfg version="1.1">
+        <enable>1</enable>
+        <sensiValue>21</sensiValue>
+        <reduceFalseAlarm>0</reduceFalseAlarm>
+        <interval>0</interval>
+        <maxAlarmTime>0</maxAlarmTime>
+        </rfAlarmCfg>
+        </body>
+        "#
+    );
+    let b = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let cfg = b.rf_alarm_cfg.as_ref().expect("rfAlarmCfg should parse");
+    assert_eq!(cfg.enable, 1);
+    assert_eq!(cfg.sensiValue, 21);
+    assert_eq!(cfg.rf_id, None);
+    assert_eq!(cfg.time_block_list, None);
+    assert_eq!(cfg.interval, Some(0));
+    assert_eq!(cfg.max_alarm_time, Some(0));
+
+    // pir_set does a read-modify-write so we must not invent fields the camera did not send
+    let ser = String::from_utf8(b.serialize(vec![]).unwrap()).unwrap();
+    assert!(!ser.contains("rfID"), "{}", ser);
+    assert!(!ser.contains("timeBlockList"), "{}", ser);
+    assert!(!ser.contains("alarmHandle"), "{}", ser);
+    assert!(!ser.contains("sensitivity"), "{}", ser);
+    assert!(ser.contains("<interval>0</interval>"), "{}", ser);
+    assert!(ser.contains("<maxAlarmTime>0</maxAlarmTime>"), "{}", ser);
+    assert_eq!(BcXml::try_parse(ser.as_bytes()).unwrap(), b);
 }

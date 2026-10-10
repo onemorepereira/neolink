@@ -198,21 +198,21 @@ fn bc_modern_msg<'a>(
                         .unwrap_or("Not Text".to_string())
                 );
             }
-            let xml = BcXml::try_parse(processed_payload_buf.as_slice()).map_err(|e| {
-                error!("header.msg_id: {}", header.msg_id);
-                error!(
-                    "processed_payload_buf: {:X?}::{:?}",
-                    processed_payload_buf,
-                    std::str::from_utf8(&processed_payload_buf)
-                );
-                log::error!("e: {:?}", e);
-                Err::Error(make_error(
-                    buf,
-                    "Unable to parse Payload XML",
-                    ErrorKind::MapRes,
-                ))
-            })?;
-            payload = Some(BcPayloads::BcXml(xml));
+            // The payload length comes from the header so the stream stays in sync even if
+            // the XML is not understood. Drop the payload instead of failing the whole
+            // connection, the requester will then get an UnintelligibleReply
+            payload = match BcXml::try_parse(processed_payload_buf.as_slice()) {
+                Ok(xml) => Some(BcPayloads::BcXml(xml)),
+                Err(e) => {
+                    warn!(
+                        "Unable to parse payload XML of msg_id {}: {:?}: {:?}",
+                        header.msg_id,
+                        e,
+                        String::from_utf8_lossy(&processed_payload_buf)
+                    );
+                    None
+                }
+            };
         }
     } else {
         payload = None;
@@ -576,5 +576,73 @@ mod tests {
                     }),
             }) if version == "1.1" && stream_type == Some("mainStream".to_string())
         );
+    }
+
+    #[test]
+    // An XML payload we cannot parse (e.g. from a newer firmware) must only drop that
+    // payload and not the stream, the following message should still be decoded
+    fn test_unparseable_xml_keeps_stream() {
+        init();
+
+        let context = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
+        let meta = |msg_num| BcMeta {
+            msg_id: MSG_ID_GET_PIR_ALARM,
+            channel_id: 0,
+            msg_num,
+            response_code: 200,
+            stream_type: 0,
+            class: 0x0000,
+        };
+        let bad = Bc::new(
+            meta(7),
+            None,
+            Some(BcPayloads::Binary(
+                b"<?xml version=\"1.0\" ?><body><rfAlarmCfg><unclosed></body>".to_vec(),
+            )),
+        );
+        let good = Bc::new_from_xml(
+            meta(8),
+            BcXml {
+                rf_alarm_cfg: Some(RfAlarmCfg {
+                    version: "1.1".to_string(),
+                    enable: 1,
+                    sensiValue: 21,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let mut buf = bad
+            .serialize(vec![], &EncryptionProtocol::Unencrypted)
+            .unwrap();
+        buf = good
+            .serialize(buf, &EncryptionProtocol::Unencrypted)
+            .unwrap();
+        let mut buf = BytesMut::from(&buf[..]);
+
+        let msg1 = Bc::deserialize(&context, &mut buf).unwrap();
+        assert_matches!(
+            msg1,
+            Bc {
+                meta: BcMeta { msg_num: 7, .. },
+                body: BcBody::ModernMsg(ModernMsg { payload: None, .. }),
+            }
+        );
+        let msg2 = Bc::deserialize(&context, &mut buf).unwrap();
+        assert_matches!(
+            msg2,
+            Bc {
+                meta: BcMeta { msg_num: 8, .. },
+                body: BcBody::ModernMsg(ModernMsg {
+                    payload: Some(BcPayloads::BcXml(BcXml {
+                        rf_alarm_cfg: Some(RfAlarmCfg { enable: 1, .. }),
+                        ..
+                    })),
+                    ..
+                }),
+            }
+        );
+        assert!(buf.is_empty());
     }
 }
