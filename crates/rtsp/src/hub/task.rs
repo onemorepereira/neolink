@@ -580,12 +580,12 @@ impl Hub {
                 let now = self.now_us();
                 let restamp = match (&self.cached_irap, self.codec, self.sessions.get(&id)) {
                     (Some(nals), Some(codec), Some(s)) if !s.playing => {
-                        // Late joiner: the last released IRAP, at the last wire time, plus
-                        // EOS where needed; live video then flows from the next IRAP (DESIGN §4.6)
-                        let wire = self
-                            .wire
-                            .last_out_wire()
-                            .unwrap_or_else(|| self.wire.virtual_now(now));
+                        // Late joiner: the last released IRAP, at the wire time of now, plus
+                        // EOS where needed; live video then flows from the next IRAP (DESIGN
+                        // §4.6). Not at the last wire time: after an idle spell that is long
+                        // past, and the client's first frame and SR would lie behind the
+                        // live media by the idle time
+                        let wire = self.wire.virtual_now(now);
                         let mut nals = nals.clone();
                         nals.extend(eos_nal(codec, &nals));
                         Some(self.video_frame(codec, &nals, true, wire))
@@ -794,6 +794,14 @@ impl Hub {
         // Frames of a stopped source are never released
         self.pacer.clear();
         self.bridge.reset();
+    }
+
+    /// One frame interval plus 1 ms, from the stream's fps (else 15 fps)
+    fn frame_gap_us(&self) -> u64 {
+        match self.learner.current().and_then(|d| d.framerate) {
+            Some(fps) if fps > 0 => 1_000_000 / fps as u64 + 1_000,
+            _ => crate::hub::wire::RELATCH_MIN_GAP_US,
+        }
     }
 
     /// After learning (which needs the in-band copies): strip, keep or inject
@@ -1031,8 +1039,10 @@ impl Hub {
                             continue; // live video resumes from an IRAP only
                         }
                         self.bridge.live(now);
+                        self.wire.min_gap_us = self.frame_gap_us();
                         self.wire.relatch(item.media_us, now);
                     } else if item.discontinuity {
+                        self.wire.min_gap_us = self.frame_gap_us();
                         self.wire.relatch(item.media_us, now);
                     }
                     self.last_video_wall = Some(now);
@@ -1786,6 +1796,47 @@ mod tests {
             source.running.load(Ordering::SeqCst),
             1,
             "the learning start ended"
+        );
+    }
+
+    /// A cold PLAY after an idle minute: the cached IRAP goes out at the wire time of now,
+    /// not at the last wire time from a minute ago, so live media follows it closely
+    #[tokio::test(start_paused = true)]
+    async fn test_cold_play_restamp_is_current() {
+        let source = Arc::new(FixtureSource::new(
+            fixture("plain_h265.bcm"),
+            1.0,
+            Some(false),
+        ));
+        source.looping.store(true, Ordering::SeqCst);
+        let mut cfg = HubConfig::new("test");
+        cfg.battery = false;
+        let h = spawn(cfg, source.clone());
+        h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        drain(&mut sub, 4).await;
+        h.unsubscribe(1).await;
+        drop(sub);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            source.running.load(Ordering::SeqCst),
+            0,
+            "stopped after linger"
+        );
+        let mut sub = h.subscribe(2).await.unwrap();
+        h.play(2).await;
+        let frames = drain(&mut sub, 5).await;
+        let video: Vec<u64> = frames
+            .iter()
+            .filter(|f| f.track == Track::Video)
+            .map(|f| f.wire_us)
+            .collect();
+        assert!(video.len() > 10);
+        let step = video[1] - video[0];
+        assert!(
+            step < 3_000_000,
+            "first frame then live: {step} µs on the wire"
         );
     }
 

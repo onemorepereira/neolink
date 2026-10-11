@@ -11,10 +11,24 @@ W=${E2E_WORK:-$(mktemp -d)}
 mkdir -p "$W"
 F=$ROOT/fixtures/synth
 PORT=${PORT:-48664}
-"$BIN/xtask" rtsp-serve --bind 127.0.0.1:$PORT --main "$F/plain_h265.bcm" --sub "$F/plain_h264.bcm" \
-  --loop --ready-file "$W/ready" > "$W/server.log" 2>&1 &
-SRV=$!
-i=0; until [ -e "$W/ready" ] || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
+FAKE=""
+if [ "${SERVER:-rtsp-serve}" = neolink ]; then
+  # Gate 4: `neolink rtsp` on the native backend against `xtask fakecam`
+  "$BIN/xtask" fakecam --addr-file "$W/fake" --stats "$W/fakestats.json" \
+    --main "$F/plain_h265.bcm" --sub "$F/plain_h264.bcm" > "$W/fake.log" 2>&1 &
+  FAKE=$!
+  i=0; until [ -s "$W/fake" ] || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
+  printf 'bind = "127.0.0.1"\nbind_port = %s\nsnapshot_port = 0\nrtsp_backend = "native"\n[[cameras]]\nname = "argus"\nusername = "admin"\npassword = "fakepass"\naddress = "%s"\n' \
+    $PORT "$(cat "$W/fake")" > "$W/neolink.toml"
+  NEOLINK_STATE_DIR="$W/state" RUST_LOG=info "$BIN/neolink" rtsp --config "$W/neolink.toml" > "$W/server.log" 2>&1 &
+  SRV=$!
+  i=0; until grep -q "Starting RTSP Server (native)" "$W/server.log" || [ $i -gt 300 ]; do sleep 0.1; i=$((i+1)); done
+else
+  "$BIN/xtask" rtsp-serve --bind 127.0.0.1:$PORT --main "$F/plain_h265.bcm" --sub "$F/plain_h264.bcm" \
+    --loop --ready-file "$W/ready" > "$W/server.log" 2>&1 &
+  SRV=$!
+  i=0; until [ -e "$W/ready" ] || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
+fi
 FAILS=0
 for secs in ${AV_SECS:-5 60}; do
   for path in main sub; do
@@ -32,5 +46,6 @@ for secs in ${AV_SECS:-5 60}; do
   done
 done
 kill -TERM $SRV; wait $SRV
+[ -n "$FAKE" ] && { kill -TERM $FAKE; wait $FAKE; }
 [ $FAILS = 0 ] && echo "ALL PASSED" || echo "$FAILS FAILED"
 exit $FAILS

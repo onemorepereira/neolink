@@ -10,6 +10,11 @@
 use crate::codec::annexb::VideoCodec;
 use bytes::Bytes;
 
+/// Default smallest step between the last frame sent and the first one after a re-latch:
+/// one frame at 15 fps plus 1 ms. Less collides in clients that count in frame ticks
+/// (ffmpeg: "non monotonically increasing dts"); the Hub sets it from the stream's fps.
+pub const RELATCH_MIN_GAP_US: u64 = 67_667;
+
 /// A track of a stream
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Track {
@@ -39,6 +44,8 @@ pub struct WireClock {
     last_out: Option<(u64, u64)>, // (wire, wall)
     last_track: [Option<u64>; 2],
     pub stats: WireStats,
+    /// The smallest step after a re-latch (about one frame interval)
+    pub min_gap_us: u64,
 }
 
 impl Default for WireClock {
@@ -54,6 +61,7 @@ impl WireClock {
             last_out: None,
             last_track: [None, None],
             stats: WireStats::default(),
+            min_gap_us: RELATCH_MIN_GAP_US,
         }
     }
 
@@ -73,9 +81,11 @@ impl WireClock {
     /// Re-latch so that `media_us` is on the wire at `virtual_now` (resume after a bridge,
     /// or a MediaClock discontinuity)
     pub fn relatch(&mut self, media_us: u64, now_wall: u64) {
-        // Strictly after anything already sent, even when no wall time has passed
+        // After anything already sent by a real step, even when no wall time has passed
+        // (frames released together after a camera reconnect): a 1 µs step is below the
+        // 90 kHz RTP tick and the millisecond of recordings (duplicate DTS in ffmpeg)
         let v = match self.last_out {
-            Some((wire, _)) => self.virtual_now(now_wall).max(wire + 1),
+            Some((wire, _)) => self.virtual_now(now_wall).max(wire + self.min_gap_us),
             None => self.virtual_now(now_wall),
         };
         self.offset = Some(v as i64 - media_us as i64);
@@ -438,6 +448,19 @@ mod tests {
             .filter(|o| matches!(o, BridgeOut::Audio { .. }))
             .count();
         assert!((15..=16).contains(&n), "{n}");
+    }
+
+    /// A re-latch with no wall time passed (frames released together after a reconnect)
+    /// still moves the wire clock by a real step: no duplicate timestamps downstream
+    #[test]
+    fn test_relatch_without_wall_time_steps_forward() {
+        let mut clock = WireClock::new();
+        let a = clock.stamp(Track::Video, 1_000_000, 5_000_000);
+        // A discontinuity at the same wall instant, with media time going back
+        clock.relatch(10_000, 5_000_000);
+        let b = clock.stamp(Track::Video, 10_000, 5_000_000);
+        assert!(b >= a + RELATCH_MIN_GAP_US, "{a} then {b}");
+        assert_eq!(clock.stats.guard_engaged, 0);
     }
 
     #[test]

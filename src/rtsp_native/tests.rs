@@ -463,3 +463,38 @@ fn test_hub_config_battery_unknown_is_battery() {
     .unwrap();
     assert!(!hub_config(&c, StreamKind::Main, 1400).battery);
 }
+
+/// A7 (neolink part): main and sub at once share the camera connection; ending the main
+/// session doesn't stop the sub stream
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_main_and_sub_together() {
+    let cam = fake().await;
+    let port = free_port();
+    let r = run(config(&cam, port, "native-a7", "", "", "")).await;
+    let main_url = format!("rtsp://127.0.0.1:{port}/native-a7/main");
+    let sub_url = format!("rtsp://127.0.0.1:{port}/native-a7/sub");
+    let mut m = Client::connect(r.port).await;
+    m.play(&main_url, &[]).await;
+    let mut s = Client::connect(r.port).await;
+    s.play(&sub_url, &[]).await;
+    // A late joiner's live video starts at the next IRAP (up to one 2 s GOP)
+    assert!(m.collect(Duration::from_secs(4)).await);
+    assert!(s.collect(Duration::from_secs(1)).await);
+    assert!(
+        m.video() > 20 && s.video() > 10,
+        "main {} sub {}",
+        m.video(),
+        s.video()
+    );
+    assert_eq!(m.request("TEARDOWN", &main_url, &[]).await.status, 200);
+    // Past the main Hub's linger: its camera stream stops; sub goes on
+    wait_stats(&cam, 15, |st| st.video_stops >= 1).await;
+    let before = s.video();
+    assert!(s.collect(Duration::from_secs(3)).await);
+    assert!(
+        s.video() > before + 20,
+        "sub stalled after main stopped: {before} -> {}",
+        s.video()
+    );
+    assert_eq!(cam.stats().video_starts, 2, "one camera stream per kind");
+}

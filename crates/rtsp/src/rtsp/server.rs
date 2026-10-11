@@ -472,6 +472,12 @@ impl Conn {
 
     async fn teardown(&mut self) {
         if let Some(s) = self.session.take() {
+            log::info!(
+                "rtsp: {} stopped {}/{}",
+                self.ip,
+                s.target.camera,
+                s.target.kind.name()
+            );
             s.hub.unsubscribe(s.num).await;
             s.closed.cancel();
         }
@@ -811,6 +817,14 @@ impl Conn {
         }
         let _ = done_rx.await;
         s.playing = true;
+        // SPEC R28: who plays what
+        log::info!(
+            "rtsp: {} playing {}/{} as {}",
+            self.ip,
+            s.target.camera,
+            s.target.kind.name(),
+            s.user.as_deref().unwrap_or("anonymous")
+        );
         Ok(None)
     }
 
@@ -972,7 +986,15 @@ async fn writer(
             Either::Ctl(WriterCmd::Close) => break,
             Either::Frame(f) => {
                 last_wire_seen = last_wire_seen.max(f.wire_us);
-                send_frame(&mut w, &mut tracks, &f, stall).await
+                let first = tracks.get(&f.track).is_some_and(|t| t.state.packets == 0);
+                let mut r = send_frame(&mut w, &mut tracks, &f, stall).await;
+                // A track's first packets get an SR at once: until one arrives, live555
+                // (VLC) can't place them on the shared clock, and a track that starts
+                // later (audio after a late joiner's IRAP) would wait for the next tick
+                if r.is_ok() && first && rtcp_sr {
+                    r = send_sr(&mut w, &tracks, last_wire_seen, ntp_epoch_us, stall).await;
+                }
+                r
             }
             Either::Sr => {
                 if rtcp_sr {

@@ -44,15 +44,21 @@ jobs:
           cp fixtures/synth/SHA256SUMS /tmp/SHA256SUMS
           cargo xtask mkfixture --standard --out fixtures/synth --check /tmp/SHA256SUMS
       - name: cargo test
-        run: cargo test --workspace
+        run: |
+          cargo test --workspace
+          cargo test --workspace --features native-rtsp
       - name: A/V sync through the native server (A16, 5 s, 60 s and 15 min)
-        run: E2E_WORK=$(mktemp -d) AV_SECS="5 60 900" tests/e2e/avsync.sh
+        run: |
+          E2E_WORK=$(mktemp -d) AV_SECS="5 60 900" tests/e2e/avsync.sh
+          E2E_WORK=$(mktemp -d) AV_SECS="5 60 900" SERVER=neolink tests/e2e/avsync.sh
       - name: retina client tests (A6, A17, A22; own lockfile, newest retina)
         run: cargo test --locked --manifest-path crates/rtsp-it/Cargo.toml
       - name: Golden structural diff, native server vs GStreamer (A19)
         run: |
-          cargo build --release -p xtask
+          cargo build --release --features native-rtsp -p neolink -p xtask
           E2E_WORK=$(mktemp -d) tests/e2e/golden-native.sh
+          # Gate 4: the same through neolink and the scripted camera
+          E2E_WORK=$(mktemp -d) SERVER=neolink tests/e2e/golden-native.sh
 
   msrv:
     name: MSRV (1.82)
@@ -68,6 +74,7 @@ jobs:
         run: |
           cargo check --locked --all-targets -p neolink_core -p neolink_rtsp -p xtask -p neolink_decoder -p mailnoti
           cargo check --locked --bin neolink --no-default-features
+          cargo check --locked --bin neolink --no-default-features --features native-rtsp
 
   clients:
     name: Client matrix (A1, A2, A2b, A4, A4b, A5, A10)
@@ -90,4 +97,4 @@ jobs:
           podman run --rm --network host -v "$PWD:/src:z" -v "$HOME/ffmpeg:/ffmpeg:ro,z" \
             -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -e PATH=/usr/local/cargo/bin:/usr/bin:/bin:/ffmpeg/bin \
             -e A5_SECS=300 -w /src neolink-clients sh -c \
-            'cargo xtask mkfixture --standard --out fixtures/synth && cargo build --release -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh'
+            'cargo xtask mkfixture --standard --out fixtures/synth && cargo build --release --features native-rtsp -p neolink -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh && E2E_WORK=$(mktemp -d) SERVER=neolink sh tests/e2e/clients.sh'
