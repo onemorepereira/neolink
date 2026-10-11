@@ -76,6 +76,9 @@ pub struct Opts {
     width: u32,
     #[arg(long, default_value_t = 360)]
     height: u32,
+    /// Video bitrate (the Argus main stream: 2400)
+    #[arg(long, default_value_t = 300)]
+    kbps: u32,
     /// First `cam_us` value
     #[arg(long)]
     cam_us_start: Option<u32>,
@@ -209,38 +212,52 @@ fn encode_video(opts: &Opts, secs: u32, width: u32, height: u32) -> Result<Vec<A
     .args(["-flags", "+bitexact", "-fflags", "+bitexact"]);
     let h265 = opts.codec == Codec::H265;
     if h265 {
-        cmd.args(["-c:v", "libx265", "-preset", "ultrafast", "-b:v", "300k"])
-            .args([
-                "-x265-params",
-                "keyint=30:min-keyint=30:scenecut=0:bframes=0:repeat-headers=1:open-gop=0:\
+        cmd.args([
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-b:v",
+            &format!("{}k", opts.kbps),
+        ])
+        .args([
+            "-x265-params",
+            "keyint=30:min-keyint=30:scenecut=0:bframes=0:repeat-headers=1:open-gop=0:\
                  pools=none:frame-threads=1:wpp=0:info=0:asm=none:log-level=error",
-            ])
-            .args(["-f", "hevc", "pipe:1"]);
+        ])
+        .args(["-f", "hevc", "pipe:1"]);
     } else {
-        cmd.args(["-c:v", "libx264", "-preset", "ultrafast", "-b:v", "300k"])
-            .args([
-                "-g",
-                "30",
-                "-keyint_min",
-                "30",
-                "-sc_threshold",
-                "0",
-                "-bf",
-                "0",
-            ])
-            .args([
-                "-threads",
-                "1",
-                "-x264-params",
-                "repeat-headers=1:cpu-independent=1",
-            ])
-            .args([
-                "-bsf:v",
-                "filter_units=remove_types=6",
-                "-f",
-                "h264",
-                "pipe:1",
-            ]);
+        cmd.args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-b:v",
+            &format!("{}k", opts.kbps),
+        ])
+        .args([
+            "-g",
+            "30",
+            "-keyint_min",
+            "30",
+            "-sc_threshold",
+            "0",
+            "-bf",
+            "0",
+        ])
+        .args([
+            "-threads",
+            "1",
+            "-x264-params",
+            "repeat-headers=1:cpu-independent=1",
+        ])
+        .args([
+            "-bsf:v",
+            "filter_units=remove_types=6",
+            "-f",
+            "h264",
+            "pipe:1",
+        ]);
     }
     let out = cmd.output().context("running ffmpeg")?;
     ensure!(

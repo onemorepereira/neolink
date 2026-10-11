@@ -47,18 +47,20 @@ jobs:
         run: |
           cargo test --workspace
           cargo test --workspace --features native-rtsp
-      - name: A/V sync through the native server (A16, 5 s, 60 s and 15 min)
-        run: |
-          E2E_WORK=$(mktemp -d) AV_SECS="5 60 900" tests/e2e/avsync.sh
-          E2E_WORK=$(mktemp -d) AV_SECS="5 60 900" SERVER=neolink tests/e2e/avsync.sh
-      - name: retina client tests (A6, A17, A22; own lockfile, newest retina)
-        run: cargo test --locked --manifest-path crates/rtsp-it/Cargo.toml
       - name: Golden structural diff, native server vs GStreamer (A19)
         run: |
           cargo build --release --features native-rtsp -p neolink -p xtask
           E2E_WORK=$(mktemp -d) tests/e2e/golden-native.sh
           # Gate 4: the same through neolink and the scripted camera
           E2E_WORK=$(mktemp -d) SERVER=neolink tests/e2e/golden-native.sh
+      - name: A/V sync through the native server (A16, 5 s, 60 s and 15 min)
+        run: |
+          E2E_WORK=$(mktemp -d) AV_SECS="5 60 900" tests/e2e/avsync.sh
+          E2E_WORK=$(mktemp -d) AV_SECS="5 60 900" SERVER=neolink tests/e2e/avsync.sh
+      - name: Frigate presets (A3, 15 min across the wrap) and bridging tolerance
+        run: E2E_WORK=$(mktemp -d) A3_SECS=900 tests/e2e/frigate.sh
+      - name: retina client tests (A6, A17, A22; own lockfile, newest retina)
+        run: cargo test --locked --manifest-path crates/rtsp-it/Cargo.toml
 
   msrv:
     name: MSRV (1.82)
@@ -98,3 +100,26 @@ jobs:
             -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -e PATH=/usr/local/cargo/bin:/usr/bin:/bin:/ffmpeg/bin \
             -e A5_SECS=300 -w /src neolink-clients sh -c \
             'cargo xtask mkfixture --standard --out fixtures/synth && cargo build --release --features native-rtsp -p neolink -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh && E2E_WORK=$(mktemp -d) SERVER=neolink sh tests/e2e/clients.sh'
+
+  container:
+    name: Native image (A13, N9)
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned ffmpeg
+        run: |
+          mkdir -p ~/ffmpeg
+          curl -sSL -o /tmp/ffmpeg.tar.xz "$FFMPEG_URL"
+          echo "$FFMPEG_SHA256  /tmp/ffmpeg.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/ffmpeg.tar.xz -C ~/ffmpeg --strip-components=1
+      - name: Images, fixtures and the scripted camera
+        run: |
+          podman build -t neolink:native -f Dockerfile.native .
+          podman build -t neolink-dev -f tests/e2e/dev/Containerfile tests/e2e/dev
+          podman volume create neolink-target
+          podman run --rm -v "$PWD:/src:z" -v neolink-target:/target -e CARGO_TARGET_DIR=/target \
+            -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -v "$HOME/ffmpeg:/ffmpeg:ro,z" -w /src neolink-dev \
+            sh -c 'cargo xtask mkfixture --standard --out fixtures/synth && cargo build --release -p xtask'
+      - name: A13 and N9
+        run: IMAGE=neolink:native FFMPEG_DIR=$HOME/ffmpeg sh tests/e2e/container-native.sh

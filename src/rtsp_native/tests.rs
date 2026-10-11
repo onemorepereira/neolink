@@ -579,3 +579,25 @@ async fn test_native_shutdown_sends_bye() {
     r.reactor.shutdown().await;
     wait_stats(&cam, 5, |s| s.logouts >= 1).await;
 }
+
+/// Clients open main and sub at once on a sleeping camera: both DESCRIBEs succeed in the
+/// same wake (the learning gate's shared-wake window), with one login
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_cold_main_and_sub_describe_together() {
+    let cam = fake().await;
+    let port = free_port();
+    let r = run(config(&cam, port, "native-cold2", "", "", "")).await;
+    let mut tasks = vec![];
+    for kind in ["main", "sub"] {
+        let url = format!("rtsp://127.0.0.1:{}/native-cold2/{}", port, kind);
+        let p = r.port;
+        tasks.push(tokio::spawn(async move {
+            let mut c = Client::connect(p).await;
+            c.request("DESCRIBE", &url, &[]).await.status
+        }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), 200);
+    }
+    assert_eq!(cam.stats().logins, 1, "one wake");
+}

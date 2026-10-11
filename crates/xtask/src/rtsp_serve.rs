@@ -43,6 +43,15 @@ pub struct Opts {
     /// Replay the fixtures forever with a continuous camera clock
     #[arg(long)]
     r#loop: bool,
+    /// Shift the camera clock so it starts this many seconds before the u32 wrap (A3)
+    #[arg(long)]
+    wrap_in: Option<u32>,
+    /// Serve no audio track (`audio = "none"`)
+    #[arg(long)]
+    no_audio: bool,
+    /// Bridge frames per second during an outage
+    #[arg(long, default_value_t = 0.2)]
+    bridge_fps: f64,
     /// Treat the camera as battery powered (learning starts rate-limited)
     #[arg(long)]
     battery: bool,
@@ -98,9 +107,23 @@ pub fn run(opts: Opts) -> Result<()> {
                 Some(opts.battery),
             ));
             source.looping.store(opts.r#loop, SeqCst);
+            if let Some(secs) = opts.wrap_in {
+                // The fixture's first camera time lands `secs` before 2^32 µs
+                let first = parse_bcm(&data)
+                    .iter()
+                    .find_map(|u| match &u.unit {
+                        neolink_rtsp::source::SourceUnit::Video { cam_us, .. } => Some(*cam_us),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let target = 0u32.wrapping_sub(secs.saturating_mul(1_000_000));
+                source.cam_offset.store(target.wrapping_sub(first), SeqCst);
+            }
             let mut cfg = HubConfig::new(&format!("{}/{}", opts.camera, kind.name()));
             cfg.battery = opts.battery;
             cfg.linger = Duration::from_secs_f64(opts.linger);
+            cfg.audio = !opts.no_audio;
+            cfg.bridge_fps = opts.bridge_fps;
             cfg.parameter_sets = match opts.parameter_sets.as_str() {
                 "strip" => ParameterSets::Strip,
                 "passthrough" => ParameterSets::Passthrough,
