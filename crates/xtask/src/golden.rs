@@ -19,7 +19,7 @@
 //!
 //! **Normalising** ([`normalize`]) replaces values that change between two recordings of
 //! the same server and camera (host:port, session ids, ssrc, seq, rtptime, ports, nonces,
-//! dates, SDP origin, npt start, packet counts) so stored transcripts are stable.
+//! dates, SDP origin and ssrc/cname, npt start, packet counts) so stored transcripts are stable.
 //!
 //! **Structural diff** ([`structural_diff`]) compares what a client depends on: methods,
 //! request paths, status codes, header presence, the shape of Transport, Session, Public,
@@ -407,6 +407,7 @@ pub fn normalize(entries: &[Entry]) -> Vec<Entry> {
             "o=$1 ID VER $2 $3 ADDR",
         ),
         (r"^a=range:npt=[0-9.]+-", "a=range:npt=T-"),
+        (r"^a=ssrc:\d+ cname:\S+", "a=ssrc:SSRC cname:CNAME"),
     ]);
     let counts = Regex::new(r"x\d+").unwrap();
     let mut out = vec![];
@@ -672,7 +673,15 @@ pub fn structural_diff(a: &[Entry], b: &[Entry]) -> Vec<String> {
     if conns(a) != conns(b) {
         out.push(format!("connections: {} vs {}", conns(a), conns(b)));
     }
-    let (ma, mb) = (msgs(a), msgs(b));
+    let (mut ma, mut mb) = (msgs(a), msgs(b));
+    // Clients often close right after sending TEARDOWN, so whether its reply was recorded
+    // is a race: compare without a final TEARDOWN reply
+    for m in [&mut ma, &mut mb] {
+        let n = m.len();
+        if n >= 2 && m[n - 1].is_response() && m[n - 2].start.starts_with("TEARDOWN ") {
+            m.pop();
+        }
+    }
     for i in 0..ma.len().max(mb.len()) {
         let label = |m: Option<&Message>| {
             m.map(|m| format!("{} {}", m.dir.mark(), m.start))
@@ -797,6 +806,17 @@ mod tests {
             .replace("Sat, 10 Oct", "Sun, 11 Oct")
             .replace("x812", "x5");
         let d = structural_diff(&parse(A).unwrap(), &parse(&b).unwrap());
+        assert!(d.is_empty(), "{:?}", d);
+    }
+
+    #[test]
+    fn test_diff_teardown_reply_optional() {
+        let with = format!(
+            "{}> TEARDOWN rtsp://h/argus/main/ RTSP/1.0\n>\n< RTSP/1.0 200 OK\n<\n",
+            A
+        );
+        let without = format!("{}> TEARDOWN rtsp://h/argus/main/ RTSP/1.0\n>\n", A);
+        let d = structural_diff(&parse(&with).unwrap(), &parse(&without).unwrap());
         assert!(d.is_empty(), "{:?}", d);
     }
 

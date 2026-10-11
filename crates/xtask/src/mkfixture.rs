@@ -11,7 +11,9 @@
 //! *scheduling size* instead of its real size (synthetic frames are tiny): IRAPs count as
 //! `irap_kb`. At each IRAP the link may also stall for up to `stall_ms`. With the defaults
 //! this reproduces the 2026-10-10 Argus capture: a ~1.9 s backlog at start, then a
-//! 0.6–1.3 s arrival gap at every IRAP followed by a catch-up burst.
+//! 0.6–1.3 s arrival gap at every IRAP followed by a catch-up burst. The `congestion`
+//! variant adds the episodes of the 2026-10-11 capture, where the link slowed down and
+//! arrivals fell up to 17 s behind before catching up.
 //!
 //! Everything, including the stalls, is deterministic: the same arguments and the same
 //! ffmpeg build give the same bytes on any x86-64 CPU, because ffmpeg and the encoders run
@@ -51,6 +53,10 @@ pub enum Variant {
     Outage,
     /// The resolution changes at the middle GOP boundary (new parameter sets)
     Reschange,
+    /// The link drops to --congestion-kbps for --congestion-s starting at the middle: the
+    /// camera buffers and arrivals fall up to ~15 s behind, then catch up (seen twice in
+    /// the 2026-10-11 10-minute capture)
+    Congestion,
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -78,6 +84,10 @@ pub struct Opts {
     prebuffer_ms: u64,
     #[arg(long, default_value_t = 4600)]
     link_kbps: u64,
+    #[arg(long, default_value_t = 20)]
+    congestion_s: u64,
+    #[arg(long, default_value_t = 800)]
+    congestion_kbps: u64,
     #[arg(long, default_value_t = 400)]
     irap_kb: u64,
     #[arg(long, default_value_t = 12)]
@@ -116,6 +126,10 @@ fn standard_set(base: &Opts) -> Vec<(&'static str, Opts)> {
         (
             "reschange_h264.bcm",
             mk(Codec::H264, Variant::Reschange, 20),
+        ),
+        (
+            "congestion_h265.bcm",
+            mk(Codec::H265, Variant::Congestion, 120),
         ),
     ]
 }
@@ -380,7 +394,12 @@ pub fn generate(opts: &Opts) -> Result<Vec<Record>> {
 
     // Arrival schedule
     let mut rng = Rng(opts.seed);
-    let bytes_per_us = opts.link_kbps as f64 * 1000.0 / 8.0 / 1e6;
+    let kbps_to_bytes_per_us = |kbps: u64| kbps as f64 * 1000.0 / 8.0 / 1e6;
+    let congested = |at_us: u64| {
+        opts.variant == Variant::Congestion
+            && at_us >= frame_us(mid_frame)
+            && at_us < frame_us(mid_frame) + opts.congestion_s * 1_000_000
+    };
     let mut last_arrival = 0u64;
     let mut out = vec![];
     for u in units.into_iter().filter(|u| !u.lost) {
@@ -406,7 +425,12 @@ pub fn generate(opts: &Opts) -> Result<Vec<Record>> {
         if u.kind == Kind::Iframe {
             depart += rng.below(opts.stall_ms * 1000);
         }
-        let arrival = depart + (sched_bytes as f64 / bytes_per_us) as u64;
+        let rate = kbps_to_bytes_per_us(if congested(depart) {
+            opts.congestion_kbps
+        } else {
+            opts.link_kbps
+        });
+        let arrival = depart + (sched_bytes as f64 / rate) as u64;
         last_arrival = arrival;
         out.push(Record {
             host_us: arrival,

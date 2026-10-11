@@ -11,6 +11,11 @@
 //! Arguments: stream (main|sub|extern), seconds, output path, and optionally a second
 //! stream to run concurrently (to check whether the camera allows it).
 //!
+//! With `NEO_RECONNECT_AFTER=<secs>` it logs out, waits, reconnects (printing how long the
+//! wake took), writes a `Restarted` record and captures `NEO_RECONNECT_SECS` (default 20)
+//! more seconds into the same file. Battery state is printed after every login and
+//! before every logout.
+//!
 //! The output is a `.bcm` fixture, see [`neolink_core::fixture`].
 
 use neolink_core::bc_protocol::{
@@ -54,13 +59,13 @@ async fn capture(
     camera: &BcCamera,
     kind: StreamKind,
     secs: u64,
-    out: Option<std::path::PathBuf>,
+    mut file: Option<&mut Fixture>,
+    start: Instant,
 ) -> Result<(), neolink_core::Error> {
     let name = format!("{:?}", kind);
-    let mut file = out.map(|p| std::io::BufWriter::new(std::fs::File::create(p).unwrap()));
     let mut stream = camera.start_video(kind, 0, false).await?;
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(secs) {
+    let began = Instant::now();
+    while began.elapsed() < Duration::from_secs(secs) {
         let media = match tokio::time::timeout(Duration::from_secs(10), stream.get_data()).await {
             Ok(r) => r??,
             Err(_) => {
@@ -166,6 +171,46 @@ async fn capture(
             .unwrap();
         }
     }
+    stream.shutdown().await
+}
+
+type Fixture = std::io::BufWriter<std::fs::File>;
+
+async fn battery(camera: &BcCamera, when: &str, start: Instant) {
+    match camera.battery_info().await {
+        Ok(b) => println!(
+            "battery {} t={:.1}s percent={} voltage={} current={} temperature={} charge={} adapter={}",
+            when,
+            start.elapsed().as_secs_f32(),
+            b.battery_percent,
+            b.voltage,
+            b.current,
+            b.temperature,
+            b.charge_status,
+            b.adapter_status
+        ),
+        Err(e) => println!("battery {} unavailable: {:?}", when, e),
+    }
+}
+
+async fn connect(options: &BcCameraOpt, start: Instant) -> Result<BcCamera, neolink_core::Error> {
+    let t = Instant::now();
+    let camera = BcCamera::new(options).await?;
+    camera.login().await?;
+    println!(
+        "connected t={:.1}s wake_and_login={:.1}s",
+        start.elapsed().as_secs_f32(),
+        t.elapsed().as_secs_f32()
+    );
+    battery(&camera, "after-login", start).await;
+    Ok(camera)
+}
+
+async fn disconnect(camera: BcCamera, start: Instant) -> Result<(), neolink_core::Error> {
+    battery(&camera, "before-logout", start).await;
+    camera.logout().await?;
+    camera.shutdown().await?;
+    println!("disconnected t={:.1}s", start.elapsed().as_secs_f32());
     Ok(())
 }
 
@@ -196,17 +241,46 @@ async fn main() -> Result<(), neolink_core::Error> {
         debug: false,
         max_discovery_retries: 10,
     };
-    let camera = BcCamera::new(&options).await?;
-    camera.login().await?;
-
+    let start = Instant::now();
+    let mut file = out.map(|p| std::io::BufWriter::new(std::fs::File::create(p).unwrap()));
+    let camera = connect(&options, start).await?;
     match second {
-        None => capture(&camera, kind, secs, out).await,
+        None => capture(&camera, kind, secs, file.as_mut(), start).await?,
         Some(second) => {
             let (a, b) = tokio::join!(
-                capture(&camera, kind, secs, out),
-                capture(&camera, second, secs, None)
+                capture(&camera, kind, secs, file.as_mut(), start),
+                capture(&camera, second, secs, None, start)
             );
-            a.and(b)
+            a.and(b)?
         }
     }
+    disconnect(camera, start).await?;
+
+    if let Ok(after) = std::env::var("NEO_RECONNECT_AFTER") {
+        let after: u64 = after.parse().expect("NEO_RECONNECT_AFTER");
+        let secs: u64 = std::env::var("NEO_RECONNECT_SECS")
+            .map(|s| s.parse().expect("NEO_RECONNECT_SECS"))
+            .unwrap_or(20);
+        tokio::time::sleep(Duration::from_secs(after)).await;
+        let camera = connect(&options, start).await?;
+        if let Some(f) = file.as_mut() {
+            Record {
+                host_us: start.elapsed().as_micros() as u64,
+                kind: Kind::Restarted,
+                h265: false,
+                cam_us: 0,
+                cam_time: 0,
+                data: vec![],
+            }
+            .write_to(f)
+            .unwrap();
+        }
+        capture(&camera, kind, secs, file.as_mut(), start).await?;
+        disconnect(camera, start).await?;
+    }
+    if let Some(f) = file.as_mut() {
+        use std::io::Write;
+        f.flush().unwrap();
+    }
+    Ok(())
 }
