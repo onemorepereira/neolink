@@ -1073,7 +1073,7 @@ async fn handle_mqtt_message(
         } => {
             let reply = match message.parse::<u64>() {
                 Ok(secs) => {
-                    if let Ok(permit) = camera.permit().await {
+                    if let Ok(permit) = camera.permit("mqtt:control/wakeup").await {
                         // This task waits for the `run_task` to send the OK then starts the countdown
                         // to drop the permit
                         let camera = camera.clone();

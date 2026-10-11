@@ -445,6 +445,7 @@ impl BcCamera {
 /// Emulate this behavior by providing a configurable mangling of the last character.
 #[derive(PartialEq, Eq)]
 enum Md5Trunc {
+    #[allow(dead_code)] // Legacy login hashing, kept for the tests
     ZeroLast,
     Truncate,
 }

@@ -6,7 +6,7 @@
 //!    Clonable interface to share amongst threadsanyhow::anyhow;
 use anyhow::Context;
 use futures::{stream::StreamExt, TryFutureExt};
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 use tokio::{
     sync::{
         mpsc::{channel as mpsc, Sender as MpscSender},
@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance, Permit,
-    UseCounter,
+    UseCounter, WakeLedger,
 };
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
@@ -37,7 +37,7 @@ pub(crate) enum NeoCamCommand {
     Disconnect(OneshotSender<()>),
     Connect(OneshotSender<()>),
     State(OneshotSender<NeoCamThreadState>),
-    GetPermit(OneshotSender<Permit>),
+    GetPermit(String, OneshotSender<Permit>),
     #[cfg(feature = "pushnoti")]
     PushNoti(OneshotSender<WatchReceiver<Option<PushNoti>>>),
     GetUid(OneshotSender<String>),
@@ -49,6 +49,7 @@ pub(crate) struct NeoCam {
     commander: MpscSender<NeoCamCommand>,
     camera_watch: WatchReceiver<Weak<BcCamera>>,
     set: JoinSet<AnyResult<()>>,
+    ledger: Arc<std::sync::Mutex<WakeLedger>>,
 }
 
 impl NeoCam {
@@ -60,11 +61,25 @@ impl NeoCam {
         let (watch_config_tx, watch_config_rx) = watch(config.clone());
         let (camera_watch_tx, camera_watch_rx) = watch(Weak::new());
         let (md_request_tx, md_request_rx) = mpsc(100);
-        let (state_tx, state_rx) = watch(NeoCamThreadState::Connected);
+        // A sleeping camera is not contacted at boot (SPEC P1)
+        let sleeps = config.sleeps();
+        if config.idle_disconnect == Some(false) && config.battery != Some(false) {
+            log::warn!(
+                "{}: idle_disconnect is off: keeps the camera awake; expect battery drain on battery cameras",
+                config.name
+            );
+        }
+        let (state_tx, state_rx) = watch(if sleeps {
+            NeoCamThreadState::Disconnected
+        } else {
+            NeoCamThreadState::Connected
+        });
         let (uid_tx, uid_rx) = watch(config.camera_uid.clone());
 
         let set = JoinSet::new();
         let users = UseCounter::new().await;
+        let users_watch = users.watch();
+        let users_reasons = users.reasons();
 
         let mut me = Self {
             cancel: CancellationToken::new(),
@@ -72,6 +87,7 @@ impl NeoCam {
             commander: commander_tx.clone(),
             camera_watch: camera_watch_rx.clone(),
             set,
+            ledger: Default::default(),
         };
 
         // This thread recieves messages from the instances
@@ -132,8 +148,8 @@ impl NeoCam {
                             NeoCamCommand::State(sender) => {
                                 let _ = sender.send(*state_tx.borrow());
                             }
-                            NeoCamCommand::GetPermit(sender) => {
-                                let _ = sender.send(users.create_activated().await?);
+                            NeoCamCommand::GetPermit(reason, sender) => {
+                                let _ = sender.send(users.create_activated_for(&reason).await?);
                             }
                             #[cfg(feature = "pushnoti")]
                             NeoCamCommand::PushNoti(sender) => {
@@ -204,7 +220,8 @@ impl NeoCam {
                     AnyResult::Ok(())
                 }
                 v = async {
-                    let version = report_instance.run_task(|cam| Box::pin(
+                    // Passive: runs on the first wake, never causes one (SPEC P10)
+                    let version = report_instance.run_passive_task(|cam| Box::pin(
                         async move {
                             Ok(cam.version().await?)
                         }
@@ -212,7 +229,7 @@ impl NeoCam {
                     log::info!("{}: Model {}", report_name, version.model.unwrap_or("Undeclared".to_string()));
                     log::info!("{}: Firmware Version {}", report_name, version.firmwareVersion);
 
-                    let stream_info = report_instance.run_task(|cam| Box::pin(
+                    let stream_info = report_instance.run_passive_task(|cam| Box::pin(
                         async move {
                             Ok(cam.get_stream_info().await?)
                         }
@@ -238,7 +255,8 @@ impl NeoCam {
                     AnyResult::Ok(())
                 },
                 v = async {
-                    let uid = uid_instance.run_task(|cam| Box::pin(async move {
+                    // Passive: runs on the first wake, never causes one (SPEC P10)
+                    let uid = uid_instance.run_passive_task(|cam| Box::pin(async move {
                         let uid = cam.uid().await?;
                         Ok(uid)
                     })).await?;
@@ -279,7 +297,7 @@ impl NeoCam {
                                     let mut pn = pn_permit_instance.push_notifications().await?;
                                     loop{
                                         prev_noti = pn.wait_for(|noti| noti != &prev_noti && noti.is_some()).await.map(|noti| noti.clone())?;
-                                        let _permit = pn_permit_instance.permit().await?;
+                                        let _permit = pn_permit_instance.permit("pushnoti").await?;
                                         sleep(Duration::from_secs(30)).await; // Push notification will wake us up for 30s
                                     }
                                 } => v,
@@ -301,7 +319,8 @@ impl NeoCam {
             });
         }
 
-        // MD permits
+        // MD permits: motion keeps the camera connected only when something consumes motion
+        // (pause.on_motion), for at most motion_hold_max_s per event (SPEC P12)
         let md_permit_instance = instance.subscribe().await?;
         let md_permit_cancel = me.cancel.clone();
         me.set.spawn(async move {
@@ -310,17 +329,31 @@ impl NeoCam {
                     AnyResult::Ok(())
                 },
                 v = async {
+                    let mut config_rx = md_permit_instance.config().await?;
                     let mut md = md_permit_instance.motion().await.with_context(|| "Unable to acquire motion watcher")?;
-                    loop{
-                        md.wait_for(|md| matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
-                        let _permit = md_permit_instance.permit().await.with_context(|| "Unuable to acquire motion permit")?;
-                        md.wait_for(|md| matches!(md, MdState::Stop(_))).await.with_context(|| "MD Watcher lost")?;
+                    loop {
+                        config_rx.wait_for(|config| config.pause.on_motion).await.map(|_| ())?;
+                        let hold_max = Duration::from_secs(config_rx.borrow().motion_hold_max_s);
+                        tokio::select! {
+                            v = config_rx.wait_for(|config| !config.pause.on_motion).map_ok(|_| ()) => { v?; continue; }
+                            v = md.wait_for(|md| matches!(md, MdState::Start(_))).map_ok(|_| ()) => { v.with_context(|| "MD Watcher lost")?; }
+                        }
+                        let _permit = md_permit_instance.permit("motion").await.with_context(|| "Unable to acquire motion permit")?;
+                        tokio::select! {
+                            _ = sleep(hold_max) => {
+                                log::info!("Motion held the camera for {hold_max:?}, releasing");
+                                // Wait for this event to end before taking a new permit
+                                md.wait_for(|md| !matches!(md, MdState::Start(_))).await.map(|_| ()).with_context(|| "MD Watcher lost")?;
+                                continue;
+                            }
+                            v = md.wait_for(|md| matches!(md, MdState::Stop(_))).map_ok(|_| ()) => { v.with_context(|| "MD Watcher lost")?; }
+                        }
                         // Try waiting for 30s
                         // If in those 30s we get motion then return to
                         // loop early to reaquire the permit
                         tokio::select!{
                             _ = sleep(Duration::from_secs(30)) => {},
-                            v = md.wait_for(|md| matches!(md, MdState::Start(_))) => {v.with_context(|| "MD Watcher lost")?;},
+                            v = md.wait_for(|md| matches!(md, MdState::Start(_))).map_ok(|_| ()) => {v.with_context(|| "MD Watcher lost")?;},
                         }
                     }
                 } => {
@@ -329,13 +362,14 @@ impl NeoCam {
             }
         });
 
-        // This thread will apply battery saving by disconnecting the camera when there are no
-        // active permits.
-        //
-        // Permits are created when a camera runs a user requested task, or when motion or push
-        // notifications are observed
+        // This thread connects the camera while permits are held and disconnects it
+        // idle_grace_s after the last one is dropped, from boot on (SPEC P1, P2). It observes
+        // the use counter without holding a permit (SPEC P10) and keeps the wake ledger
+        // (SPEC P6).
         let connect_instance = instance.subscribe().await?;
         let connect_cancel = me.cancel.clone();
+        let ledger_name = config.name.clone();
+        let ledger = me.ledger.clone();
         me.set.spawn(async move {
             tokio::select!{
                 _ = connect_cancel.cancelled() => {
@@ -343,39 +377,40 @@ impl NeoCam {
                 },
                 v = async {
                     let mut config_rx = connect_instance.config().await?;
+                    let mut users = users_watch;
                     loop {
-                        // Wait for the green light
-                        config_rx.wait_for(|config| config.idle_disconnect).await?;
-
-                        let r = tokio::select!{
-                            // Wait for red light
-                            v = config_rx.wait_for(|config| !config.idle_disconnect).map_ok(|_| ()) => {
-                                v?;
-                                connect_instance.connect().await?; // Ensure we are online now that we are not idle_disconnect
-                                AnyResult::Ok(())
-                            }
-                            // Handle disconnects when no active permits
-                            v = async {
-                                let mut permit = connect_instance.permit().await?;
-                                permit.deactivate().await?; // Watching only from here
-                                loop {
-                                    permit.aquired_users().await?;
-                                    connect_instance.connect().await?;
-                                    permit.dropped_users().await?;
-                                    // Wait 30s or if we hit another use then go back and wait again
-                                    tokio::select! {
-                                        _ = sleep(Duration::from_secs(30)) => {},
-                                        _ = permit.aquired_users() => continue,
-                                    };
-                                    connect_instance.disconnect().await?;
-                                }
-                            } => v,
-                        };
-                        if r.is_err() {
-                            break r;
+                        if !config_rx.borrow_and_update().sleeps() {
+                            connect_instance.connect().await?;
+                            ledger.lock().unwrap().wake("startup-always-on".to_string());
+                            config_rx.wait_for(|config| config.sleeps()).await.map(|_| ())?;
+                            continue;
                         }
-                    }?;
-                    AnyResult::Ok(())
+                        tokio::select! {
+                            v = config_rx.wait_for(|config| !config.sleeps()).map_ok(|_| ()) => { v?; continue; }
+                            v = users.wait_for(|n| *n > 0).map_ok(|_| ()) => { v?; }
+                        }
+                        let reason = {
+                            let reasons = users_reasons.lock().unwrap();
+                            let mut r: Vec<&str> = reasons.values().map(|s| s.as_str()).collect();
+                            r.dedup();
+                            r.join(",")
+                        };
+                        ledger.lock().unwrap().wake(reason);
+                        connect_instance.connect().await?;
+                        loop {
+                            users.wait_for(|n| *n == 0).await.map(|_| ())?;
+                            let grace = Duration::from_secs(config_rx.borrow().idle_grace_s);
+                            tokio::select! {
+                                _ = sleep(grace) => break,
+                                v = users.wait_for(|n| *n > 0).map_ok(|_| ()) => { v?; continue; }
+                            };
+                        }
+                        connect_instance.disconnect().await?;
+                        let summary = ledger.lock().unwrap().sleep();
+                        if let Some(summary) = summary {
+                            log::info!("{ledger_name}: {summary}");
+                        }
+                    }
                 } => {
                     v
                 },
@@ -391,6 +426,12 @@ impl NeoCam {
             self.commander.clone(),
             self.cancel.clone(),
         )
+    }
+
+    /// The wake ledger (SPEC P6)
+    #[allow(dead_code)]
+    pub(crate) fn ledger(&self) -> Arc<std::sync::Mutex<WakeLedger>> {
+        self.ledger.clone()
     }
 
     pub(crate) async fn update_config(&self, config: CameraConfig) -> Result<()> {

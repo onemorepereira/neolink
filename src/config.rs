@@ -216,8 +216,45 @@ pub(crate) struct CameraConfig {
     #[serde(default = "default_true", alias = "push", alias = "push_noti")]
     pub(crate) push_notifications: bool,
 
-    #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
-    pub(crate) idle_disconnect: bool,
+    /// Disconnect when idle. Unset means: yes for battery or unknown cameras (SPEC P1)
+    #[serde(
+        default,
+        alias = "idle",
+        alias = "idle_disc",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) idle_disconnect: Option<bool>,
+
+    /// Whether the camera runs on battery. Unset means unknown, which is treated as battery
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) battery: Option<bool>,
+
+    /// Seconds to stay connected after the last use (SPEC P2)
+    #[serde(default = "default_idle_grace_s")]
+    pub(crate) idle_grace_s: u64,
+
+    /// Longest time a motion event keeps the camera connected (SPEC P12)
+    #[serde(default = "default_motion_hold_max_s")]
+    pub(crate) motion_hold_max_s: u64,
+}
+
+impl CameraConfig {
+    /// The camera sleeps (is only connected on demand) unless always-on was asked for,
+    /// or it is known to be mains powered and `idle_disconnect` is unset
+    pub(crate) fn sleeps(&self) -> bool {
+        match self.idle_disconnect {
+            Some(idle) => idle,
+            None => self.battery != Some(false),
+        }
+    }
+}
+
+const fn default_idle_grace_s() -> u64 {
+    10
+}
+
+const fn default_motion_hold_max_s() -> u64 {
+    120
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]

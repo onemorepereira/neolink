@@ -1,4 +1,9 @@
 //! Used to track number of users of a service
+use std::collections::BTreeMap;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use tokio::{
     sync::{
         mpsc::{channel as mpsc, Sender as MpscSender},
@@ -10,10 +15,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{AnyResult, Result};
 
+/// Why each active permit is held, by permit id (SPEC P6, P10)
+pub(crate) type Reasons = Arc<Mutex<BTreeMap<u64, String>>>;
+
+static NEXT_PERMIT_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Counts the active users of the stream
 pub(crate) struct UseCounter {
     value: WatchReceiver<u32>,
     notifier_tx: MpscSender<bool>,
+    reasons: Reasons,
     cancel: CancellationToken,
     set: JoinSet<AnyResult<()>>,
 }
@@ -52,13 +63,20 @@ impl UseCounter {
         Self {
             value,
             notifier_tx,
+            reasons: Default::default(),
             cancel,
             set,
         }
     }
 
+    #[cfg(feature = "gstreamer")]
     pub(crate) async fn create_activated(&self) -> Result<Permit> {
-        let mut res = Permit::new(self);
+        self.create_activated_for("").await
+    }
+
+    /// An active permit, recorded with why it is held
+    pub(crate) async fn create_activated_for(&self, reason: &str) -> Result<Permit> {
+        let mut res = Permit::new(self, reason);
         res.activate().await?;
         Ok(res)
     }
@@ -66,7 +84,17 @@ impl UseCounter {
     #[cfg(feature = "gstreamer")]
     #[allow(dead_code)]
     pub(crate) async fn create_deactivated(&self) -> Result<Permit> {
-        Ok(Permit::new(self))
+        Ok(Permit::new(self, ""))
+    }
+
+    /// Observe the number of active permits without holding one (SPEC P10)
+    pub(crate) fn watch(&self) -> WatchReceiver<u32> {
+        self.value.clone()
+    }
+
+    /// The reasons of the active permits
+    pub(crate) fn reasons(&self) -> Reasons {
+        self.reasons.clone()
     }
 }
 
@@ -83,9 +111,12 @@ impl Drop for UseCounter {
 }
 
 pub(crate) struct Permit {
+    id: u64,
+    reason: String,
     is_active: bool,
     value: WatchReceiver<u32>,
     notifier: MpscSender<bool>,
+    reasons: Reasons,
 }
 
 impl Permit {
@@ -93,23 +124,33 @@ impl Permit {
     #[allow(dead_code)]
     pub(crate) fn subscribe(&self) -> Self {
         Self {
+            id: NEXT_PERMIT_ID.fetch_add(1, Ordering::Relaxed),
+            reason: self.reason.clone(),
             is_active: false,
             value: self.value.clone(),
             notifier: self.notifier.clone(),
+            reasons: self.reasons.clone(),
         }
     }
 
-    fn new(source: &UseCounter) -> Self {
+    fn new(source: &UseCounter, reason: &str) -> Self {
         Self {
+            id: NEXT_PERMIT_ID.fetch_add(1, Ordering::Relaxed),
+            reason: reason.to_string(),
             is_active: false,
             value: source.value.clone(),
             notifier: source.notifier_tx.clone(),
+            reasons: source.reasons.clone(),
         }
     }
 
     pub(crate) async fn activate(&mut self) -> Result<()> {
         if !self.is_active {
             self.is_active = true;
+            self.reasons
+                .lock()
+                .unwrap()
+                .insert(self.id, self.reason.clone());
             self.notifier.send(self.is_active).await?;
         }
         Ok(())
@@ -118,6 +159,7 @@ impl Permit {
     pub(crate) async fn deactivate(&mut self) -> Result<()> {
         if self.is_active {
             self.is_active = false;
+            self.reasons.lock().unwrap().remove(&self.id);
             self.notifier.send(self.is_active).await?;
         }
         Ok(())
@@ -145,7 +187,6 @@ impl Permit {
         Ok(())
     }
 
-    #[cfg(feature = "gstreamer")]
     #[allow(dead_code)]
     pub(crate) fn get_counter(&self) -> WatchReceiver<u32> {
         self.value.clone()
@@ -156,6 +197,7 @@ impl Drop for Permit {
     fn drop(&mut self) {
         if self.is_active {
             self.is_active = false;
+            self.reasons.lock().unwrap().remove(&self.id);
             let _gt = tokio::runtime::Handle::current().enter();
             let notifier = self.notifier.clone();
             let is_active = self.is_active;

@@ -35,29 +35,54 @@ impl NeoCamThread {
             camera_watch: camera_watch_tx,
         }
     }
-    async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<()> {
+    /// Connect, log in, and serve the camera until it fails, the config changes, or it is
+    /// released (state goes `Disconnected`). Every exit after login logs out (SPEC P13).
+    async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<Exit> {
         let name = config.name.clone();
         log::trace!("Attempting connection with config: {config:?}");
-        let camera = Arc::new(connect_and_login(config).await?);
+        // Until logged in, a release or config change just abandons the attempt
+        let mut state = self.state.clone();
+        let mut config_rec = self.config.clone();
+        config_rec.borrow_and_update();
+        let camera = tokio::select! {
+            v = connect_and_login(config) => Arc::new(v?),
+            Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
+                return Ok(Exit::Released);
+            }
+            Ok(_) = config_rec.changed() => return Ok(Exit::Released),
+        };
         log::trace!("  - Connected");
 
-        sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
-        if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
-            log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
+        // Some calls answer 400 while the camera wakes up; retry those instead of sleeping a
+        // fixed time before every use (SPEC P13)
+        for attempt in 0..3 {
+            match update_camera_time(&camera, &name, config.update_time).await {
+                Err(e) if is_busy(&e) && attempt < 2 => sleep(Duration::from_secs(1)).await,
+                Err(e) => {
+                    log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
+                    break;
+                }
+                Ok(()) => break,
+            }
         }
-        sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
 
         self.camera_watch.send_replace(Arc::downgrade(&camera));
 
         let cancel_check = self.cancel.clone();
         // Now we wait for a disconnect
-        tokio::select! {
+        let exit = tokio::select! {
             _ = cancel_check.cancelled() => {
-                AnyResult::Ok(())
+                AnyResult::Ok(Exit::Shutdown)
+            }
+            Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
+                Ok(Exit::Released)
+            }
+            Ok(_) = config_rec.changed() => {
+                Ok(Exit::Released)
             }
             v = camera.join() => {
                 v?;
-                Ok(())
+                Ok(Exit::Shutdown)
             },
             v = async {
                 let mut interval = interval(Duration::from_secs(5));
@@ -92,12 +117,10 @@ impl NeoCamThread {
                     }
                 }
             } => v,
-        }?;
-
-        let _ = camera.logout().await;
-        let _ = camera.shutdown().await;
-
-        Ok(())
+        };
+        self.camera_watch.send_replace(Weak::new());
+        release(&camera).await;
+        exit
     }
 
     // Will run and attempt to maintain the connection
@@ -105,59 +128,40 @@ impl NeoCamThread {
     // A watch sender is used to send the new camera
     // whenever it changes
     pub(crate) async fn run(&mut self) -> AnyResult<()> {
-        const MAX_BACKOFF: Duration = Duration::from_secs(5);
-        const MIN_BACKOFF: Duration = Duration::from_millis(50);
+        // SPEC P4: 1, 2, 4.. 60 s while there is demand, 5 min after 10 min offline
+        const MIN_BACKOFF: Duration = Duration::from_secs(1);
+        const MAX_BACKOFF: Duration = Duration::from_secs(60);
+        const SLOW_RETRY: Duration = Duration::from_secs(300);
+        const SLOW_AFTER: Duration = Duration::from_secs(600);
 
         let mut backoff = MIN_BACKOFF;
+        let mut failing_since: Option<Instant> = None;
 
         loop {
             self.state
                 .clone()
                 .wait_for(|state| matches!(state, NeoCamThreadState::Connected))
                 .await?;
-            let mut config_rec = self.config.clone();
-
-            let config = config_rec.borrow_and_update().clone();
+            let config = self.config.borrow().clone();
             let now = Instant::now();
             let name = config.name.clone();
 
-            let mut state = self.state.clone();
-
-            let res = tokio::select! {
-                Ok(_) = config_rec.changed() => {
-                    None
-                }
-                Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
-                    log::trace!("State changed to disconnect");
-                    None
-                }
-                v = self.run_camera(&config) => {
-                    Some(v)
-                }
-            };
+            // run_camera handles release and config changes itself so that it can log out
+            let result = self.run_camera(&config).await;
             self.camera_watch.send_replace(Weak::new());
-
-            if res.is_none() {
-                // If None go back and reload NOW
-                //
-                // This occurs if there was a config change
-                log::trace!("Config change or Manual disconnect");
-                continue;
-            }
-
-            // Else we see what the result actually was
-            let result = res.unwrap();
 
             if now.elapsed() > Duration::from_secs(60) {
                 // Command ran long enough to be considered a success
                 backoff = MIN_BACKOFF;
             }
-            if backoff > MAX_BACKOFF {
-                backoff = MAX_BACKOFF;
-            }
 
             match result {
-                Ok(()) => {
+                Ok(Exit::Released) => {
+                    backoff = MIN_BACKOFF;
+                    failing_since = None;
+                    continue;
+                }
+                Ok(Exit::Shutdown) => {
                     // Normal shutdown
                     log::trace!("Normal camera shutdown");
                     self.cancel.cancel();
@@ -176,16 +180,54 @@ impl NeoCamThread {
                         }
                         _ => {
                             // Non fatal
+                            let since = *failing_since.get_or_insert_with(Instant::now);
+                            let wait = if since.elapsed() > SLOW_AFTER {
+                                log::warn!("{name}: offline for over 10 min, retrying every 5 min");
+                                SLOW_RETRY
+                            } else {
+                                backoff
+                            };
                             log::warn!("{name}: Connection Lost: {:?}", e);
-                            log::info!("{name}: Attempt reconnect in {:?}", backoff);
-                            sleep(backoff).await;
-                            backoff *= 2;
+                            log::info!("{name}: Attempt reconnect in {:?}", wait);
+                            // Without demand there is nothing to retry for (SPEC P4)
+                            let mut state = self.state.clone();
+                            tokio::select! {
+                                _ = sleep(wait) => {},
+                                Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
+                                    failing_since = None;
+                                    backoff = MIN_BACKOFF;
+                                    continue;
+                                }
+                            }
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// How a connection ended
+enum Exit {
+    /// Neolink is shutting down
+    Shutdown,
+    /// Released (idle, or config change); connect again when needed
+    Released,
+}
+
+/// A 400 reply, which cameras send while still waking up
+fn is_busy(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<neolink_core::Error>(),
+        Some(neolink_core::Error::CameraServiceUnavailable { code: 400, .. })
+    )
+}
+
+/// Log out and close, bounded so that a dead camera can't hold us (SPEC P13)
+async fn release(camera: &BcCamera) {
+    let _ = timeout(Duration::from_secs(2), camera.logout()).await;
+    let _ = timeout(Duration::from_secs(2), camera.shutdown()).await;
 }
 
 impl Drop for NeoCamThread {

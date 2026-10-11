@@ -183,7 +183,7 @@ impl NeoInstance {
         tokio::task::spawn(
             tokio::task::spawn(async move {
                 thread_camera
-                    .run_task(move |cam| {
+                    .run_stream_task(&format!("stream:{stream:?}"), move |cam| {
                         let media_tx = media_tx.clone();
                         Box::pin(async move {
                             let mut media_stream = cam.start_video(stream, 0, strict).await?;
