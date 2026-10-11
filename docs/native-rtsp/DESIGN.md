@@ -1,7 +1,7 @@
 # Native RTSP: Design
 
-Status: **v2.1** (2026-10-10). v2 was revised after two adversarial reviews (concurrency/timing,
-traceability/integration). v2.1 applies the whole-doc-set review ("F-ds#"). Implements [SPEC.md](SPEC.md) v2.2. IDs (Rn, Nn, An) refer to
+Status: **v2.2** (2026-10-11). v2 was revised after two adversarial reviews (concurrency/timing,
+traceability/integration). v2.1 applies the whole-doc-set review ("F-ds#"); v2.2 applies the Phase 0 measurements. Implements [SPEC.md](SPEC.md) v2.3. IDs (Rn, Nn, An) refer to
 the spec; "F#" in margins refers to review findings this design answers.
 
 ## 1. Shape
@@ -212,12 +212,14 @@ The MediaClock is per Hub and lives as long as the Hub, **across Idle** (F-cc 16
 - Kept in **samples**: `audio_samples: u64`. Each AU advances it by 1024.
 - **Anchor**, at the first AU after start or after a discontinuity:
   `audio_media_us = media_us of the latest video frame + skew_estimate`. `skew_estimate`
-  starts at the value measured in PLAN 0.4 (default 0) and is persisted in desc.json.
+  starts at 0 (PLAN 0.4 measured a +8 ms median on the Argus) and is persisted in desc.json.
 - **Offset estimate**: on each video frame,
   `err = (audio position at arrival) − (video media_us at arrival)`. The estimate is the
   **median over a sliding 20 s window**. The median is used because the arrival-skew sign
   is unknown: bairelay reports video ahead, while GStreamer measured audio 1.9 s ahead.
-  Phase 0.4 measures the distribution and confirms the estimator before Phase 2.4.
+  Phase 0.4 confirmed it: on the Argus `err` spans −67…+91 ms with both signs, the 20 s
+  medians stay within 0–21 ms, and drift is −9.6 ± 11.1 ppm, so on that camera the
+  correction below never engages (SPEC §9).
 - **Correction**: when `|median| > 80 ms` (this keeps A16's 150 ms with margin), correct at
   up to 1 AU per second until `|median| < 20 ms`. Audio ahead: drop one AU. Audio behind:
   skip 1024 samples, a single RTP delta of 2048. That is the only case where an audio delta
@@ -291,6 +293,14 @@ moves therefore never show up as RTP or NTP steps (F-cc 7).
   WireClock (F-cc 32).
 - **Default `pacing_latency_ms`**: 1500 when battery or unknown, otherwise 300.
   Spec §9 Q4 decides whether mains-powered cameras burst.
+- **Congestion episodes (SPEC §9, 2026-10-11).** The Argus link sometimes slows for tens of
+  seconds; the camera buffers and arrivals fall up to 17 s behind, with no frames lost.
+  The rules above handle it without new mechanism: every late frame is an underrun, so the
+  anchor follows arrival and delivery latency grows (timestamps don't move); when the
+  catch-up burst arrives, `min_lead` exceeds `latency + GOP` and the pacer skips to the
+  newest IRAP, back to `latency`. Arrival gaps stay below the bridge threshold, so viewers
+  see late video, then one skip, and no bridge. The `congestion_h265.bcm` fixture
+  (`cargo xtask mkfixture`) reproduces it for the Phase 2.6 pacer tests.
 
 ### 4.5 WireClock and Bridge: the only source of on-wire time
 
@@ -317,8 +327,8 @@ This makes late-joiner restamps safe even during a pacer underrun.
 
 **Bridge (R21)**
 - Engages when no live video has been *released* for **3 s + latency**, measured from the
-  pacer's perspective (F-cc 6). With latency 1.5 s that is 4.5 s, so normal Argus GOP gaps
-  of 1.1–1.5 s never trigger it.
+  pacer's perspective (F-cc 6). With latency 1.5 s that is 4.5 s, so normal Argus arrival
+  gaps (p99 0.9 s, max 3.1 s over 10 min, SPEC §9) never trigger it.
 - While bridging, at `bridge_fps` (default 0.2, i.e. one IRAP every 5 s; F-ds 11):
   - `wire_ts = virtual_now` (it tracks wall time, F-cc 6).
   - The frame is the cached IRAP AU, followed by an **end-of-sequence NAL** (H.265 type 36,
@@ -756,7 +766,9 @@ backends.
 - Their last values are cached with a timestamp.
 - **Piggyback hook:** on each `Awake` transition, one battery read and one stream-info read
   run once, and one snapshot runs at the end of the wake (P5, P7), all under the existing
-  permit.
+  permit. The Argus answers the first `battery_info` after a wake with **400** (SPEC §9),
+  so the battery read retries every 2 s while the permit is held, up to 3 times, and
+  never extends the wake on its own.
 
 **Wake ledger (P6)**
 - A `Vec` ring of the last 1000 wakes per camera, in memory.

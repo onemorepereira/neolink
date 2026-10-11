@@ -1,7 +1,7 @@
 # Native RTSP: Specification
 
-Status: **v2.2** (2026-10-10). v2 was revised after two adversarial reviews (protocol/media and
-scope/security/ops); v2.1 adds amendments from the design reviews and the golden transcripts; v2.2 applies the whole-doc-set review. Companion docs: [DESIGN.md](DESIGN.md), [PLAN.md](PLAN.md).
+Status: **v2.3** (2026-10-11). v2 was revised after two adversarial reviews (protocol/media and
+scope/security/ops); v2.1 adds amendments from the design reviews and the golden transcripts; v2.2 applies the whole-doc-set review; v2.3 records the Phase 0 measurements (§9) and restates N3/N5 for the owner's hardware. Companion docs: [DESIGN.md](DESIGN.md), [PLAN.md](PLAN.md).
 
 Notation: **MUST/SHOULD** per RFC 2119. Requirement IDs are stable across revisions;
 removed IDs are not reused.
@@ -196,9 +196,9 @@ Each NFR names its measurement method; numbers are targets to confirm in PLAN ph
 |---|---|---|
 | N1 | DESCRIBE → first video RTP ≤ 2 s (camera streaming), ≤ 2 s plus wake time (camera asleep) | Log timestamps in the neolink server plus a retina test client |
 | N2 | Added latency excluding `pacing_latency_ms`: p99 ≤ 50 ms | Ingest→write histogram from the `metrics` cargo feature, from the fixture replay (log level doesn't matter: `release_max_level_debug` compiles out trace) |
-| N3 | One 4K H.265 15 fps stream to 4 TCP clients on a Pi 4: ≤ 10 % of one core, camera decryption included | `pidstat -p` over 120 s, info log level |
+| N3 | One 4K H.265 15 fps stream (2.4 Mb/s, the Argus rate) to 4 TCP clients: ≤ 5 % of one core of the CI runner (ubuntu-24.04 x86-64) from fixture replay; the Baichuan decryption cost is measured once on hardware and added. No Pi 4 is available (owner, 2026-10-10); an aarch64 QEMU run is informative only | `pidstat -p` over 120 s, info log level |
 | N4 | Process RSS growth per added client ≤ 1 MiB (frames shared, R9) | RSS with 1 vs 5 clients after 60 s |
-| N5 | 24 h soak with 2 clients on a mains-powered camera: RSS growth ≤ 10 % after the first hour; no client reconnect; no on-wire timestamp jump > 1 s outside logged rebases | ffmpeg `-c copy` logs + neolink logs |
+| N5 | 24 h soak with 2 clients: RSS growth ≤ 10 % after the first hour; no client reconnect; no on-wire timestamp jump > 1 s outside logged rebases. **Run on fixtures** (looped real capture plus the synthetic wrap/outage/congestion variants), because there is no mains-powered camera (owner, 2026-10-10); a hardware soak is deferred until one exists | ffmpeg `-c copy` logs + neolink logs |
 | N7 | Fuzzing: RTSP parser, Transport/Session/Authorization parsers, Annex-B splitter, ADTS parser. Smoke run of 60 s per target per PR; 30 min per target nightly | cargo-fuzz |
 | N9 | `podman stop` returns in < 5 s with exit code 0 | CI container test |
 
@@ -258,7 +258,7 @@ tag, not a runtime switch inside the static build.
 
 ## 9. Measured facts and open questions
 
-Measured on the Argus PT Ultra, fw v3.0.0.5808_26041006, 20 s main+sub capture, 2026-10-10:
+Measured on the Argus PT Ultra, fw v3.0.0.5808_26041006: a 20 s main+sub capture (2026-10-10) and a 570 s main capture followed by logout, 180 s idle and a 20 s reconnect (2026-10-11 08:31, morning, solar):
 
 | Question | Answer |
 |---|---|
@@ -267,10 +267,15 @@ Measured on the Argus PT Ultra, fw v3.0.0.5808_26041006, 20 s main+sub capture, 
 | Video clock | Monotonic, 66,667 µs/frame (15.00 fps); main and sub share one clock; an occasional 200 ms gap (dropped frame) on sub |
 | Info frames | Not sent |
 | Audio | AAC-LC ADTS, 16 kHz, **mono**, 1 raw block, 64 ms/frame; no timestamp |
-| Arrival jitter | Max gap between frame arrivals 1.3–1.5 s (Wi-Fi bursts); p50 22 ms |
+| Arrival jitter | 20 s capture: max gap 1.3–1.5 s (Wi-Fi bursts), p50 22 ms. 570 s capture: video inter-arrival p50 38 ms, p99 905 ms, max **3.1 s**; 64 gaps > 1 s, 11 > 1.5 s |
+| Arrival lag | Steady state: the least-delayed frames arrive 0.93 s after their camera time. **Two congestion episodes** (at 40–80 s and 240–300 s) where the lag grew to **17 s** and 7 s: the camera buffers and delivers everything late rather than dropping, then catches up in a burst. 2 % of frames are dropped by the camera (133 ms steps). Main averages 2.37 Mb/s |
+| Audio vs video (Q1) | `err` (DESIGN §4.2) median **+8 ms**, p5 −35, p95 +48, range −67…+91 ms; both signs occur. Drift **−9.6 ± 11.1 ppm** (95 %), i.e. not measurable over 10 min. Audio and video share the camera clock; `skew_estimate` defaults to 0 and the median estimator is confirmed |
+| Camera vs host clock | −9.6 ± 23.9 ppm (95 %), from the lower envelope of steady windows: < 0.15 s over a full 71.6 min `cam_us` wrap |
 | Frame sizes | Main IRAP up to 763 KB (about 550 packets), P-frames up to 359 KB; sub IRAP ≤ 139 KB |
 | Concurrency | Main + sub run concurrently on one Baichuan connection |
 | Wake path (20:22, camera asleep) | TCP 9000 refused while asleep **and stays closed while awake** (Baichuan runs over UDP on this model), so TCP 9000 is not a sleep indicator. Local UDP discovery woke the camera: 7 s from start to battery read. The camera's awake time after disconnect is **unmeasured** (open question 6). |
+| Reconnect (Q2) | Discovery + login took 0.6 s when the camera was awake (08:31), **2.0 s** 180 s after a clean logout, 7 s from overnight sleep. `cam_us` **continues** across logout and reconnect (advanced 185.6 s over 186.3 s of wall time; the difference is arrival lag), and so does `cam_time`. The **first `battery_info` right after that wake returned 400**; P7's piggyback must retry, not give up |
+| Streaming cost | 9.5 min of main: battery 55 → 54 %, 3.70 V, −0.47 to −0.52 A, `charge=none` in morning sun. The 180 s idle + 20 s reconnect cost < 1 % |
 | Exit bug | `neolink battery` logs `Connection Lost: Thread panicked` on exit (fixed in PLAN 1.5) |
 
 Golden transcripts from the GStreamer backend (2026-10-10, ffmpeg 8 client):
@@ -283,12 +288,13 @@ Golden transcripts from the GStreamer backend (2026-10-10, ffmpeg 8 client):
 | SETUP reply | `Transport: RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=XXXXXXXX;mode="PLAY"`; `Session: <16 chars>;timeout=30` |
 | PLAY reply | `RTP-Info: url=…/stream=0;seq=…;rtptime=…, url=…/stream=1;…`; `Range: npt=0.32-` |
 | Auth | Basic only. No creds / wrong / unknown user → 401; valid user not permitted → **404**; unknown path → 404 |
+| Re-record (2026-10-11, pinned ffmpeg n8.1.3, `crates/rtsp/tests/golden/gst`) | All 19 aliases recorded. A re-recording of `/argus/main` has **no structural deltas**. A stream the camera lacks (`/argus/extern`) gives **400** at DESCRIBE, not 404. One PLAY of `/argus/Main` got **503** when it followed the previous client's TEARDOWN immediately (a GStreamer media-reuse race; the next 17 opens succeeded). `neolink rtsp` exits within 4 s on SIGTERM |
 
 Still open:
 
-1. Long-run drift between the audio sample clock and the camera video clock (needs a capture of 10 min or more; it costs battery).
-2. Camera µs counter behaviour across wake-from-sleep and reconnect (reset or continue?).
+1. ~~Long-run drift between the audio sample clock and the camera video clock.~~ Not measurable over 10 min (−9.6 ± 11.1 ppm); see the table (2026-10-11).
+2. ~~Camera µs counter behaviour across reconnect.~~ It continues across a clean logout and a 180 s idle (2026-10-11). Whether it survives a deep sleep (overnight) is unconfirmed; the MediaClock treats any jump as a discontinuity anyway (DESIGN §4.2), so this no longer blocks anything.
 3. Default for `parameter_sets` (A4b, Gate 3).
 4. Is the burst pattern the same on mains power, and on wired cameras? This decides the `pacing_latency_ms` default.
 5. ~~Whether the owner allows a short capture of their camera as a CI fixture.~~ Yes (2026-10-10).
-6. How long the camera stays awake after a clean logout plus `C2D_DISC`, compared with an abrupt drop. This needs a non-waking observation method. Candidate: the battery current reported in the next wake's first reading, compared across sessions with different disconnect styles.
+6. How long the camera stays awake after a clean logout plus `C2D_DISC`, compared with an abrupt drop. Partial data (2026-10-11): 180 s after a clean logout the wake took 2.0 s, between the awake (0.6 s) and deep-sleep (7 s) figures, so the camera was likely in a light sleep. This needs a non-waking observation method. Candidate: the battery current reported in the next wake's first reading, compared across sessions with different disconnect styles.

@@ -45,17 +45,22 @@ clocks and SR.
 
 | # | Task | Output |
 |---|---|---|
-| 0.1 | ✅ Capture tool `crates/core/examples/bcmedia_dump.rs` | Done, uncommitted |
+| 0.1 | ✅ Capture tool `crates/core/examples/bcmedia_dump.rs` | Done; writes `neolink_core::fixture` records, reconnect mode, battery readings |
 | 0.2 | ✅ Argus characterisation (spec §9) | Done |
-| 0.3 | ✅ Raw golden transcripts: open + auth, main + sub, TCP + default (UDP) | Raw, in scratchpad |
-| 0.3b | **Golden tooling**: a recording TCP proxy (test utility), a normaliser, and a **structural** diff. The diff compares methods, status codes, header presence and shape, SDP attribute sets and fmtp keys. It does not compare values that depend on the source: sprop, ssrc, seq, rtptime, dates, resolution. One hardware session re-records all 19 aliases plus extern-404, open and auth, TCP and UDP, with ffmpeg pinned (see 0.8). | `tests/golden/*.txt` committed (normalised, no camera imagery) |
-| 0.4 | 10 min main capture (1 session). Measure the **arrival-skew distribution** (sign and spread) and the AU-vs-cam_us drift, estimated as the **slope of the arrival offset over time**; AU counting alone has 107 ppm resolution. Confirms the median estimator (DESIGN §4.2) | Skew histogram, drift estimate with a confidence interval, initial `skew_estimate` |
-| 0.5 | Wake/reconnect: let the camera sleep, then reconnect (the same session as 0.4, using `idle_disconnect`). Does `cam_us` reset? | Fixture `argus_reconnect.bcm` (kept locally unless 0.9 allows committing) |
-| 0.6 | Silent AAC-LC AU, mono and stereo: generate with ffmpeg, verify that ffmpeg and symphonia decode it to zeros | Bytes plus a unit test |
-| 0.7 | `xtask mkfixture` (Rust): ffmpeg lavfi testsrc2 + sine with a periodic flash/beep → Annex-B/ADTS → `.bcm` with the Argus burst schedule. Variants: wrap (start at 2³²−5 min), reset, outage, resolution change | Reproducible CI fixtures; no owner footage |
-| 0.8 | CI: `test.yml` (`cargo test --workspace`); tokio ≥ 1.39 lock bump; `rust-version = "1.82"`; **pin a static ffmpeg build** (BtbN, version recorded) for every ffmpeg-based test, because request shapes and error strings differ between ffmpeg 6 and 8 | CI green on the current tree |
-| 0.9 | Owner decisions (below): fixture permission, mains power, Windows/Blue Iris, Pi 4, distribution | Recorded here |
-| 0.10 | Confirm the NFR targets (spec §6) from 0.4 and the golden data; adjust the spec if they're unrealistic | Spec diff |
+| 0.3 | ✅ Raw golden transcripts: open + auth, main + sub, TCP + default (UDP) | Superseded by 0.3b |
+| 0.3b | ✅ **Golden tooling**: `cargo xtask golden record` (recording TCP proxy), `normalize`, and a **structural** `diff` (methods, status codes, header presence and shape, SDP attribute sets and fmtp keys; not sprop, ssrc, seq, rtptime, dates, resolution). Session 2 (2026-10-11) re-recorded all 19 aliases, extern, unknown path, UDP and five auth cases with the pinned ffmpeg | 28 files in `crates/rtsp/tests/golden/gst/` (normalised, no media), `docs/native-rtsp/golden-session.sh` |
+| 0.4 | ✅ 570 s main capture (session 1, 2026-10-11). Audio-vs-video `err` median +8 ms (p5 −35, p95 +48), drift −9.6 ± 11.1 ppm; camera vs host −9.6 ± 23.9 ppm; **new: congestion episodes with up to 17 s arrival lag** (spec §9). Median estimator confirmed; `skew_estimate` = 0 | `docs/native-rtsp/analysis/drift.py`; spec §9 |
+| 0.5 | ✅ Logout, 180 s idle, reconnect (same session): `cam_us` continues; wake 2.0 s; first battery read after wake → 400 | `argus_main_10min.bcm` (175 MB, with a `Restarted` record) kept locally, too large to commit; CI uses the synthetic variants |
+| 0.6 | ✅ Silent AAC-LC AU, mono `01 18 20 07` and stereo `21 10 04 60 8c 1c`, sample-rate independent; symphonia and ffmpeg decode them to zeros | `neolink_rtsp::codec::aac` + tests |
+| 0.7 | ✅ `cargo xtask mkfixture`: plain, wrap, reset, outage, reschange, **congestion** (added from 0.4). Deterministic and CPU-independent (ffmpeg `-cpuflags 0`, x264 `cpu-independent`, x265 `asm=none`). Deviation: wrap starts 10 s before the u32 wrap, not 5 min (configurable with `--cam-us-start`) to keep fixtures small | `fixtures/synth/SHA256SUMS`; `.bcm` files are generated, not committed |
+| 0.8 | ✅ `test.yml`: `cargo test --workspace` with the pinned static ffmpeg (BtbN `autobuild-2026-10-10-13-04`, n8.1.3, sha256-checked, cached), the fixture reproducibility check, and an MSRV 1.82 job. tokio 1.37 → 1.42.1 (the newest that keeps MSRV 1.82); `rust-version = "1.82"` on every crate | Passes in the dev container and on rust:1.82; **not yet run on GitHub** (no fork remote yet). BtbN deletes old autobuilds, so the first CI run caches the tarball |
+| 0.9 | ✅ Owner decisions (below) | Recorded |
+| 0.10 | ✅ NFRs confirmed against 0.4 and the golden data. N3 restated for the CI runner (no Pi 4), N5 runs on fixtures (no mains). N1/N2/N4 unchanged | Spec v2.3 |
+
+Hardware used: 2 sessions on 2026-10-11 (battery 55 % → 53 %). Session 2 kept the camera
+connected for 11 min instead of about 5: the script stopped neolink with SIGINT, which a
+non-interactive `sh` ignores in background jobs, so neolink kept running until it was sent
+SIGTERM by hand. The script now uses SIGTERM.
 
 **Gate 0**
 - Spec §9 Q1, Q2 and Q5 are answered.
