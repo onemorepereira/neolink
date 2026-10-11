@@ -1,0 +1,61 @@
+name: Native release artifacts
+
+# PLAN 6.1-6.4: static musl binaries of the native build (no GStreamer) for x86_64 and
+# aarch64, the license notice, and the FROM-scratch image as a tarball. Artifacts only:
+# nothing is pushed to a registry from here.
+on:
+  push:
+    tags: ["v*-native*"]
+  workflow_dispatch:
+
+jobs:
+  x86_64:
+    runs-on: ubuntu-24.04
+    container: docker.io/library/rust:1.90-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - run: apk add --no-cache musl-dev protobuf-dev perl make
+      - run: cargo build --release --locked --no-default-features --features native-rtsp
+      - run: ./target/release/neolink --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neolink-native-x86_64-linux-musl
+          path: target/release/neolink
+
+  aarch64:
+    runs-on: ubuntu-24.04
+    container: ghcr.io/rust-cross/rust-musl-cross:aarch64-musl
+    env:
+      # 64 KiB pages: kernels on Raspberry Pi 5 and many arm64 servers use them
+      JEMALLOC_SYS_WITH_LG_PAGE: "16"
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
+      - run: cargo build --release --locked --no-default-features --features native-rtsp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neolink-native-aarch64-linux-musl
+          path: target/aarch64-unknown-linux-musl/release/neolink
+
+  licenses:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install --locked cargo-about --features cli
+      - run: cargo about generate --no-default-features --features native-rtsp about.hbs -o THIRD-PARTY-LICENSES.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: third-party-licenses
+          path: THIRD-PARTY-LICENSES.txt
+
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: podman build -t neolink:native -f Dockerfile.native .
+      - run: podman run --rm neolink:native --version
+      - run: podman save -o neolink-native.tar neolink:native
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neolink-native-image
+          path: neolink-native.tar

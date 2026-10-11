@@ -249,15 +249,18 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                         let curr_config = thread_config.borrow().clone();
                         let mut config = config;
 
-                        // Fill in skipped passwords
+                        // Fill in skipped passwords, but only for the same broker and the same
+                        // camera address: a write that points elsewhere must not receive the
+                        // current secrets
                         if let (Some(mqtt), Some(curr_mqtt)) = (config.mqtt.as_mut(), curr_config.mqtt.as_ref()) {
-                            if mqtt.credentials.is_none() {
+                            let same_broker = mqtt.broker_addr == curr_mqtt.broker_addr && mqtt.port == curr_mqtt.port;
+                            if mqtt.credentials.is_none() && same_broker {
                                 mqtt.credentials = curr_mqtt.credentials.clone();
                             }
-                            if mqtt.ca.is_none() {
+                            if mqtt.ca.is_none() && same_broker {
                                 mqtt.ca = curr_mqtt.ca.clone();
                             }
-                            if mqtt.client_auth.is_none() {
+                            if mqtt.client_auth.is_none() && same_broker {
                                 mqtt.client_auth = curr_mqtt.client_auth.clone();
                             }
                         }
@@ -265,7 +268,9 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                             let name = cam.name.clone();
                             let cur_cam = curr_config.cameras.iter().find(|c| c.name == name);
                             if let Some(cur_cam) = cur_cam.as_ref() {
-                                if cam.password.is_none() {
+                                let same_camera = cam.camera_addr == cur_cam.camera_addr
+                                    && cam.camera_uid == cur_cam.camera_uid;
+                                if cam.password.is_none() && same_camera {
                                     cam.password = cur_cam.password.clone();
                                 }
                             }

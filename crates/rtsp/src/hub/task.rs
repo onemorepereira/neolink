@@ -90,13 +90,21 @@ impl LearnGate {
         Self::new(LEARN_INTERVAL, path)
     }
 
-    /// True (and taken) if no learning start ran within the interval
+    /// True (and taken) if no learning start ran within the interval. Starts within
+    /// `SHARED_WAKE` of the one that took it belong to the same wake and are allowed too:
+    /// clients open main and sub together, while the camera is still waking
     pub fn try_take(&self) -> bool {
+        const SHARED_WAKE: Duration = Duration::from_secs(30);
         let now = std::time::SystemTime::now();
         let mut last = self.last.lock().unwrap();
-        // A clock that went back counts as recent
-        if last.is_some_and(|t| now.duration_since(t).map_or(true, |d| d < self.interval)) {
-            return false;
+        if let Some(t) = *last {
+            match now.duration_since(t) {
+                Ok(d) if d < SHARED_WAKE => return true,
+                Ok(d) if d < self.interval => return false,
+                Ok(_) => {}
+                // A clock that went back counts as recent
+                Err(_) => return false,
+            }
         }
         *last = Some(now);
         if let Some(p) = &self.path {
@@ -1915,10 +1923,22 @@ mod tests {
         ));
         let g = Arc::new(LearnGate::standard(Some(path.clone())));
         assert!(g.try_take(), "the first");
-        assert!(!g.try_take(), "the second, e.g. the sub stream's");
-        // A restart reads the time back
+        assert!(g.try_take(), "the sub stream's, in the same wake");
+        // Past the shared wake, within the interval: refused, also after a restart
+        let later = LearnGate::standard(Some(path.clone()));
+        *later.last.lock().unwrap() = Some(std::time::SystemTime::now() - Duration::from_secs(60));
+        assert!(!later.try_take(), "a second wake within 10 min");
+        std::fs::write(
+            &path,
+            (std::time::SystemTime::now() - Duration::from_secs(60))
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_string(),
+        )
+        .unwrap();
         let again = LearnGate::standard(Some(path.clone()));
-        assert!(!again.try_take());
+        assert!(!again.try_take(), "after a restart");
         // ... and after the interval it is allowed
         let short = LearnGate::new(Duration::from_millis(1), Some(path.clone()));
         std::thread::sleep(std::time::Duration::from_millis(1100));

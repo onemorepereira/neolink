@@ -910,6 +910,29 @@ const PAUSE_KEYS: &[&str] = &[
     "mode",
 ];
 
+/// Settings this build can't honour, said once at startup
+pub(crate) fn warn_feature_mismatches(config: &Config) {
+    for c in &config.cameras {
+        if c.push_notifications && !cfg!(feature = "pushnoti") {
+            log::warn!(
+                "{}: push_notifications is set but this build has no push notification support \
+                 (feature pushnoti); it is ignored",
+                c.name
+            );
+        }
+        if c.pause.on_motion && c.sleeps() && !(cfg!(feature = "pushnoti") && c.push_notifications)
+        {
+            log::warn!(
+                "{}: pause.on_motion on a camera that sleeps: motion events arrive only over an \
+                 open connection, so the stream can't start on motion while it sleeps. Either \
+                 keep it connected (idle_disconnect = false, costs battery) or don't use \
+                 pause.on_motion with it",
+                c.name
+            );
+        }
+    }
+}
+
 static NATIVE_RTSP_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

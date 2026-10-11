@@ -436,6 +436,61 @@ Defects this found, all fixed:
 - **Fresh-machine test** (1 hardware session): download the binary, write a config, run
   it, connect Frigate's preset command line. No other install steps.
 
+**Status (2026-10-11), Phases 5 and 6, fixture and CI parts** (`feature/native-rtsp-p5`):
+- **5.1 A3:** Frigate 0.14's preset-rtsp-generic (record segments + 5 fps detect) and
+  preset-rtsp-restream for 15 min across the u32 wrap: no reconnect, 0 errors, 90 of 90
+  segments (`tests/e2e/frigate.sh`). One ffmpeg startup note is tolerated: under
+  `-use_wallclock_as_timestamps`, "Non-monotonic DTS; previous: 0, current: 0". The
+  GStreamer backend doesn't trigger it; it should be re-checked on hardware.
+- **5.2:** a 60 s stall at `bridge_fps` 0.2, with and without audio, doesn't trip Frigate's
+  5 s `-timeout`.
+- **5.5:** nightly workflow: fuzz for 30 min per target, A3 and A16 for 90 min, soak 5 h.
+  The 24 h soak needs a self-hosted runner (`SOAK_SECS=86400`).
+- **5.6:** `tests/e2e/soak.sh` (neolink + scripted camera, two clients, RSS ≤ +10 %).
+- **5.7:** N3: 1.98 % of one core for 4K H.265 (3.3 Mb/s) to 4 clients; N4: 58 KiB per added
+  client (x86_64). No Pi or arm64 host is available.
+- **6.1:** static musl builds:
+  - x86_64 static-PIE, 14 MB; runs in a scratch image;
+  - aarch64 static, 11.6 MB, with jemalloc 64 KiB pages; built, not run (no arm64 host).
+- **6.2:** `Dockerfile.native` (`FROM scratch`, 14.3 MB, root by default, `PUID`/`PGID`, state
+  volume, CA certs).
+- **6.3:** `tests/e2e/container-native.sh`: A13 plays; `PUID` drops; N9: `podman stop` with a
+  client playing takes 297 ms, exit 0, one logout. In CI.
+- **6.4:** `cargo-about` notice (76 entries). No bairelay code was ported (line overlap is
+  only generic idioms), so no provenance headers are needed.
+- **6.5:** `docs/native-rtsp/NATIVE.md` covers install, config keys, battery behaviour, the
+  §5 deltas, Docker changes, the `irap.bin` privacy note, the MQTT trust boundary and
+  bridged media. The README links to it.
+- **Gate 5 full-branch red-team review:** 11 findings, all fixed:
+  - **Docs and builds:**
+    - push notifications are compiled out of the native build. They would also break
+      local-only networking, so NATIVE.md now says plainly that `pause.on_motion` can't
+      start a sleeping camera, and neolink warns at startup;
+    - hot reload is via MQTT only, and the docs now say so;
+    - the snapshot endpoint and the remaining keys are documented;
+    - the Frigate claim is corrected;
+    - the leftover env vars are removed.
+  - **Security:**
+    - an unreadable MQTT CA is now an error, not a fall back to plaintext;
+    - an MQTT config write that points a camera or the broker elsewhere no longer
+      receives the current secrets;
+    - the snapshot endpoint paces failed logins.
+  - **Power:**
+    - with `PUID`, the state directory is handed to that user first and checked for
+      writes;
+    - the learning gate shares one wake for 30 s, so main and sub opened together both
+      succeed. The 1 h soak caught this: sub got 503 on a cold start.
+  - **Tests:**
+    - `perf.sh` N4 uses a fresh server;
+    - the soak also asserts one camera login and no neolink errors.
+  - The soak (600 s after the fix; 1 h before it, main only) passes with 1 login, no
+    errors and RSS ±4 %.
+- **Pending (hardware):** see `docs/native-rtsp/HARDWARE-SESSIONS.md`:
+  - Gate 4's four sessions;
+  - 5.1 and 5.3;
+  - the Phase 1 10-cycle check;
+  - the Gate 6 fresh-machine test.
+
 ## Phase 7: default flip (later, spec §8)
 
 Not scheduled.
