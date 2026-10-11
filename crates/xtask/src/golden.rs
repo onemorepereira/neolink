@@ -117,6 +117,23 @@ impl Splitter {
         self.buf.extend_from_slice(data);
         let mut out = String::new();
         loop {
+            // Resync: skip keep-alive CRLFs, and after a framing error skip to the next
+            // '$' or something that looks like a start line
+            let skip = self
+                .buf
+                .iter()
+                .position(|&b| b == b'$' || b.is_ascii_uppercase())
+                .unwrap_or(self.buf.len());
+            if skip > 0 {
+                let junk = self.buf[..skip].iter().any(|b| !b"\r\n".contains(b));
+                if junk {
+                    let _ = writeln!(out, "# desync: skipped {} bytes", skip);
+                }
+                self.buf.drain(..skip);
+                if self.buf.is_empty() {
+                    break;
+                }
+            }
             if self.buf.first() == Some(&b'$') {
                 if self.buf.len() < 4 {
                     break;
@@ -189,8 +206,18 @@ fn describe_packet(p: &[u8]) -> String {
 }
 
 /// Run the recording proxy until `max_conns` connections have closed
-pub fn record(listen: &str, upstream: &str, out: &std::path::Path, max_conns: usize) -> Result<()> {
+pub fn record(
+    listen: &str,
+    upstream: &str,
+    out: &std::path::Path,
+    max_conns: usize,
+    ready_file: Option<&std::path::Path>,
+) -> Result<()> {
     let listener = TcpListener::bind(listen).with_context(|| format!("binding {}", listen))?;
+    if let Some(ready) = ready_file {
+        // Scripts wait for this instead of sleeping before they start the client
+        std::fs::write(ready, b"")?;
+    }
     let file = Arc::new(Mutex::new(std::fs::File::create(out)?));
     eprintln!(
         "golden proxy {} -> {}, writing {}",
@@ -409,7 +436,9 @@ pub fn normalize(entries: &[Entry]) -> Vec<Entry> {
         (r"^a=range:npt=[0-9.]+-", "a=range:npt=T-"),
         (r"^a=ssrc:\d+ cname:\S+", "a=ssrc:SSRC cname:CNAME"),
     ]);
-    let counts = Regex::new(r"x\d+").unwrap();
+    let counts = Regex::new(r"x(\d+)\+?").unwrap();
+    // Session ids become SESSION1, SESSION2.. by first appearance, so consistency survives
+    let mut sessions: Vec<String> = vec![];
     let mut out = vec![];
     for e in entries {
         out.push(match e {
@@ -421,7 +450,24 @@ pub fn normalize(entries: &[Entry]) -> Vec<Entry> {
                     *v = match lk.as_str() {
                         "date" | "expires" => "DATE".to_string(),
                         "content-length" => "N".to_string(),
-                        "session" => session.replace(v, "SESSION").to_string(),
+                        "session" => {
+                            let id = session.find(v).map(|m| m.as_str()).unwrap_or("");
+                            if id.starts_with("SESSION") {
+                                // Already normalised
+                                v.clone()
+                            } else {
+                                let n = match sessions.iter().position(|s| s == id) {
+                                    Some(n) => n + 1,
+                                    None => {
+                                        sessions.push(id.to_string());
+                                        sessions.len()
+                                    }
+                                };
+                                session
+                                    .replace(v, format!("SESSION{}", n).as_str())
+                                    .to_string()
+                            }
+                        }
                         "user-agent" => user_agent.replace(v, "$1").to_string(),
                         _ => headers.apply(&everywhere.apply(v)),
                     };
@@ -434,10 +480,32 @@ pub fn normalize(entries: &[Entry]) -> Vec<Entry> {
                 Entry::Msg(m)
             }
             Entry::Comment(c) if c.contains("closed:") => {
-                Entry::Comment(counts.replace_all(c, "xN").to_string())
+                // Keep whether media flowed: a few packets (RTCP, a stall) vs a stream
+                let c =
+                    counts.replace_all(c, |caps: &regex::Captures| match caps[1].parse::<u64>() {
+                        Ok(n) if n < 10 => "x1".to_string(),
+                        Ok(_) => "x10+".to_string(),
+                        Err(_) => caps[0].to_string(),
+                    });
+                Entry::Comment(c.to_string())
             }
             other => other.clone(),
         });
+    }
+    // Interleaved first-seen lines arrive in a racy order: sort each contiguous run
+    let mut i = 0;
+    while i < out.len() {
+        let mut j = i;
+        while j < out.len() && matches!(out[j], Entry::Interleaved { .. }) {
+            j += 1;
+        }
+        if j > i + 1 {
+            out[i..j].sort_by_key(|e| match e {
+                Entry::Interleaved { dir, channel, desc } => (*dir, *channel, desc.clone()),
+                _ => unreachable!(),
+            });
+        }
+        i = j.max(i + 1);
     }
     out
 }
@@ -461,12 +529,15 @@ fn shape(m: &Message) -> BTreeMap<String, String> {
             .unwrap_or_else(|| url.to_string())
     };
     if m.is_response() {
-        let code = m.start.split_whitespace().nth(1).unwrap_or("").to_string();
-        s.insert("status".into(), code);
+        let mut parts = m.start.splitn(3, ' ');
+        s.insert("version".into(), parts.next().unwrap_or("").to_string());
+        s.insert("status".into(), parts.next().unwrap_or("").to_string());
+        s.insert("reason".into(), parts.next().unwrap_or("").to_string());
     } else {
         let mut parts = m.start.split_whitespace();
         s.insert("method".into(), parts.next().unwrap_or("").to_string());
         s.insert("path".into(), path(parts.next().unwrap_or("")));
+        s.insert("version".into(), parts.next().unwrap_or("").to_string());
     }
     let names: BTreeSet<String> = m
         .headers
@@ -504,7 +575,8 @@ fn shape(m: &Message) -> BTreeMap<String, String> {
                     .skip(1)
                     .find_map(|p| p.trim().strip_prefix("timeout="))
                     .unwrap_or("-");
-                s.insert("session".into(), format!("timeout={}", timeout));
+                let id = v.split(';').next().unwrap_or("").trim();
+                s.insert("session".into(), format!("{} timeout={}", id, timeout));
             }
             "public" => {
                 let set: BTreeSet<String> = v.split(',').map(|x| x.trim().to_string()).collect();
@@ -578,6 +650,7 @@ fn sdp_shape(body: &[String], s: &mut BTreeMap<String, String>) {
     let mut section = "sdp.session".to_string();
     let mut attrs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut media_n = 0;
+    let mut media_pts: Vec<String> = vec![];
     for line in body {
         let Some((t, v)) = line.split_once('=') else {
             continue;
@@ -587,6 +660,7 @@ fn sdp_shape(body: &[String], s: &mut BTreeMap<String, String>) {
                 let f: Vec<&str> = v.split_whitespace().collect();
                 section = format!("sdp.m{}", media_n);
                 media_n += 1;
+                media_pts = f[3.min(f.len())..].iter().map(|p| p.to_string()).collect();
                 s.insert(
                     format!("{}.m", section),
                     format!(
@@ -608,12 +682,20 @@ fn sdp_shape(body: &[String], s: &mut BTreeMap<String, String>) {
                         s.insert(format!("{}.control", section), val.to_string());
                     }
                     "rtpmap" => {
-                        // Encoding name and clock rate; channels depend on the source
-                        let enc = val.split_whitespace().nth(1).unwrap_or("");
-                        let mut p = enc.split('/');
-                        let name = p.next().unwrap_or("").to_ascii_uppercase();
+                        let mut f = val.split_whitespace();
+                        let pt = f.next().unwrap_or("");
+                        let mut p = f.next().unwrap_or("").split('/');
+                        let enc = p.next().unwrap_or("").to_ascii_uppercase();
                         let rate = p.next().unwrap_or("");
-                        s.insert(format!("{}.rtpmap", section), format!("{}/{}", name, rate));
+                        let channels = p.next().unwrap_or("1");
+                        s.insert(
+                            format!("{}.rtpmap", section),
+                            format!("{}/{}/{}", enc, rate, channels),
+                        );
+                        s.insert(
+                            format!("{}.rtpmap-pt-in-m", section),
+                            media_pts.iter().any(|p| p == pt).to_string(),
+                        );
                     }
                     "fmtp" => {
                         let keys: BTreeSet<String> = val
@@ -626,6 +708,28 @@ fn sdp_shape(body: &[String], s: &mut BTreeMap<String, String>) {
                             .filter(|k| !k.is_empty())
                             .collect();
                         s.insert(format!("{}.fmtp", section), join(keys));
+                        // Values that define the payload format (not the source's sprop,
+                        // profile or config)
+                        const VALUE_KEYS: &[&str] = &[
+                            "packetization-mode",
+                            "mode",
+                            "sizelength",
+                            "indexlength",
+                            "indexdeltalength",
+                            "streamtype",
+                            "level-asymmetry-allowed",
+                        ];
+                        let values: BTreeSet<String> = val
+                            .split_once(' ')
+                            .map(|(_, p)| p)
+                            .unwrap_or("")
+                            .split(';')
+                            .filter_map(|kv| kv.split_once('='))
+                            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim()))
+                            .filter(|(k, _)| VALUE_KEYS.contains(&k.as_str()))
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect();
+                        s.insert(format!("{}.fmtp-values", section), join(values));
                     }
                     _ => {}
                 }
@@ -649,7 +753,10 @@ fn join<I: IntoIterator<Item = String>>(i: I) -> String {
 }
 
 /// Structural differences between two transcripts, empty when they match
+///
+/// Both are normalised first (normalising is idempotent).
 pub fn structural_diff(a: &[Entry], b: &[Entry]) -> Vec<String> {
+    let (a, b) = (&normalize(a)[..], &normalize(b)[..]);
     let msgs = |e: &[Entry]| -> Vec<Message> {
         e.iter()
             .filter_map(|e| match e {
@@ -675,11 +782,38 @@ pub fn structural_diff(a: &[Entry], b: &[Entry]) -> Vec<String> {
     }
     let (mut ma, mut mb) = (msgs(a), msgs(b));
     // Clients often close right after sending TEARDOWN, so whether its reply was recorded
-    // is a race: compare without a final TEARDOWN reply
-    for m in [&mut ma, &mut mb] {
+    // is a race: when only one side has a final TEARDOWN reply, drop it
+    let ends_with_reply = |m: &[Message]| {
         let n = m.len();
-        if n >= 2 && m[n - 1].is_response() && m[n - 2].start.starts_with("TEARDOWN ") {
-            m.pop();
+        n >= 2 && m[n - 1].is_response() && m[n - 2].start.starts_with("TEARDOWN ")
+    };
+    match (ends_with_reply(&ma), ends_with_reply(&mb)) {
+        (true, false) => {
+            ma.pop();
+        }
+        (false, true) => {
+            mb.pop();
+        }
+        _ => {}
+    }
+    // Every response must echo the CSeq of the request before it
+    for (name, m) in [("first", &ma), ("second", &mb)] {
+        let mut last_cseq = None;
+        for (i, msg) in m.iter().enumerate() {
+            let cseq = msg.header("cseq").map(|c| c.to_string());
+            if msg.is_response() {
+                if cseq != last_cseq {
+                    out.push(format!(
+                        "msg {} in {}: CSeq {:?} does not echo the request's {:?}",
+                        i + 1,
+                        name,
+                        cseq,
+                        last_cseq
+                    ));
+                }
+            } else {
+                last_cseq = cseq;
+            }
         }
     }
     for i in 0..ma.len().max(mb.len()) {
@@ -706,6 +840,17 @@ pub fn structural_diff(a: &[Entry], b: &[Entry]) -> Vec<String> {
             }
             (x, y) => out.push(format!("msg {}: {} vs {}", i + 1, label(x), label(y))),
         }
+    }
+    let closes = |e: &[Entry]| -> Vec<String> {
+        e.iter()
+            .filter_map(|e| match e {
+                Entry::Comment(c) if c.contains("closed:") => Some(c.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    if closes(a) != closes(b) {
+        out.push(format!("media flow: {:?} vs {:?}", closes(a), closes(b)));
     }
     let (ia, ib) = (interleaved(a), interleaved(b));
     for x in ia.difference(&ib) {
@@ -787,8 +932,8 @@ mod tests {
         assert!(n.contains("< Date: DATE\n"));
         assert!(n.contains("<| o=- ID VER IN IP4 ADDR\n"));
         assert!(n.contains("ssrc=SSRC;mode"));
-        assert!(n.contains("< Session: SESSION;timeout=30\n"));
-        assert!(n.contains("# conn 1 closed: < $0 xN"));
+        assert!(n.contains("< Session: SESSION1;timeout=30\n"));
+        assert!(n.contains("# conn 1 closed: < $0 x10+"));
         // Source-dependent values are kept in the stored file
         assert!(n.contains("sprop-parameter-sets=Z0,aO"));
         // Idempotent
@@ -804,7 +949,7 @@ mod tests {
             .replace("Z0,aO", "QQ,RR")
             .replace("640029", "42e01f")
             .replace("Sat, 10 Oct", "Sun, 11 Oct")
-            .replace("x812", "x5");
+            .replace("x812", "x50");
         let d = structural_diff(&parse(A).unwrap(), &parse(&b).unwrap());
         assert!(d.is_empty(), "{:?}", d);
     }
@@ -834,6 +979,19 @@ mod tests {
             ),
             ("H264/90000", "H265/90000", "rtpmap"),
             ("< $0 rtp pt=96", "< $0 rtp pt=97", "interleaved"),
+            (
+                "packetization-mode=1",
+                "packetization-mode=0",
+                "fmtp-values",
+            ),
+            ("< CSeq: 3", "< CSeq: 99", "echo"),
+            (
+                "< RTSP/1.0 200 OK\n< CSeq: 2",
+                "< RTSP/2.0 200 OK\n< CSeq: 2",
+                "version",
+            ),
+            ("RTP/AVP 96", "RTP/AVP 97", "rtpmap-pt-in-m"),
+            ("x812", "x3", "media flow"),
             (";mode=\"PLAY\"", "", "transport"),
         ];
         for (from, to, expect) in cases {

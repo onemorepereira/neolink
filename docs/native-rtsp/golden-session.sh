@@ -10,8 +10,10 @@ X=/target/release/xtask
 N=/target/release/neolink
 umask 077
 # Configs derived from the owner's config (password stays local)
-sed 's/^bind = .*/bind = "127.0.0.1"\nbind_port = 8554/' /cfg/argus.toml > $WORK/open.toml
-awk '/^\[\[cameras\]\]/{print "[[users]]\nname = \"alice\"\npass = \"alicepw\"\n[[users]]\nname = \"bob\"\npass = \"bobpw\"\n"} {print} END{print "permitted_users = [\"alice\"]"}' $WORK/open.toml > $WORK/auth.toml
+# Drop any bind settings and put ours first, so they can't land inside a table
+{ printf 'bind = "127.0.0.1"\nbind_port = 8554\n'; grep -v '^bind' /cfg/argus.toml; } > $WORK/open.toml
+# Users go before the first [[cameras]]; permitted_users goes right after it
+awk '/^\[\[cameras\]\]/ && !done {print "[[users]]\nname = \"alice\"\npass = \"alicepw\"\n[[users]]\nname = \"bob\"\npass = \"bobpw\"\n"; print; print "permitted_users = [\"alice\"]"; done=1; next} {print}' $WORK/open.toml > $WORK/auth.toml
 
 start_neolink() {
   RUST_LOG=info $N rtsp --config "$1" > $WORK/neolink_$2.log 2>&1 &
@@ -27,9 +29,10 @@ start_neolink() {
 # name url-path transport [creds]
 rec() {
   name=$1; path=$2; transport=$3; creds=${4:-}
-  $X golden record --listen 127.0.0.1:8555 --upstream 127.0.0.1:8554 --out $OUT/$name.txt 2>/dev/null &
+  rm -f $WORK/proxy.ready
+  $X golden record --listen 127.0.0.1:8555 --upstream 127.0.0.1:8554 --out $OUT/$name.txt --ready-file $WORK/proxy.ready 2>/dev/null &
   PX=$!
-  sleep 0.3
+  i=0; until [ -e $WORK/proxy.ready ]; do i=$((i+1)); [ $i -gt 100 ] && { echo "proxy not ready"; exit 1; }; sleep 0.1; done
   if [ "$transport" = tcp ]; then T="-rtsp_transport tcp"; else T=""; fi
   timeout 30 ffmpeg -v error -nostdin $T -i "rtsp://${creds}127.0.0.1:8555$path" -t 4 -f null - > $OUT/$name.ffmpeg.log 2>&1
   echo "$name: ffmpeg exit $? ($(head -c 200 $OUT/$name.ffmpeg.log | tr '\n' ' '))"

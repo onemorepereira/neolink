@@ -33,6 +33,9 @@ enum GoldenCmd {
         /// Exit after this many client connections have closed
         #[arg(long, default_value_t = 1)]
         conns: usize,
+        /// Create this file once listening
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
     },
     /// Normalise a recorded transcript (in place unless --out is given)
     Normalize {
@@ -57,7 +60,8 @@ fn main() -> anyhow::Result<()> {
             upstream,
             out,
             conns,
-        }) => golden::record(&listen, &upstream, &out, conns),
+            ready_file,
+        }) => golden::record(&listen, &upstream, &out, conns, ready_file.as_deref()),
         Cmd::Golden(GoldenCmd::Normalize { input, out }) => {
             let n = golden::render(&golden::normalize(&read(&input)?));
             std::fs::write(out.unwrap_or(input), n)?;

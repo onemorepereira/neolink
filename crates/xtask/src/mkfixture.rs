@@ -53,9 +53,10 @@ pub enum Variant {
     Outage,
     /// The resolution changes at the middle GOP boundary (new parameter sets)
     Reschange,
-    /// The link drops to --congestion-kbps for --congestion-s starting at the middle: the
-    /// camera buffers and arrivals fall up to ~15 s behind, then catch up (seen twice in
-    /// the 2026-10-11 10-minute capture)
+    /// The link drops to --congestion-kbps for --congestion-s (host time) from the middle:
+    /// the camera buffers and arrivals fall ~14 s behind, then catch up, like the 17 s and
+    /// 7 s episodes of the 2026-10-11 10-minute capture. The rate is chosen per unit when
+    /// it departs
     Congestion,
 }
 
@@ -340,7 +341,13 @@ pub fn generate(opts: &Opts) -> Result<Vec<Record>> {
     } else {
         encode_video(opts, secs, opts.width, opts.height)?
     };
-    let audio = encode_audio(opts, secs)?;
+    // The aac encoder's first AU holds its 1024 priming samples: drop it so that AU j
+    // starts at media time j × 64 ms, and stop with the video
+    let audio: Vec<Vec<u8>> = encode_audio(opts, secs)?
+        .into_iter()
+        .skip(1)
+        .take((secs as u64 * 1_000_000 / AUDIO_AU_US) as usize)
+        .collect();
 
     let cam_us_start = opts.cam_us_start.unwrap_or(match opts.variant {
         Variant::Wrap => u32::MAX - 10_000_000 + 1,
@@ -349,6 +356,10 @@ pub fn generate(opts: &Opts) -> Result<Vec<Record>> {
     let frame_us = |i: usize| (i as u64 * 1_000_000) / FPS as u64;
     // Outage: media in [mid, resume) is lost; resume is the next GOP boundary
     let resume_frame = mid_frame + ((opts.outage_s * FPS) as usize).div_ceil(GOP) * GOP;
+    ensure!(
+        opts.variant != Variant::Outage || resume_frame < gops * GOP,
+        "the outage ends after the media: use a longer --secs or a shorter --outage-s"
+    );
     let lost = |media_us: u64| {
         opts.variant == Variant::Outage
             && media_us >= frame_us(mid_frame)
@@ -395,10 +406,12 @@ pub fn generate(opts: &Opts) -> Result<Vec<Record>> {
     // Arrival schedule
     let mut rng = Rng(opts.seed);
     let kbps_to_bytes_per_us = |kbps: u64| kbps as f64 * 1000.0 / 8.0 / 1e6;
-    let congested = |at_us: u64| {
+    // The congested window is in host time, starting when the middle frame is ready
+    let congestion_start = frame_us(mid_frame).saturating_sub(opts.prebuffer_ms * 1000);
+    let congested = |host_us: u64| {
         opts.variant == Variant::Congestion
-            && at_us >= frame_us(mid_frame)
-            && at_us < frame_us(mid_frame) + opts.congestion_s * 1_000_000
+            && host_us >= congestion_start
+            && host_us < congestion_start + opts.congestion_s * 1_000_000
     };
     let mut last_arrival = 0u64;
     let mut out = vec![];

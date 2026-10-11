@@ -269,8 +269,8 @@ Measured on the Argus PT Ultra, fw v3.0.0.5808_26041006: a 20 s main+sub capture
 | Audio | AAC-LC ADTS, 16 kHz, **mono**, 1 raw block, 64 ms/frame; no timestamp |
 | Arrival jitter | 20 s capture: max gap 1.3–1.5 s (Wi-Fi bursts), p50 22 ms. 570 s capture: video inter-arrival p50 38 ms, p99 905 ms, max **3.1 s**; 64 gaps > 1 s, 11 > 1.5 s |
 | Arrival lag | Steady state: the least-delayed frames arrive 0.93 s after their camera time. **Two congestion episodes** (at 40–80 s and 240–300 s) where the lag grew to **17 s** and 7 s: the camera buffers and delivers everything late rather than dropping, then catches up in a burst. 2 % of frames are dropped by the camera (133 ms steps). Main averages 2.37 Mb/s |
-| Audio vs video (Q1) | `err` (DESIGN §4.2) median **+8 ms**, p5 −35, p95 +48, range −67…+91 ms; both signs occur. Drift **−9.6 ± 11.1 ppm** (95 %), i.e. not measurable over 10 min. Audio and video share the camera clock; `skew_estimate` defaults to 0 and the median estimator is confirmed |
-| Camera vs host clock | −9.6 ± 23.9 ppm (95 %), from the lower envelope of steady windows: < 0.15 s over a full 71.6 min `cam_us` wrap |
+| Audio vs video (Q1) | `err` (DESIGN §4.2) median **+8 ms**, p5 −35, p95 +48, range −67…+91 ms; both signs occur. Drift **−1.2 ± 25.4 ppm** (95 %, start-up windows skipped, interval widened for autocorrelation; `analysis/drift.py`), i.e. not measurable over 10 min. Audio and video share the camera clock; `skew_estimate` defaults to 0 and the median estimator is confirmed |
+| Camera vs host clock | −9.6 ± 25.8 ppm (95 %), from the lower envelope of the 23 steady 20 s windows (congestion excluded; `analysis/drift.py`): at most ~0.15 s over a full 71.6 min `cam_us` wrap |
 | Frame sizes | Main IRAP up to 763 KB (about 550 packets), P-frames up to 359 KB; sub IRAP ≤ 139 KB |
 | Concurrency | Main + sub run concurrently on one Baichuan connection |
 | Wake path (20:22, camera asleep) | TCP 9000 refused while asleep **and stays closed while awake** (Baichuan runs over UDP on this model), so TCP 9000 is not a sleep indicator. Local UDP discovery woke the camera: 7 s from start to battery read. The camera's awake time after disconnect is **unmeasured** (open question 6). |
@@ -292,7 +292,7 @@ Golden transcripts from the GStreamer backend (2026-10-10, ffmpeg 8 client):
 
 Still open:
 
-1. ~~Long-run drift between the audio sample clock and the camera video clock.~~ Not measurable over 10 min (−9.6 ± 11.1 ppm); see the table (2026-10-11).
+1. ~~Long-run drift between the audio sample clock and the camera video clock.~~ Not measurable over 10 min (−1.2 ± 25.4 ppm); see the table (2026-10-11).
 2. ~~Camera µs counter behaviour across reconnect.~~ It continues across a clean logout and a 180 s idle (2026-10-11). Whether it survives a deep sleep (overnight) is unconfirmed; the MediaClock treats any jump as a discontinuity anyway (DESIGN §4.2), so this no longer blocks anything.
 3. Default for `parameter_sets` (A4b, Gate 3).
 4. Is the burst pattern the same on mains power, and on wired cameras? This decides the `pacing_latency_ms` default.

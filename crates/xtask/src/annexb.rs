@@ -57,7 +57,7 @@ pub fn split_access_units(data: &[u8], h265: bool) -> Vec<AccessUnit> {
             let vcl = t < 32;
             let first = vcl && data.get(h + 2).map(|b| b & 0x80 != 0).unwrap_or(false);
             let starter = matches!(t, 32..=35 | 39 | 41..=44 | 48..=55);
-            (vcl, first, starter, (16..=21).contains(&t))
+            (vcl, first, starter, (16..=23).contains(&t))
         } else {
             let t = data[h] & 0x1f;
             let vcl = (1..=5).contains(&t);
@@ -90,7 +90,9 @@ pub fn split_access_units(data: &[u8], h265: bool) -> Vec<AccessUnit> {
     aus
 }
 
-/// Split an ADTS stream into frames (headers included)
+/// Split an ADTS stream into frames (headers included: 7 bytes, or 9 with a CRC)
+///
+/// Only single-raw-block frames are accepted; any sync error fails the whole stream.
 pub fn split_adts(data: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     let mut out = vec![];
     let mut i = 0;
@@ -103,6 +105,11 @@ pub fn split_adts(data: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
         let len = (((data[i + 3] & 3) as usize) << 11)
             | ((data[i + 4] as usize) << 3)
             | ((data[i + 5] as usize) >> 5);
+        anyhow::ensure!(
+            data[i + 6] & 3 == 0,
+            "ADTS frame at {} has more than one raw data block",
+            i
+        );
         anyhow::ensure!(
             len >= 7 && i + len <= data.len(),
             "bad ADTS length at {}",

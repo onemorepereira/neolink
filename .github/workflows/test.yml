@@ -2,7 +2,6 @@ name: Test
 
 on:
   push:
-  pull_request:
   workflow_dispatch:
 
 env:
@@ -58,4 +57,6 @@ jobs:
           rustup override set 1.82
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
-        run: cargo check --locked --all-targets -p neolink_core -p neolink_rtsp -p xtask
+        run: |
+          cargo check --locked --all-targets -p neolink_core -p neolink_rtsp -p xtask -p neolink_decoder -p mailnoti
+          cargo check --locked --bin neolink --no-default-features

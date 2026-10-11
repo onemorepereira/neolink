@@ -19,6 +19,9 @@ use std::io::{self, Read, Write};
 /// Size of a record header in bytes
 pub const HEADER_LEN: usize = 21;
 
+/// Largest record accepted when reading (a 4K IRAP is under 1 MB)
+pub const MAX_RECORD_LEN: usize = 16 * 1024 * 1024;
+
 /// High bit of the kind byte, set for H.265 video
 pub const H265_FLAG: u8 = 0x80;
 
@@ -121,7 +124,14 @@ impl Record {
                 format!("unknown record kind {:#x}", header[8]),
             )
         })?;
-        let mut data = vec![0u8; u32_at(17) as usize];
+        let len = u32_at(17) as usize;
+        if len > MAX_RECORD_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("record of {} bytes is larger than {}", len, MAX_RECORD_LEN),
+            ));
+        }
+        let mut data = vec![0u8; len];
         r.read_exact(&mut data)?;
         Ok(Some(Record {
             host_us,

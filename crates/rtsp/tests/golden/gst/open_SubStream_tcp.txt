@@ -55,50 +55,50 @@
 < CSeq: 3
 < Transport: RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=SSRC;mode="PLAY"
 < Server: GStreamer RTSP server
-< Session: SESSION;timeout=30
+< Session: SESSION1;timeout=30
 < Date: DATE
 <
 > SETUP rtsp://HOST/argus/SubStream/stream=1 RTSP/1.0
 > Transport: RTP/AVP/TCP;unicast;interleaved=2-3
 > CSeq: 4
 > User-Agent: Lavf
-> Session: SESSION
+> Session: SESSION1
 >
 < RTSP/1.0 200 OK
 < CSeq: 4
 < Transport: RTP/AVP/TCP;unicast;interleaved=2-3;ssrc=SSRC;mode="PLAY"
 < Server: GStreamer RTSP server
-< Session: SESSION;timeout=30
+< Session: SESSION1;timeout=30
 < Date: DATE
 <
 > PLAY rtsp://HOST/argus/SubStream/ RTSP/1.0
 > Range: npt=T-
 > CSeq: 5
 > User-Agent: Lavf
-> Session: SESSION
+> Session: SESSION1
 >
 < RTSP/1.0 200 OK
 < CSeq: 5
 < RTP-Info: url=rtsp://HOST/argus/SubStream/stream=0;seq=N;rtptime=N, url=rtsp://HOST/argus/SubStream/stream=1;seq=N;rtptime=N
 < Range: npt=T-
 < Server: GStreamer RTSP server
-< Session: SESSION;timeout=30
+< Session: SESSION1;timeout=30
 < Date: DATE
 <
+< $0 rtp pt=96
+< $1 rtcp pt=200
 < $2 rtp pt=96
 < $3 rtcp pt=200
-< $1 rtcp pt=200
-< $0 rtp pt=96
 > TEARDOWN rtsp://HOST/argus/SubStream/ RTSP/1.0
 > CSeq: 6
 > User-Agent: Lavf
-> Session: SESSION
+> Session: SESSION1
 >
 < RTSP/1.0 200 OK
 < CSeq: 6
 < Server: GStreamer RTSP server
-< Session: SESSION;timeout=30
+< Session: SESSION1;timeout=30
 < Connection: close
 < Date: DATE
 <
-# conn 1 closed: < $0 xN, < $1 xN, < $2 xN, < $3 xN
+# conn 1 closed: < $0 x10+, < $1 x1, < $2 x10+, < $3 x1

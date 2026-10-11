@@ -55,27 +55,27 @@
 < CSeq: 3
 < Transport: RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=SSRC;mode="PLAY"
 < Server: GStreamer RTSP server
-< Session: SESSION;timeout=30
+< Session: SESSION1;timeout=30
 < Date: DATE
 <
 > SETUP rtsp://HOST/argus/Main/stream=1 RTSP/1.0
 > Transport: RTP/AVP/TCP;unicast;interleaved=2-3
 > CSeq: 4
 > User-Agent: Lavf
-> Session: SESSION
+> Session: SESSION1
 >
 < RTSP/1.0 200 OK
 < CSeq: 4
 < Transport: RTP/AVP/TCP;unicast;interleaved=2-3;ssrc=SSRC;mode="PLAY"
 < Server: GStreamer RTSP server
-< Session: SESSION;timeout=30
+< Session: SESSION1;timeout=30
 < Date: DATE
 <
 > PLAY rtsp://HOST/argus/Main/ RTSP/1.0
 > Range: npt=T-
 > CSeq: 5
 > User-Agent: Lavf
-> Session: SESSION
+> Session: SESSION1
 >
 < RTSP/1.0 503 Service Unavailable
 < CSeq: 5
@@ -85,12 +85,12 @@
 > TEARDOWN rtsp://HOST/argus/Main/ RTSP/1.0
 > CSeq: 6
 > User-Agent: Lavf
-> Session: SESSION
+> Session: SESSION1
 >
 < RTSP/1.0 200 OK
 < CSeq: 6
 < Server: GStreamer RTSP server
-< Session: SESSION;timeout=30
+< Session: SESSION1;timeout=30
 < Connection: close
 < Date: DATE
 <

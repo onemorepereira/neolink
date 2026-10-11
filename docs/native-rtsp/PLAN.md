@@ -49,11 +49,11 @@ clocks and SR.
 | 0.2 | ✅ Argus characterisation (spec §9) | Done |
 | 0.3 | ✅ Raw golden transcripts: open + auth, main + sub, TCP + default (UDP) | Superseded by 0.3b |
 | 0.3b | ✅ **Golden tooling**: `cargo xtask golden record` (recording TCP proxy), `normalize`, and a **structural** `diff` (methods, status codes, header presence and shape, SDP attribute sets and fmtp keys; not sprop, ssrc, seq, rtptime, dates, resolution). Session 2 (2026-10-11) re-recorded all 19 aliases, extern, unknown path, UDP and five auth cases with the pinned ffmpeg | 28 files in `crates/rtsp/tests/golden/gst/` (normalised, no media), `docs/native-rtsp/golden-session.sh` |
-| 0.4 | ✅ 570 s main capture (session 1, 2026-10-11). Audio-vs-video `err` median +8 ms (p5 −35, p95 +48), drift −9.6 ± 11.1 ppm; camera vs host −9.6 ± 23.9 ppm; **new: congestion episodes with up to 17 s arrival lag** (spec §9). Median estimator confirmed; `skew_estimate` = 0 | `docs/native-rtsp/analysis/drift.py`; spec §9 |
+| 0.4 | ✅ 570 s main capture (session 1, 2026-10-11). Audio-vs-video `err` median +8 ms (p5 −35, p95 +48), drift −1.2 ± 25.4 ppm; camera vs host −9.6 ± 25.8 ppm (both with start-up/congestion windows excluded and autocorrelation-widened intervals; the first published figures came from an uncommitted fit and were corrected after the Gate 0 review); **new: congestion episodes with up to 17 s arrival lag** (spec §9). Median estimator confirmed; `skew_estimate` = 0 | `docs/native-rtsp/analysis/drift.py`; spec §9 |
 | 0.5 | ✅ Logout, 180 s idle, reconnect (same session): `cam_us` continues; wake 2.0 s; first battery read after wake → 400 | `argus_main_10min.bcm` (175 MB, with a `Restarted` record) kept locally, too large to commit; CI uses the synthetic variants |
 | 0.6 | ✅ Silent AAC-LC AU, mono `01 18 20 07` and stereo `21 10 04 60 8c 1c`, sample-rate independent; symphonia and ffmpeg decode them to zeros | `neolink_rtsp::codec::aac` + tests |
 | 0.7 | ✅ `cargo xtask mkfixture`: plain, wrap, reset, outage, reschange, **congestion** (added from 0.4). Deterministic and CPU-independent (ffmpeg `-cpuflags 0`, x264 `cpu-independent`, x265 `asm=none`). Deviation: wrap starts 10 s before the u32 wrap, not 5 min (configurable with `--cam-us-start`) to keep fixtures small | `fixtures/synth/SHA256SUMS`; `.bcm` files are generated, not committed |
-| 0.8 | ✅ `test.yml`: `cargo test --workspace` with the pinned static ffmpeg (BtbN `autobuild-2026-10-10-13-04`, n8.1.3, sha256-checked, cached), the fixture reproducibility check, and an MSRV 1.82 job. tokio 1.37 → 1.42.1 (the newest that keeps MSRV 1.82); `rust-version = "1.82"` on every crate | Passes in the dev container and on rust:1.82; **not yet run on GitHub** (no fork remote yet). BtbN deletes old autobuilds, so the first CI run caches the tarball |
+| 0.8 | ✅ `test.yml`: `cargo test --workspace` with the pinned BtbN ffmpeg (`autobuild-2026-10-10-13-04`, n8.1.3, sha256-checked, cached; not fully static, it links the host glibc, and its output was identical under glibc 2.36 and 2.43), the fixture reproducibility check, and an MSRV 1.82 job covering every crate except pushnoti (the binary without GStreamer). tokio 1.37 → 1.42.1 (the newest that keeps MSRV 1.82); `rust-version = "1.82"` on every crate | **Owner decision (2026-10-11): no remote CI until much later.** The same commands run in the dev container and on rust:1.82 and pass; that is what Gate 0 accepts. BtbN deletes old autobuilds, so the tarball must be mirrored before the first remote run (risk register) |
 | 0.9 | ✅ Owner decisions (below) | Recorded |
 | 0.10 | ✅ NFRs confirmed against 0.4 and the golden data. N3 restated for the CI runner (no Pi 4), N5 runs on fixtures (no mains). N1/N2/N4 unchanged | Spec v2.3 |
 
@@ -62,12 +62,28 @@ connected for 11 min instead of about 5: the script stopped neolink with SIGINT,
 non-interactive `sh` ignores in background jobs, so neolink kept running until it was sent
 SIGTERM by hand. The script now uses SIGTERM.
 
-**Gate 0**
-- Spec §9 Q1, Q2 and Q5 are answered.
-- Fixtures are generated reproducibly in CI.
-- `cargo test --workspace` runs in CI.
-- The golden tooling diffs a re-recorded GStreamer transcript against itself: 0 structural
-  deltas.
+**Gate 0** (passed 2026-10-11, after the review findings below were fixed)
+- ✅ Spec §9 Q1, Q2 and Q5 are answered.
+- ✅ Fixtures are generated reproducibly (`mkfixture --standard --check`), in the dev
+  container instead of remote CI (owner decision 2026-10-11).
+- ✅ `cargo test --workspace` passes, likewise in the dev container.
+- ✅ The golden tooling diffs a re-recorded GStreamer transcript against itself: 0 structural
+  deltas (`crates/xtask/tests/golden_files.rs`).
+
+Gate 0 review (fresh agent, 2026-10-11), fixed: the camera-vs-host drift figure was not
+reproducible from the committed script, and the audio interval was too narrow (both
+recomputed); synthetic audio lagged video by the encoder's 64 ms priming (first AU now
+dropped, audio trimmed to the video length); the outage variant silently broke when the
+outage ran past the media (now an error); the structural diff missed fmtp values, CSeq
+echo, session-id consistency, PT consistency, channel counts, status line version and
+reason, media flow (counts now bucketed `x1`/`x10+`), and hid TEARDOWN errors (now only a
+reply missing on one side is ignored); the splitter now resyncs; re-records are byte-stable
+(interleaved lines sorted); ADTS rejects multi-block frames and IRAP covers types 22–23;
+fixture records are capped at 16 MiB; the congestion window is in host time; the proxy
+writes a ready file and the recording script waits for it and edits the config safely;
+the MSRV job covers more crates and CI no longer runs twice per push. Deferred: folded
+RTSP headers are not parsed (no client sends them); the proxy's Down pump does not end if
+a server never closes after the client half-closes (the GStreamer and native servers do).
 
 ## Phase 1: neolink refactors, test seam, fixes (8–12 d; 1 hardware session)
 
@@ -237,6 +253,7 @@ the MediaClock; 0.7 provides fixtures). v1's "Phase 2 in parallel with Phase 1" 
 | Risk | L | I | Mitigation | Trigger |
 |---|---|---|---|---|
 | Client incompatibility found late (Blue Iris, XProtect, Synology) | M | H | Golden structural diff; client CI image from Phase 3; Phase 5 matrix | Any P1 compatibility bug |
+| Pinned ffmpeg autobuild deleted by BtbN before the first remote CI run | H | M | Mirror the tarball (sha256 in test.yml) as a release asset on the fork before enabling CI; fixtures regenerate only with the same build | First remote CI run |
 | Clients that don't retry SETUP over TCP after 461 (Synology, XProtect defaults unverified) | M | H | Test them in Phase 5; UDP is first in the §4.2 backlog | A confirmed client failure → pull UDP into v1 |
 | Battery drain from testing, or from design bugs (waking on probes) | M | M | A21; hardware budget; `battery: None` fail-safe | Battery delta > 5 % per session |
 | A/V offset wrong because the arrival-skew model is wrong | M | M | 0.4 measurement before 2.4; A16 at 5 s / 60 s / 15 min / 90 min | A16 fails |

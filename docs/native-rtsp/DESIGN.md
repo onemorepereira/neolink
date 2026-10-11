@@ -218,7 +218,7 @@ The MediaClock is per Hub and lives as long as the Hub, **across Idle** (F-cc 16
   **median over a sliding 20 s window**. The median is used because the arrival-skew sign
   is unknown: bairelay reports video ahead, while GStreamer measured audio 1.9 s ahead.
   Phase 0.4 confirmed it: on the Argus `err` spans −67…+91 ms with both signs, the 20 s
-  medians stay within 0–21 ms, and drift is −9.6 ± 11.1 ppm, so on that camera the
+  medians stay within 0–21 ms, and drift is −1.2 ± 25.4 ppm, so on that camera the
   correction below never engages (SPEC §9).
 - **Correction**: when `|median| > 80 ms` (this keeps A16's 150 ms with margin), correct at
   up to 1 AU per second until `|median| < 20 ms`. Audio ahead: drop one AU. Audio behind:
@@ -299,8 +299,11 @@ moves therefore never show up as RTP or NTP steps (F-cc 7).
   anchor follows arrival and delivery latency grows (timestamps don't move); when the
   catch-up burst arrives, `min_lead` exceeds `latency + GOP` and the pacer skips to the
   newest IRAP, back to `latency`. Arrival gaps stay below the bridge threshold, so viewers
-  see late video, then one skip, and no bridge. The `congestion_h265.bcm` fixture
-  (`cargo xtask mkfixture`) reproduces it for the Phase 2.6 pacer tests.
+  see late video, then one skip, and no bridge at the battery default latency (1500 ms,
+  threshold 4.5 s). The real capture's longest gap was 3.1 s; the synthetic
+  `congestion_h265.bcm` fixture (`cargo xtask mkfixture`; 14 s peak lag, 4.3 s longest
+  gap) is harsher. At the 300 ms mains default (threshold 3.3 s) such a gap would bridge
+  briefly, which is acceptable: Phase 2.6 tests both latencies on that fixture.
 
 ### 4.5 WireClock and Bridge: the only source of on-wire time
 
