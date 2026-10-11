@@ -427,7 +427,9 @@ async fn test_100_cycles_return_to_baseline() {
 /// Real time: tokio's paused clock races real sockets
 #[tokio::test]
 async fn test_backoff_with_demand() {
-    let cam = FakeCamera::start(FakeCameraConfig::default()).await.unwrap();
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
     cam.set_unreachable(true);
     let neocam = new_neocam(config_for(&cam, "")).await;
     let instance = neocam.subscribe().await.unwrap();
@@ -438,4 +440,44 @@ async fn test_backoff_with_demand() {
     // start at 0, 1, 3, 7, 15 and 31 s; the old 5 s cap made about 13 in 40 s
     let attempts = cam.stats().connections / 2;
     assert!((4..=8).contains(&attempts), "{} attempts in 40 s", attempts);
+}
+
+/// A28 / P12: a motion Start that never stops does not hold the camera after a drop
+#[tokio::test]
+async fn test_motion_permit_released_on_disconnect() {
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
+    let neocam = new_neocam(config_for(
+        &cam,
+        "idle_grace_s = 1\n[pause]\non_motion = true",
+    ))
+    .await;
+    let instance = neocam.subscribe().await.unwrap();
+    let permit = instance.permit("test:wake").await.unwrap();
+    // Wait until the motion listener has subscribed (MSG_ID_MOTION_REQUEST)
+    wait_stats(&cam, 10, |s| s.messages.get(&31).is_some()).await;
+    drop(permit);
+    cam.motion(true);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while neocam.use_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "motion took no permit"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cam.drop_connections();
+    wait_stats(&cam, 10, |s| s.open_connections == 0).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while neocam.use_count() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "motion permit kept after the drop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // No demand left: it stays disconnected
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(cam.stats().open_connections, 0);
 }

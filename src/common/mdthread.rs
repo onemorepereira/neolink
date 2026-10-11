@@ -51,6 +51,8 @@ impl NeoCamMdThread {
         let thread_cancel = self.cancel.clone();
         let watcher = self.md_watcher.clone();
         let md_instance = self.instance.clone();
+        let reset_watcher = self.md_watcher.clone();
+        let mut camera_watch = self.instance.camera();
         tokio::select! {
             _ = thread_cancel.cancelled() => {
                 Ok(())
@@ -95,7 +97,16 @@ impl NeoCamMdThread {
                     log::debug!("Error in MD task Restarting: {:?}", r);
                     sleep(Duration::from_secs(1)).await;
                 }
-            } => v
+            } => v,
+            // Motion is unknown while disconnected: a Start from before must not keep a
+            // motion permit (and the camera) alive after a drop (SPEC P12)
+            v = async {
+                loop {
+                    camera_watch.wait_for(|cam| cam.upgrade().is_some()).await?;
+                    camera_watch.wait_for(|cam| cam.upgrade().is_none()).await?;
+                    reset_watcher.send_replace(MdState::Unknown);
+                }
+            } => v,
         }
     }
 }

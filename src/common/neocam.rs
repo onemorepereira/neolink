@@ -320,7 +320,8 @@ impl NeoCam {
                                 md.wait_for(|md| !matches!(md, MdState::Start(_))).await.map(|_| ()).with_context(|| "MD Watcher lost")?;
                                 continue;
                             }
-                            v = md.wait_for(|md| matches!(md, MdState::Stop(_))).map_ok(|_| ()) => { v.with_context(|| "MD Watcher lost")?; }
+                            // Stop, or Unknown after a disconnect, releases it
+                            v = md.wait_for(|md| !matches!(md, MdState::Start(_))).map_ok(|_| ()) => { v.with_context(|| "MD Watcher lost")?; }
                         }
                         // Try waiting for 30s
                         // If in those 30s we get motion then return to
