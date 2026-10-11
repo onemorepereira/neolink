@@ -174,7 +174,7 @@ Useful on its own; it **ships with the GStreamer backend**.
 | 5.1 | Frigate's preset ffmpeg command lines: A3 in CI (15 min, crossing the wrap) and nightly (90 min). On hardware: 1 session of 10 min. A real Frigate container is optional and manual |
 | 5.2 | `bridge_fps` tuning with Frigate's preset command lines and go2rtc (A12's tolerance criterion) |
 | 5.3 | VLC and retina timeline checks on hardware (1 session) |
-| 5.4 | Blue Iris (A14, manual), **only if** the owner provides a Windows machine; otherwise deferred |
+| 5.4 | ~~Blue Iris (A14)~~: dropped by owner decision |
 | 5.5 | Nightly fuzz job (30 min per target); exact-timing nightly job on a dedicated runner |
 | 5.6 | Soak: 24 h on fixtures (A15 surrogate, nightly). 24 h hardware only with mains power; otherwise deferred |
 | 5.7 | Performance (N3, N4) on a Pi 4 **if available**, otherwise any aarch64 SBC/VM, with fixtures. Decryption cost is measured separately with a camera-layer benchmark on the scripted peer, using AES on the replay |
@@ -241,11 +241,18 @@ the MediaClock; 0.7 provides fixtures). v1's "Phase 2 in parallel with Phase 1" 
 | Hidden coupling in neolink (permits, reactor drop semantics) | M | H | Phase 1 first; scripted-peer tests; Gate 1 per-cycle check | Gate 1 failures |
 | Fork divergence from other neolink forks and from bairelay | H | L | Keep changes in new modules; minimise edits to shared files | — |
 
-## Decisions needed from the owner
+## Owner decisions (2026-10-10)
 
-1. **Fixture permission**: may a short capture of your camera be committed (0.9)?
-2. **Mains power** for 24 h and 2 h hardware runs, or accept the fixture surrogates (5.6)?
-3. **Windows / Blue Iris** access for A14, or defer it (5.4)?
-4. **Pi 4** (or any aarch64 board) for N3/N4, or a VM surrogate (5.7)?
-5. **Distribution**: PRs to upstream (inactive), or releases from your own fork with GHCR
-   images? Needed before Gate 1.
+1. **Fixture permission: yes.** Short captures of the Argus may be committed as CI fixtures.
+   0.5's `argus_reconnect.bcm` and a trimmed capture from 0.4 go under
+   `crates/rtsp/tests/fixtures/`. Synthetic fixtures are still used for wrap, reset and
+   A/V-sync tests.
+2. **Mains power: open.** The question: can the camera run on USB power for a day? If yes,
+   24 h hardware soaks (A15) are possible. If no, they are replaced by fixture soaks plus
+   ≤ 10 min hardware sessions.
+3. **Windows / Blue Iris: out of scope.** A14 is dropped. Windows artifacts stay out of
+   v1.x (spec §4.2 item 4 is reduced to armv7 and macOS).
+4. **Pi 4: none.** N3/N4 run on an aarch64 VM or CI runner with fixtures. The Pi 4 numbers
+   in spec §6 become "aarch64 reference runner" targets.
+5. **Distribution: a personal fork.** No upstream PRs. Phase 6 targets the owner's fork:
+   GitHub releases plus GHCR images. Until the fork exists, work stays on local branches.

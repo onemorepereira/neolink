@@ -186,7 +186,7 @@ the owner's camera are not committed (privacy) unless the owner explicitly allow
 | A11 | F, H | Camera outage of 60 s mid-stream. Fixture: stall the feed. Hardware: an nftables drop of the camera's IP on the neolink host | ffmpeg, go2rtc and VLC keep their sessions; live media resumes from an IRAP; per-session RTP timestamps monotonic; no on-wire jump > 1 s |
 | A12 | F, M | `pause.on_motion`: 60 s idle, then motion. A **10 min idle** variant checks that motion pause is not capped by `bridge_max_s`. Motion in F is injected `MdState`; on hardware it is a person in front of the PIR (owner in the loop) | No camera stream while idle (except one learning start on an empty cache); sessions survive both variants; first live IRAP ≤ motion event + 2 RTT + 1 GOP; Frigate tolerates `bridge_fps = 0.2` |
 | A13 | B | Static binary + scratch image | `file` reports a static binary; container starts; N9 |
-| A14 | M | Blue Iris, main and sub, "Use RTSP/stream timecode" on and off | Plays 10 min |
+| A14 | — | ~~Blue Iris~~: dropped (owner decision 2026-10-10) | — |
 | A15 | H | 24 h soak | N5 |
 | A16 | F | A/V sync, using a fixture with a periodic flash plus beep | \|A−V\| ≤ 150 ms at 5 s, 60 s and 15 min in CI; at 90 min nightly |
 | A17 | F | u32 wrap (fixture starting at 2³²−5 s) and counter reset | No on-wire jump > 1 s; retina accepts the timeline |
