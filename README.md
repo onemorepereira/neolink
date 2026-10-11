@@ -41,6 +41,13 @@ features not yet in upstream master.
 
 ## Installation
 
+**No GStreamer: the native backend (beta).** Neolink can also be built with its own RTSP
+server, as a single static binary with nothing else to install (x86_64 and aarch64, plus
+a ~15 MB `FROM scratch` image). See
+[docs/native-rtsp/NATIVE.md](docs/native-rtsp/NATIVE.md). The instructions below are for
+the GStreamer build.
+
+
 Download from the
 [release page](https://github.com/QuantumEntangledAndy/neolink/releases)
 
