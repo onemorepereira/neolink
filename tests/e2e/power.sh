@@ -98,6 +98,12 @@ check "A29 CLI battery from state" 'grep -q "<batteryPercent>80</batteryPercent>
 check "A29 CLI battery: 0 connections" '[ "$(stat connections)" = "$BEFORE" ]'
 check "A29 second process warned" 'grep -q "Another neolink process" "$W/battery.err"'
 
+# --- Gate 1: no password in logs at the most verbose level a release build has (debug;
+# trace is compiled out by release_max_level_debug)
+RUST_LOG=trace "$BIN/neolink" battery --fresh --config "$W/neolink.toml" fake > /dev/null 2> "$W/trace.log"
+check "debug log has content" '[ $(wc -l < "$W/trace.log") -gt 5 ]'
+check "no password in trace logs" '! grep -q "fakepass" "$W/trace.log"'
+
 # --- A28: unreachable camera, a query arrives: it fails at its deadline, no retry after
 kill -USR2 "$(pgrep -f 'xtask fakecam')"
 mosquitto_pub -p 18883 -t neolink/fake/query/battery -m ""
