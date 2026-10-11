@@ -726,3 +726,62 @@ ingest→write latency histogram. It doesn't depend on log level, which is
 - A container job (A13/N9): build the scratch image, run it with the fixture camera, then
   `podman stop` must take < 5 s.
 - ffmpeg, VLC and go2rtc integration jobs on an image that has them.
+
+## 10. Power management (spec §4.1.1)
+
+The changes are in `src/common/neocam.rs` and `camthread.rs` and are shared by both
+backends.
+
+**Connection state machine per camera**
+
+```
+ Asleep ──demand (permit acquired)──▶ Connecting ──login ok──▶ Awake
+   ▲                                     │ fail: backoff only while demand (P4)
+   └──── idle_grace_s after last permit ─┴─────────────── Awake (no permits)
+```
+
+- `NeoCamThreadState` starts as `Disconnected` for battery or unknown cameras (P1). Today
+  it is hard-coded to `Connected` at `neocam.rs:63`.
+- The idle loop is restructured so the grace timer starts at boot and after every permit
+  drop, not only after the first use. This fixes `neocam.rs:357-366`.
+- `idle_disconnect` keeps its meaning but changes its default:
+  - unset and battery/unknown → sleep;
+  - unset and mains → always-on, as today;
+  - explicitly `false` → always-on, with a warning on battery cameras.
+
+**Passive tasks (P3)**
+- `run_passive_task` already avoids connecting.
+- The MQTT snapshot, battery and stream-info timers are changed to **skip** while
+  `Asleep`, instead of waiting for the camera.
+- Their last values are cached with a timestamp.
+- **Piggyback hook:** on each `Awake` transition, one battery read and one stream-info read
+  run once, and one snapshot runs at the end of the wake (P5, P7), all under the existing
+  permit.
+
+**Wake ledger (P6)**
+- A `Vec` ring of the last 1000 wakes per camera, in memory.
+- Each permit carries a reason string, which `run_task` callers pass. Today permits have
+  no reason, so this is a signature change on `NeoInstance::permit`/`run_task`.
+
+**Snapshot endpoint (P5)**
+- A minimal HTTP/1.1 GET server on `snapshot_port` (same limits as §6.6).
+- Auth is the shared module from §6.5.
+- It serves the cached JPEG and never takes a permit unless `?fresh=1` is allowed by
+  config.
+
+**Additions from the power review (spec P9–P19)**
+
+- **`find_camera` for battery or unknown cameras.** Run local discovery to completion (or
+  its timeout) first. Only then, if `discovery` permits it, run remote/map/relay.
+  `register_address` (`C2R_C`) is never run concurrently with local discovery.
+- **Permits require a `Reason`.** The `UseCounter` gets a non-activating `observe()`
+  subscription for the idle loop. Boot tasks become `on_awake` hooks, run once per wake
+  inside the wake's own permit.
+- **`run_task_with_deadline(reason, dur, f)`** replaces `run_task`. The old signature calls
+  it with a 60 s default during the migration.
+- **Disconnect.** `NeoCamThread` gets an explicit `disconnect().await`: logout with a 2 s
+  timeout, then `C2D_DISC` (UDP), then drop. The idle loop and shutdown both call it,
+  instead of dropping the `run_camera` future.
+- **State file.** A `CameraState` struct, serialized to
+  `{state_dir}/camera/<sha256(name)[..16]>.json` with atomic rename, plus an advisory lock
+  file (`fs2`-style `flock` on unix; best-effort elsewhere).

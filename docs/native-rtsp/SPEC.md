@@ -105,6 +105,48 @@ Adopting bairelay was offered, with a time-boxed evaluation, and declined.
 | R28 | Observability: info-level events for client connect/disconnect (IP, user, path), auth failure (IP, user), camera stream start/stop/rebase/bridging, slow-client drop. Every 60 s at debug level, and on `SIGUSR1` at info level: a per-stream stats line (clients, bitrate, fps, drops). |
 | R29 | Trust boundary documented: the MQTT `config` topic can rewrite users and permissions. New key `mqtt_config_writes` (default `true` for compatibility, with a startup warning when users are configured). |
 
+### 4.1.1 Power management (first-class; owner use case: on-demand viewing)
+
+**Use case (owner decision, 2026-10-10):** a battery/solar camera that is viewed on demand
+(HA dashboard, VLC). It is not recorded 24/7, and motion-triggered recording is not a v1
+goal. The camera must be asleep whenever nobody is watching.
+
+**Measured or verified problems in today's neolink**
+
+- `idle_disconnect` defaults to `false`, so neolink stays logged in and pings every 5 s
+  forever (`config.rs:218`, `camthread.rs:64`).
+- It connects at startup unconditionally (`neocam.rs:63`).
+- Even with `idle_disconnect = true`, the startup connection is never dropped until a first
+  use cycle has finished (`neocam.rs:357-366`).
+- An unreachable camera is retried every ≤ 5 s indefinitely (`camthread.rs:108`).
+- MQTT polls snapshots and battery on timers (`mqtt/mod.rs:480-540`).
+
+| ID | Requirement |
+|---|---|
+| P1 | **Sleep by default.** A camera whose `battery` is true or unknown is not connected unless something needs it right now: a playing RTSP session, a CLI or MQTT command, or a learning start. This holds at startup too, so neolink makes **no** connection at boot. Always-on requires `idle_disconnect = false` set explicitly in the config (presence detected per R14), and it logs a warning: "keeps <camera> awake; expect battery drain". |
+| P2 | **Release quickly.** After the last use, the camera is disconnected (logout, socket closed) within `idle_grace_s`, default **10 s** (today 30 s). The grace covers a client that reconnects at once (DESCRIBE→PLAY, or an ffprobe followed by ffmpeg). |
+| P3 | **Zero contact while idle.** While disconnected, neolink sends nothing to the camera: no pings, no stream-info, battery, snapshot or time polls, no discovery. Periodic tasks run only while the camera is already connected for another reason, and never cause a connection. Values they would fetch are served from cache, with their age. |
+| P4 | **Bounded reconnect.** When a connection attempt fails while there is demand, retry with backoff (1, 2, 4… 60 s). With no demand, don't retry at all. A camera that is offline for 10 min with demand moves to a slow retry (5 min) and logs it. |
+| P5 | **Cached snapshot endpoint.** An HTTP `GET /{camera}/snapshot.jpg` on a configurable port (`snapshot_port`, default `bind_port + 1`) serves the camera's own JPEG (`get_snapshot`), captured during the last wake (at the end of each streaming session, and at most once per wake), with `Last-Modified`. It **never** wakes the camera by default. `?fresh=1` may wake it; this is rate-limited and configurable, and off for battery cameras by default. This lets HA's camera card refresh thumbnails without waking the camera. It uses the same auth as RTSP (Basic and Digest). |
+| P6 | **Wake ledger.** Every connection is recorded with a reason (`rtsp:<peer>:<path>`, `cli:<cmd>`, `mqtt:<topic>`, `learn`, `startup-always-on`), the start time, awake duration and bytes streamed. A per-camera summary line is logged at info on each disconnect (`argus: awake 23.4 s for rtsp:192.168.86.10:/argus/sub; today: 3 wakes, 71 s awake`). The ledger is published on MQTT if it is enabled. This is how power use is observed and tested. |
+| P7 | **Battery reads only while awake.** `battery` CLI/MQTT values come from the last reading taken during a wake (each wake reads it once, piggybacked). An explicit CLI `battery --fresh` may wake the camera. |
+| P9 | **Wake path.** Measured on fw v3.0.0.5808 (2026-10-10, 20:22, camera asleep, TCP 9000 refusing): **local UDP discovery reaches and wakes the sleeping camera**, and discovery → login → battery read took 7 s. bairelay's claim that only the cloud can wake it does not hold for this camera. For battery cameras, discovery runs **local first; cloud registration (`C2R_C`) only if local fails *and* `discovery` allows it; never both in parallel.** That is a change to `find_camera`'s `select!`. Every cloud attempt counts as a wake attempt in the ledger, and P4's backoff applies to it. |
+| P10 | **No permit without a reason.** Boot-time tasks that take permits are removed or turned into wake piggybacks: the version/stream-info report (`neocam.rs:197-229`), the UID fetch (`:231-249`), and push registration (`:252-302`, pushnoti only). The idle loop observes the use-counter with a subscription, not an activated permit (it races today, `neocam.rs:359-360`). Only callers that pass a P6 reason can create permits. |
+| P11 | **Deadlines.** Every `run_task` has a deadline (default 60 s) and then fails. "Demand" for P4 retries means a playing RTSP session or an unexpired command, never a stuck task. Duplicate MQTT queries are coalesced. |
+| P12 | **Motion permits.** The motion-permit thread (`neocam.rs:304-330`) runs only when `pause.on_motion` (or another explicit motion consumer) is configured. `MdState` resets to `Unknown` on disconnect. A motion permit is held for at most `motion_hold_max_s` (default 120). Its ledger reason is `motion`. |
+| P13 | **Clean release.** Every disconnect path logs out (2 s timeout) and, over UDP, sends `C2D_DISC`. Today an idle disconnect drops the future without logging out (`camthread.rs:126-137`), and `C2D_DISC` is never sent. The fixed 4 s of sleeps after login (`camthread.rs:44,48`) become retry-on-400, so a wake is shorter. The TCP probe login as `admin`/`123456` (`discovery.rs:1079-1111`) is removed. |
+| P14 | **MQTT does not undo power settings.** Config is pushed per camera only when that camera's config changed, and only connection-affecting keys reconnect (`reactor.rs:104-107` pushes to every camera today). Retained `config` messages from before process start are ignored. Retained `control/*` and `query/*` messages are ignored with a warning. `idle_disconnect` and `battery` are `Option` and skipped when unset, so a config dump never turns into an "explicit always-on". HA availability comes from the neolink process's last-will, plus a separate `awake` binary sensor, so a sleeping camera isn't shown as "unavailable". While a battery camera is awake: one snapshot and one battery read per wake, with the polling timers suppressed. |
+| P15 | **One state file per camera** in `{state_dir}/camera/<hash>.json`, shared by every mode and process. It holds battery (yes/no/unknown), supported streams, UID, model and firmware, the last battery reading, and the last snapshot. Battery is true once `battery_info` succeeds; it is never inferred as mains from `adapterStatus` or `chargeStatus` (solar reports "solarPanel"). A lock file warns when a second neolink process uses the same camera. CLI `battery` and `image` read the state file by default and wake only with `--fresh`. |
+| P16 | **GStreamer backend under P1.** Mounts come from the state file's supported streams (or config), so they exist before any wake. Documented: the GStreamer backend still wakes the camera on DESCRIBE (R11's protection is native-only). |
+| P17 | **One retry owner** (P4). The Hub's linger is folded into `idle_grace_s`. Awake-time budget per on-demand session: session length + `idle_grace_s` + login and logout overhead (≤ 5 s). |
+| P18 | **Learning starts** are limited **per camera** (one wake teaches every stream kind), with the limiter timestamp persisted in the state file. |
+| P19 | **Documented HA recipe for battery cameras:**<ul><li>still image URL = the P5 endpoint;</li><li>"Preload stream" off;</li><li>`camera_view: auto` (not `live`);</li><li>no Frigate or go2rtc `preload:` for this camera;</li><li>no `command_line` polling;</li><li>no ping or nmap device tracker on the camera's IP.</li></ul>P5 returns a placeholder JPEG (HTTP 200) when the cache is empty, so HA's config flow accepts the URL. |
+| P8 | **24/7 warning.** If a session on a battery camera lasts more than 30 min, log once: "<camera> has streamed continuously for 30 min; battery cameras are not designed for continuous recording". It is informational and never enforced. |
+
+**Out of scope (v1):** waking on motion without staying connected. That needs a local
+push/wake receiver, as bairelay has; it is a v1.x candidate. `pause.on_motion` on a battery
+camera keeps today's behaviour of staying connected, and P1's warning applies to it.
+
 ### 4.2 Deferred to v1.x (in order)
 
 1. UDP unicast: server port range config, RTP sent only to the RTSP peer IP, `destination=` rejected, RTCP accepted only from the negotiated peer and ports, per-IP caps, paced sends.
@@ -180,6 +222,14 @@ the owner's camera are not committed (privacy) unless the owner explicitly allow
 | A7 | F, H | 4 clients join at staggered times, including one during camera start-up; plus main+sub concurrently. Run with `parameter_sets = strip` and with `inject` | 1 camera stream start per kind; each client's first video frame is an IRAP and decodes (from SDP parameter sets alone under `strip`) |
 | A8 | F | 100 connect/teardown cycles, run both against the fixture source in `crates/rtsp` and against the real `source.rs` with a mock `NeoInstance` | Camera stream stops ≤ 5 s after the last client; `num_alive_tasks` and the camera use-counter return to baseline |
 | A21 | F | Health probe: a DESCRIBE every 10 s for 10 min against a cached battery mount | 0 camera stream starts |
+| A23 | F | Idle power: scripted peer marked battery; neolink **boots** and runs 1 h (virtual time) with no clients, MQTT enabled with default intervals, a DESCRIBE probe every 10 s, broker reconnects every 5 min, retained `control/wakeup` and `query/battery` present, and an unchanged config re-published every 10 min | **0** connections, **0** discovery broadcasts, **0** cloud registrations (mock p2p host) (P1, P3, P9, P10, P14, R11) |
+| A28 | F | Stuck work: the camera is unreachable and an MQTT `query/battery` arrives; a motion Start with no Stop, then disconnect | The query fails at its deadline; there are no retries after it; the motion permit is released on disconnect or at `motion_hold_max_s` (P11, P12) |
+| A29 | F | Multiple processes: an `rtsp` and an `mqtt` instance on the same camera, plus CLI `battery` | The second process warns; CLI `battery` makes 0 connections (P15) |
+| A30 | F | GStreamer backend with P1: on-demand PLAY works with an empty and with a warm state file | Mounts exist before any wake; the camera wakes on demand (P16) |
+| A24 | F | On-demand cycle: 20 PLAY sessions of 30 s each, spaced 2 min apart | 20 wakes; each awake time ≤ session + `idle_grace_s` + 2 s; ledger reasons correct (P2, P6) |
+| A25 | F | Unreachable camera: no demand for 1 h, then demand for 10 min | 0 attempts without demand; backoff per P4 with demand |
+| A26 | F | Snapshot endpoint: 360 `GET snapshot.jpg` over 1 h with no clients | 0 wakes; JPEG served from the last wake with a correct `Last-Modified` (P5) |
+| A27 | H | Sleep check: one 1-minute viewing session, then 2 h idle. The method must not wake the camera: the neolink ledger and per-wake battery readings (voltage, current, %), plus `ss -u`/`ss -t` showing no neolink socket to the camera. Do **not** open the Reolink app, which wakes the camera; do not ping continuously. Passive capture at the AP is used if the router allows it (Google Wifi doesn't, so this is likely unavailable) | Ledger: exactly 1 wake; no socket to the camera from `idle_grace_s` + 5 s after the session; the next session's first battery reading is consistent with sleep (no unexplained drop) |
 | A22 | F | Wire monotonicity under random bridge/resume/discontinuity/pause schedules (property test) | RTP timestamps per track never decrease; SR NTP−RTP mapping identical across tracks |
 | A9 | F | A client that stops reading (SO_RCVBUF 4 KiB) | Other clients' frame timing unaffected (inter-frame p99 delta < 50 ms); slow client dropped per R13 |
 | A10 | F | Auth matrix × clients (ffmpeg, go2rtc, VLC, retina): none / wrong / Basic / Digest qop / Digest no-qop / user not permitted / `anyone` with valid creds / `anyone` without creds | Matches the golden transcript per row |
@@ -220,6 +270,8 @@ Measured on the Argus PT Ultra, fw v3.0.0.5808_26041006, 20 s main+sub capture, 
 | Arrival jitter | Max gap between frame arrivals 1.3–1.5 s (Wi-Fi bursts); p50 22 ms |
 | Frame sizes | Main IRAP up to 763 KB (about 550 packets), P-frames up to 359 KB; sub IRAP ≤ 139 KB |
 | Concurrency | Main + sub run concurrently on one Baichuan connection |
+| Wake path (20:22, camera asleep) | TCP 9000 refused while asleep **and stays closed while awake** (Baichuan runs over UDP on this model), so TCP 9000 is not a sleep indicator. Local UDP discovery woke the camera: 7 s from start to battery read. The camera's awake time after disconnect is **unmeasured** (open question 6). |
+| Exit bug | `neolink battery` logs `Connection Lost: Thread panicked` on exit (fixed in PLAN 1.5) |
 
 Golden transcripts from the GStreamer backend (2026-10-10, ffmpeg 8 client):
 
@@ -238,4 +290,5 @@ Still open:
 2. Camera µs counter behaviour across wake-from-sleep and reconnect (reset or continue?).
 3. Default for `parameter_sets` (A4b, Gate 3).
 4. Is the burst pattern the same on mains power, and on wired cameras? This decides the `pacing_latency_ms` default.
-5. Whether the owner allows a short capture of their camera as a CI fixture.
+5. ~~Whether the owner allows a short capture of their camera as a CI fixture.~~ Yes (2026-10-10).
+6. How long the camera stays awake after a clean logout plus `C2D_DISC`, compared with an abrupt drop. This needs a non-waking observation method. Candidate: the battery current reported in the next wake's first reading, compared across sessions with different disconnect styles.

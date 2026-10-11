@@ -80,6 +80,10 @@ Useful on its own; it **ships with the GStreamer backend**.
 | 1.7 | Dead-key warnings via the `toml::Value` pass (file and MQTT); a **config-corpus parse test** (R14) built from `sample_config.toml`, the README examples, and a few synthetic legacy configs | §3.3 |
 | 1.8 | `build.rs` gating; explicit tokio features; `strip = "symbols"`; release CI uses explicit feature lists instead of `--all-features` | §3.3 |
 | 1.9 | Docker: exec-form CMD, `NEO_LINK_MODE` argv pre-processing, `setrlimit`, entrypoint without the `exit 1` trap; still root and still the Debian image in this phase | §3.3 |
+| 1.11 | **Power (spec §4.1.1), part 1.** P1 (no connection at boot; sleep by default for battery/unknown cameras; explicit always-on with a warning), P2 (`idle_grace_s`, default 10 s, applied to the startup connection too), P3 (periodic tasks never connect; cached values with age), P4 (backoff only with demand), P6 (wake ledger and summary line), P7 (battery piggyback). These fix today's GStreamer neolink as well. | §10 |
+| 1.13 | **Power, part 3** (power review): P9 (local-first discovery, never parallel with cloud), P10 (no reasonless or boot-time permits; subscription-based idle observer), P11 (`run_task` deadlines, demand definition, MQTT coalescing), P12 (motion permits gated, reset and capped), P13 (logout + `C2D_DISC` on every path; drop the fixed sleeps; remove the bogus probe login), P14 (MQTT config/retain/availability), P15 (state file, lock file, CLI reads the state), P16 (GStreamer mounts from state), P17, P18 | §10 |
+| 1.14 | Fix the `Thread panicked` on CLI exit (observed 2026-10-10) as part of 1.5 shutdown | §3.3 |
+| 1.12 | **Power, part 2.** P5 cached snapshot endpoint (a small HTTP/1.1 listener sharing the RTSP auth module), P8 warning | §10 |
 | 1.10 | Test-only stats dump (task count, per-camera use-counter) on SIGUSR1 behind `cfg(any(test, feature = "debug-stats"))` | §4.8 |
 
 **Gate 1**
@@ -88,6 +92,8 @@ Useful on its own; it **ships with the GStreamer backend**.
   to 0 after *each* cycle, and the task count returns to baseline.
 - On hardware, 10 cycles with a 6 s gap (1 session): the use-counter returns to 0 each
   cycle, checked with the 1.10 dump.
+- **A23–A26 and A28–A30 pass against the scripted peer**; the peer mocks the p2p cloud host and counts broadcasts.
+- **A27 on hardware (1 evening session).**
 - The golden structural diff against the GStreamer backend is clean.
 - No password appears in `RUST_LOG=trace` output (grep test).
 - The config corpus parses.
@@ -208,14 +214,14 @@ Not scheduled.
 | Phase | Focused days | Hardware sessions |
 |---|---|---|
 | 0 | 4–6 | 2 |
-| 1 | 8–12 | 1 |
+| 1 | 16–22 | 2 |
 | 2 | 12–16 | 0 |
 | 3 | 10–14 | 0 |
 | 4 | 6–9 | 3–4 |
 | 5 | 8–12 | 2–3 |
 | 6 | 4–6 | 1 |
 | Review/fix buffer (7 gates, about 12 %) | 6–9 | — |
-| **Total** | **58–84 d** | **9–11** |
+| **Total** | **66–94 d** | **10–12** |
 
 For one developer that is about 3–4 months of calendar time. Phases run strictly in order
 (0 → 1 → … → 6). There is one developer, and Phase 2 depends on Gate 0's answers (Q2 shapes
@@ -243,13 +249,13 @@ the MediaClock; 0.7 provides fixtures). v1's "Phase 2 in parallel with Phase 1" 
 
 ## Owner decisions (2026-10-10)
 
+0. **Use case: on-demand viewing** of a battery/solar camera (HA dashboard, VLC). Power management is first-class (spec §4.1.1) and lands in Phase 1, before any RTSP work. Motion-triggered wake is v1.x.
+
 1. **Fixture permission: yes.** Short captures of the Argus may be committed as CI fixtures.
    0.5's `argus_reconnect.bcm` and a trimmed capture from 0.4 go under
    `crates/rtsp/tests/fixtures/`. Synthetic fixtures are still used for wrap, reset and
    A/V-sync tests.
-2. **Mains power: open.** The question: can the camera run on USB power for a day? If yes,
-   24 h hardware soaks (A15) are possible. If no, they are replaced by fixture soaks plus
-   ≤ 10 min hardware sessions.
+2. **Mains power: no** (solar only). A15 runs on fixtures only. The hardware budget stays at ≤ 10 min sessions, ≥ 40 % battery, and daytime sessions where possible.
 3. **Windows / Blue Iris: out of scope.** A14 is dropped. Windows artifacts stay out of
    v1.x (spec §4.2 item 4 is reduced to armv7 and macOS).
 4. **Pi 4: none.** N3/N4 run on an aarch64 VM or CI runner with fixtures. The Pi 4 numbers
