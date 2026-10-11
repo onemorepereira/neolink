@@ -257,7 +257,11 @@ async fn test_wake_fills_state_file() {
     assert_eq!(s.supported_streams, ["mainStream", "subStream"]);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while state.snapshot().is_none() {
-        assert!(tokio::time::Instant::now() < deadline, "no snapshot: {:?}", state.load());
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no snapshot: {:?}",
+            state.load()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(state.snapshot().unwrap().0, b"\xff\xd8fake jpeg\xff\xd9");
@@ -266,12 +270,103 @@ async fn test_wake_fills_state_file() {
 /// PLAN 1.5: shutting a connected camera down logs it out, quickly
 #[tokio::test]
 async fn test_shutdown_logs_out() {
-    let cam = FakeCamera::start(FakeCameraConfig::default()).await.unwrap();
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
     let mut neocam = new_neocam(config_for(&cam, "idle_disconnect = false")).await;
     wait_stats(&cam, 10, |s| s.logins == 1).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let t = tokio::time::Instant::now();
     neocam.shutdown().await;
-    assert!(t.elapsed() < Duration::from_secs(3), "shutdown took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "shutdown took {:?}",
+        t.elapsed()
+    );
     wait_stats(&cam, 2, |s| s.logouts == 1 && s.open_connections == 0).await;
+}
+
+fn fixture() -> std::sync::Arc<Vec<neolink_core::fixture::Record>> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/synth/plain_h264.bcm");
+    let file = std::fs::File::open(path).expect("run cargo xtask mkfixture --standard first");
+    std::sync::Arc::new(neolink_core::fixture::read_all(file).unwrap())
+}
+
+/// PLAN 1.3: dropping a stream releases the camera (stop + logout after the grace)
+#[tokio::test]
+async fn test_stream_cancel_releases_permit() {
+    let cam = FakeCamera::start(FakeCameraConfig {
+        main: fixture(),
+        loop_media: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let neocam = new_neocam(config_for(&cam, "idle_grace_s = 1")).await;
+    let instance = neocam.subscribe().await.unwrap();
+    let mut rx = instance
+        .stream(neolink_core::bc_protocol::StreamKind::Main)
+        .await
+        .unwrap();
+    assert!(rx.recv().await.is_some());
+    drop(rx);
+    wait_stats(&cam, 5, |s| s.video_stops == 1 && s.open_connections == 0).await;
+    assert_eq!(cam.stats().logouts, 1);
+}
+
+/// PLAN 1.3: a stalled camera (no frames) is released too; before, the permit was only
+/// dropped when the next frame failed to send
+#[tokio::test]
+async fn test_stalled_stream_cancel_releases_permit() {
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
+    let neocam = new_neocam(config_for(&cam, "idle_grace_s = 1")).await;
+    let instance = neocam.subscribe().await.unwrap();
+    let rx = instance
+        .stream(neolink_core::bc_protocol::StreamKind::Main)
+        .await
+        .unwrap();
+    wait_stats(&cam, 10, |s| s.video_starts == 1).await;
+    drop(rx);
+    wait_stats(&cam, 5, |s| s.open_connections == 0).await;
+    assert_eq!(cam.stats().logouts, 1);
+}
+
+/// PLAN 1.3: the pause.on_motion watchers stop with the stream
+#[tokio::test]
+async fn test_on_motion_stream_drop_stops_tasks() {
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
+    let neocam = new_neocam(config_for(
+        &cam,
+        "idle_grace_s = 1\n[pause]\non_motion = true",
+    ))
+    .await;
+    let instance = neocam.subscribe().await.unwrap();
+    // Baseline after one plain wake, so per-wake tasks are counted on both sides
+    instance
+        .run_task(|cam| Box::pin(async move { Ok(cam.get_linktype().await?) }))
+        .await
+        .unwrap();
+    wait_stats(&cam, 10, |s| s.open_connections == 0).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    let rx = instance
+        .stream_while_live(neolink_core::bc_protocol::StreamKind::Main)
+        .await
+        .unwrap();
+    wait_stats(&cam, 10, |s| s.video_starts == 1).await;
+    drop(rx);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The 5 s initial permit and the grace end, then everything it started is gone
+    wait_stats(&cam, 10, |s| s.open_connections == 0).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    assert!(after <= before, "tasks leaked: {} -> {}", before, after);
 }

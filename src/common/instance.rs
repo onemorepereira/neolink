@@ -21,6 +21,8 @@ use neolink_core::bc_protocol::BcCamera;
 
 #[cfg(feature = "gstreamer")]
 mod gst;
+mod stream;
+pub(crate) use stream::*;
 
 /// How long a [`NeoInstance::run_task`] may take before it fails (SPEC P11)
 pub(crate) const TASK_DEADLINE: Duration = Duration::from_secs(60);
