@@ -334,6 +334,7 @@ async fn test_stalled_stream_cancel_releases_permit() {
 }
 
 /// PLAN 1.3: the pause.on_motion watchers stop with the stream
+#[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
 #[tokio::test]
 async fn test_on_motion_stream_drop_stops_tasks() {
     let cam = FakeCamera::start(FakeCameraConfig::default())
@@ -356,7 +357,10 @@ async fn test_on_motion_stream_drop_stops_tasks() {
         .metrics()
         .num_alive_tasks();
     let rx = instance
-        .stream_while_live(neolink_core::bc_protocol::StreamKind::Main)
+        .stream_while_live(
+            neolink_core::bc_protocol::StreamKind::Main,
+            Some(tokio::time::Duration::from_secs(5)),
+        )
         .await
         .unwrap();
     wait_stats(&cam, 10, |s| s.video_starts == 1).await;

@@ -347,6 +347,63 @@ dev container (the same commands as CI):
 - Battery delta is logged for each session.
 - Red-team review.
 
+**Status (2026-10-11).** Code and CI part done on `feature/native-rtsp-p4`; the hardware
+sessions are pending (camera budget: 4 sessions were used on 2026-10-11).
+
+| # | Result |
+|---|---|
+| 4.1 | Feature `native-rtsp` (not default); `rtsp_backend` / `--rtsp-backend` (CLI, then config, then GStreamer if built in, else native; an unbuilt backend is a startup error); `rtsp` and `mqtt-rtsp` with either backend; all four feature combinations build and test |
+| 4.2 | `src/rtsp_native`:<br>- `NativeSource` maps `StreamEvent` → `SourceUnit` (ADPCM dropped, warned once; Paused/Retrying states);<br>- mounts come from the 15 s passive stream-info poll, seeded for sleeping cameras;<br>- descs are cached in the state dir |
+| 4.3 | Hot reload:<br>- users and `rtsp_auth` swap the server's auth;<br>- `permitted_users` are read per request;<br>- adding or removing a camera, or a change that shapes its streams, recreates its Hubs (BYE);<br>- entries are tagged per generation;<br>- a camera whose task ends is restarted |
+| 4.4 | New keys from DESIGN §7, validated and in the unknown-key lists. A reload adding `certificate` or `tls_client_auth` is refused whole, before any camera sees it |
+| 4.5 | `mqtt-rtsp` runs on the native backend:<br>- `mqtt_config_writes` gates the config topic, with a startup warning when users exist;<br>- `config/status` no longer echoes a parse error's source line |
+| 4.6 | R28: info lines for connect, close, play and stop (IP, mount, user), auth failures, and source start/stop; the Hub stats line at debug every 60 s |
+| 4.7 | `src/rtsp_native/tests.rs` against `FakeCamera`:<br>- one wake per DESCRIBE+PLAY, released after linger + grace;<br>- A21 after a restart (0 contacts over 22 s of probes);<br>- A12: 60 s idle, past `bridge_max_s`, then motion;<br>- hot reload: users, a refused certificate, removal and re-add;<br>- A8: 30 cycles back to the task baseline;<br>- main+sub together;<br>- a taken snapshot port;<br>- shutdown BYE;<br>- battery unknown is treated as battery |
+
+**Gate 4 (CI part).** The Gate 3 suite was re-run through `neolink rtsp` (native) and
+`xtask fakecam` (`SERVER=neolink` in `tests/e2e/{clients,golden-native,avsync}.sh`; CI runs
+both paths):
+- A1 and A2 at 120 s (0 decode errors), A2b, A4, A4b (strip), A5 at 300 s (0 lost, 0 too late);
+- A10: 21 of 21;
+- A19: 28 of 28;
+- A16: worst 73 ms at 15 min.
+
+Defects this found, all fixed:
+- the H.265 EOS packet;
+- re-latching by 1 µs (duplicate DTS);
+- a late joiner's cached IRAP stamped at a stale wire time;
+- audio SRs delayed by up to 2 s (VLC played audio 2–8 s late);
+- a learning start continuing as Demand without honouring `pause.on_motion`;
+- in the fake camera: VIDEO_STOP stopped all streams, and loop timing was wrong.
+
+**Red-team review.** 11 findings, all fixed:
+- the snapshot port taking the server down;
+- a half-applied refused reload;
+- shutdown order (R27);
+- linger (P17);
+- learning limits per camera, persisted, applied only when starting costs a wake, and one
+  wake teaches every kind (P18);
+- a camera not restarting;
+- a teardown/re-add race;
+- the `rtp_mtu` reload;
+- a false Retrying state at start;
+- a test gated for no-backend builds;
+- weak tests strengthened.
+
+**Notes for users:**
+- `pause.on_motion` needs motion events, which a camera sends only over an open connection.
+  On a sleeping camera, use push notifications (`pushnoti`), or the camera must stay
+  connected.
+- `bind`, `bind_port`, `limits` and `rtcp_sr` apply at start. `rtcp_sr` is per server: it
+  stays on while any camera wants it.
+- R11's per-client-IP learning limit is covered by the stricter per-camera limit.
+
+**Pending (hardware, ≤ 2 sessions/day, battery ≥ 40 %):**
+- the four Gate 4 sessions;
+- battery deltas;
+- the Phase 1 deferred 10-cycle check.
+
+
 ## Phase 5: client matrix and hardening (8–12 d; 2–3 hardware sessions, more with mains)
 
 | # | Task |

@@ -228,6 +228,11 @@ impl NeoReactor {
     }
 
     pub(crate) async fn update_config(&self, new_config: Config) -> Result<()> {
+        // Refused whole, before any camera sees it (SPEC R7: the previous config stays)
+        if let Some(why) = crate::config::reload_rejection(&new_config) {
+            log::error!("Config reload rejected: {why}");
+            return Err(anyhow::anyhow!("Config reload rejected: {why}"));
+        }
         let (sender_tx, sender_rx) = oneshot();
         self.commander
             .send(NeoReactorCommand::UpdateConfig(new_config, sender_tx))

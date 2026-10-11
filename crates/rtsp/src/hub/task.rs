@@ -56,6 +56,63 @@ pub struct HubConfig {
     pub describe_wait: Duration,
     /// In-band VPS/SPS/PPS handling (SPEC R10)
     pub parameter_sets: ParameterSets,
+    /// Keep the last IRAP in the cache, to show while the camera wakes
+    pub persist_irap: bool,
+    /// Shared by a camera's Hubs and persisted (SPEC P18); `None`: per Hub, in memory
+    pub learn_gate: Option<Arc<LearnGate>>,
+}
+
+/// At most one learning start per camera per interval, across its streams and restarts
+/// (SPEC R11, P18). The time of the last one is kept in a file when given one.
+#[derive(Debug)]
+pub struct LearnGate {
+    interval: Duration,
+    path: Option<std::path::PathBuf>,
+    last: std::sync::Mutex<Option<std::time::SystemTime>>,
+}
+
+impl LearnGate {
+    pub fn new(interval: Duration, path: Option<std::path::PathBuf>) -> Self {
+        let last = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .map(|s| std::time::UNIX_EPOCH + Duration::from_secs(s));
+        Self {
+            interval,
+            path,
+            last: std::sync::Mutex::new(last),
+        }
+    }
+
+    /// The SPEC's 10 minutes
+    pub fn standard(path: Option<std::path::PathBuf>) -> Self {
+        Self::new(LEARN_INTERVAL, path)
+    }
+
+    /// True (and taken) if no learning start ran within the interval
+    pub fn try_take(&self) -> bool {
+        let now = std::time::SystemTime::now();
+        let mut last = self.last.lock().unwrap();
+        // A clock that went back counts as recent
+        if last.is_some_and(|t| now.duration_since(t).map_or(true, |d| d < self.interval)) {
+            return false;
+        }
+        *last = Some(now);
+        if let Some(p) = &self.path {
+            let secs = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(p, secs.to_string()) {
+                log::warn!("could not persist the learning-start time: {e}");
+            }
+        }
+        true
+    }
 }
 
 /// In-band parameter sets (SPEC R10, DESIGN §5.1). The SDP always carries them.
@@ -87,6 +144,8 @@ impl HubConfig {
             skew_estimate_us: 0,
             describe_wait: Duration::from_secs(2),
             parameter_sets: ParameterSets::default(),
+            persist_irap: true,
+            learn_gate: None,
         }
     }
 }
@@ -130,6 +189,8 @@ enum Cmd {
     Pause(u64),
     Unsubscribe(u64),
     Stats(oneshot::Sender<HubStats>),
+    /// Stop the source, close every session and end the Hub (its mount went away)
+    Shutdown,
 }
 
 /// Talk to a Hub
@@ -167,6 +228,11 @@ impl HubHandle {
 
     pub async fn unsubscribe(&self, session: u64) {
         let _ = self.tx.send(Cmd::Unsubscribe(session)).await;
+    }
+
+    /// End the Hub: the source stops and every session is closed (BYE)
+    pub async fn shutdown(&self) {
+        let _ = self.tx.send(Cmd::Shutdown).await;
     }
 
     pub async fn stats(&self) -> Option<HubStats> {
@@ -368,7 +434,7 @@ impl Hub {
     fn new(cfg: HubConfig, source: Arc<dyn StreamSource>) -> Self {
         let cached = cfg.cache.as_ref().and_then(|c| c.load_desc());
         let cached_irap = match (&cfg.cache, &cached) {
-            (Some(c), Some(d)) => c.load_irap(d),
+            (Some(c), Some(d)) if cfg.persist_irap => c.load_irap(d),
             _ => None,
         };
         let rate = cached
@@ -443,8 +509,8 @@ impl Hub {
             let wake = self.next_wake();
             tokio::select! {
                 cmd = cmds.recv() => match cmd {
+                    Some(Cmd::Shutdown) | None => break,
                     Some(cmd) => self.command(cmd),
-                    None => break,
                 },
                 started = recv_start(&mut self.starting) => self.started(started),
                 unit = recv_opt(&mut self.source_rx) => match unit {
@@ -461,9 +527,12 @@ impl Hub {
         for s in self.sessions.values() {
             s.closed.cancel();
         }
-        if let (Some(cache), Some(desc), Some(irap)) =
-            (&self.cfg.cache, self.learner.current(), &self.cached_irap)
-        {
+        if let (true, Some(cache), Some(desc), Some(irap)) = (
+            self.cfg.persist_irap,
+            &self.cfg.cache,
+            self.learner.current(),
+            &self.cached_irap,
+        ) {
             let _ = cache.save_irap(desc, irap);
         }
     }
@@ -567,12 +636,12 @@ impl Hub {
                 let now = self.now_us();
                 let restamp = match (&self.cached_irap, self.codec, self.sessions.get(&id)) {
                     (Some(nals), Some(codec), Some(s)) if !s.playing => {
-                        // Late joiner: the last released IRAP, at the last wire time, plus
-                        // EOS where needed; live video then flows from the next IRAP (DESIGN §4.6)
-                        let wire = self
-                            .wire
-                            .last_out_wire()
-                            .unwrap_or_else(|| self.wire.virtual_now(now));
+                        // Late joiner: the last released IRAP, at the wire time of now, plus
+                        // EOS where needed; live video then flows from the next IRAP (DESIGN
+                        // §4.6). Not at the last wire time: after an idle spell that is long
+                        // past, and the client's first frame and SR would lie behind the
+                        // live media by the idle time
+                        let wire = self.wire.virtual_now(now);
                         let mut nals = nals.clone();
                         nals.extend(eos_nal(codec, &nals));
                         Some(self.video_frame(codec, &nals, true, wire))
@@ -593,6 +662,13 @@ impl Hub {
                 }
                 self.linger_until = None;
                 match self.running_mode() {
+                    // The source wants demand semantics (e.g. pause.on_motion): restart it
+                    // as Demand; the camera is awake, so this is no extra wake
+                    Some(StartMode::Learn) if self.source.restart_for_demand() => {
+                        self.stop_source();
+                        self.learn_deadline = None;
+                        self.start_source(StartMode::Demand);
+                    }
                     // A learning start simply becomes the demand start: no second wake
                     Some(StartMode::Learn) => {
                         if self.source_mode == Some(StartMode::Learn) {
@@ -616,6 +692,7 @@ impl Hub {
                     s.closed.cancel();
                 }
             }
+            Cmd::Shutdown => {} // handled by the loop
             Cmd::Stats(reply) => {
                 let now = self.now_us();
                 let mut st = self.stats.clone();
@@ -652,11 +729,17 @@ impl Hub {
         );
     }
 
+    /// Whether a learning start may run now; with a shared gate this takes it
     fn learning_allowed(&self) -> bool {
-        !self.cfg.battery
-            || self
+        if !self.cfg.battery || self.source.wake_is_free() {
+            return true;
+        }
+        match &self.cfg.learn_gate {
+            Some(g) => g.try_take(),
+            None => self
                 .last_learn
-                .is_none_or(|t| t.elapsed() >= LEARN_INTERVAL)
+                .is_none_or(|t| t.elapsed() >= LEARN_INTERVAL),
+        }
     }
 
     /// Start the source without blocking the Hub; the result arrives in `started`
@@ -773,6 +856,14 @@ impl Hub {
         // Frames of a stopped source are never released
         self.pacer.clear();
         self.bridge.reset();
+    }
+
+    /// One frame interval plus 1 ms, from the stream's fps (else 15 fps)
+    fn frame_gap_us(&self) -> u64 {
+        match self.learner.current().and_then(|d| d.framerate) {
+            Some(fps) if fps > 0 => 1_000_000 / fps as u64 + 1_000,
+            _ => crate::hub::wire::RELATCH_MIN_GAP_US,
+        }
     }
 
     /// After learning (which needs the in-band copies): strip, keep or inject
@@ -909,6 +1000,9 @@ impl Hub {
     }
 
     fn save_irap(&self, nals: &[Bytes]) {
+        if !self.cfg.persist_irap {
+            return;
+        }
         if let (Some(c), Some(d)) = (self.cfg.cache.clone(), self.learner.current().cloned()) {
             let nals = nals.to_vec();
             tokio::task::spawn_blocking(move || {
@@ -1007,8 +1101,10 @@ impl Hub {
                             continue; // live video resumes from an IRAP only
                         }
                         self.bridge.live(now);
+                        self.wire.min_gap_us = self.frame_gap_us();
                         self.wire.relatch(item.media_us, now);
                     } else if item.discontinuity {
+                        self.wire.min_gap_us = self.frame_gap_us();
                         self.wire.relatch(item.media_us, now);
                     }
                     self.last_video_wall = Some(now);
@@ -1741,6 +1837,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A source whose demand starts differ (pause.on_motion) is restarted as Demand when a
+    /// session plays during its learning start
+    #[tokio::test(start_paused = true)]
+    async fn test_learn_restarts_as_demand_when_the_source_asks() {
+        let (h, source) = hub("plain_h265.bcm", true);
+        source.restart_for_demand.store(true, Ordering::SeqCst);
+        h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        let frames = drain(&mut sub, 5).await;
+        assert!(frames.iter().any(|f| f.track == Track::Video));
+        assert_eq!(
+            source.starts.lock().unwrap().as_slice(),
+            &[StartMode::Learn, StartMode::Demand]
+        );
+        assert_eq!(
+            source.running.load(Ordering::SeqCst),
+            1,
+            "the learning start ended"
+        );
+    }
+
+    /// A cold PLAY after an idle minute: the cached IRAP goes out at the wire time of now,
+    /// not at the last wire time from a minute ago, so live media follows it closely
+    #[tokio::test(start_paused = true)]
+    async fn test_cold_play_restamp_is_current() {
+        let source = Arc::new(FixtureSource::new(
+            fixture("plain_h265.bcm"),
+            1.0,
+            Some(false),
+        ));
+        source.looping.store(true, Ordering::SeqCst);
+        let mut cfg = HubConfig::new("test");
+        cfg.battery = false;
+        let h = spawn(cfg, source.clone());
+        h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        drain(&mut sub, 4).await;
+        h.unsubscribe(1).await;
+        drop(sub);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            source.running.load(Ordering::SeqCst),
+            0,
+            "stopped after linger"
+        );
+        let mut sub = h.subscribe(2).await.unwrap();
+        h.play(2).await;
+        let frames = drain(&mut sub, 5).await;
+        let video: Vec<u64> = frames
+            .iter()
+            .filter(|f| f.track == Track::Video)
+            .map(|f| f.wire_us)
+            .collect();
+        assert!(video.len() > 10);
+        let step = video[1] - video[0];
+        assert!(
+            step < 3_000_000,
+            "first frame then live: {step} µs on the wire"
+        );
+    }
+
+    /// P18: one learning start per camera across its streams and restarts
+    #[test]
+    fn test_learn_gate_shared_and_persisted() {
+        let path = std::env::temp_dir().join(format!(
+            "neolink-learn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let g = Arc::new(LearnGate::standard(Some(path.clone())));
+        assert!(g.try_take(), "the first");
+        assert!(!g.try_take(), "the second, e.g. the sub stream's");
+        // A restart reads the time back
+        let again = LearnGate::standard(Some(path.clone()));
+        assert!(!again.try_take());
+        // ... and after the interval it is allowed
+        let short = LearnGate::new(Duration::from_millis(1), Some(path.clone()));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(short.try_take());
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A spinning Hub never lets paused time advance, so these tests would hang: fail

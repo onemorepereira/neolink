@@ -8,7 +8,7 @@ mod pushnoti;
 mod reactor;
 mod state;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod usecounter;
 
 pub(crate) use camthread::*;

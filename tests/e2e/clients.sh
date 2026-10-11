@@ -10,7 +10,11 @@
 #      A5_SECS (60; the full gate is 300), PSETS (the --parameter-sets mode for the main
 #      server, default the server's own), A4B_MODES ("strip passthrough inject"),
 #      A4B_GATE (the A4b modes that must pass, default "strip"),
-#      PORT (base port, default 48710; uses PORT..PORT+29).
+#      PORT (base port, default 48710; uses PORT..PORT+29),
+#      SERVER (rtsp-serve, the default, or neolink: `neolink rtsp` on the native backend
+#      against `xtask fakecam`, which needs neolink built with --features native-rtsp;
+#      Gate 4 re-runs the matrix this way), NEOLINK_EXTRA (extra camera config lines
+#      with SERVER=neolink).
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
@@ -46,7 +50,42 @@ cleanup() { for p in $PIDS; do kill -TERM "$p" 2>/dev/null; done; wait 2>/dev/nu
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+# The rtsp-serve options as a neolink config: --user, --permit, --auth, --parameter-sets
+serve_neolink() { # port name extra-args...; sets SRV
+  p=$1; n=$2; shift 2
+  users=""; permit=""; auth=""; psets=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --user) users="$users
+[[users]]
+name = \"${2%%:*}\"
+pass = \"${2#*:}\""; shift 2;;
+      --permit) permit="$permit\"$2\", "; shift 2;;
+      --auth) auth="rtsp_auth = [\"$2\"]"; shift 2;;
+      --parameter-sets) psets="parameter_sets = \"$2\""; shift 2;;
+      *) echo "serve_neolink: unknown option $1"; exit 2;;
+    esac
+  done
+  "$BIN/xtask" fakecam --addr-file "$W/fake.$n" --stats "$W/fakestats.$n.json" \
+    --main "$F/plain_h265.bcm" --sub "$F/plain_h264.bcm" > "$W/fake.$n.log" 2>&1 &
+  PIDS="$PIDS $!"
+  wait_for "$W/fake.$n" || { echo "fakecam $n did not start"; exit 2; }
+  {
+    printf 'bind = "127.0.0.1"\nbind_port = %s\nsnapshot_port = 0\nrtsp_backend = "native"\n%s\n' "$p" "$auth"
+    printf '[[cameras]]\nname = "argus"\nusername = "admin"\npassword = "fakepass"\naddress = "%s"\n%s\n%s\n' \
+      "$(cat "$W/fake.$n")" "$psets" "${NEOLINK_EXTRA:-}"
+    [ -n "$permit" ] && printf 'permitted_users = [%s]\n' "${permit%, }"
+    printf '%s\n' "$users"
+  } > "$W/neolink.$n.toml"
+  NEOLINK_STATE_DIR="$W/state.$n" RUST_LOG=info "$BIN/neolink" rtsp --config "$W/neolink.$n.toml" \
+    > "$W/server.$n.log" 2>&1 &
+  SRV=$!; PIDS="$PIDS $SRV"
+  i=0; until grep -q "Starting RTSP Server (native)" "$W/server.$n.log" || [ $i -gt 300 ]; do sleep 0.1; i=$((i+1)); done
+  grep -q "Starting RTSP Server (native)" "$W/server.$n.log" || { echo "neolink $n did not start:"; cat "$W/server.$n.log"; exit 2; }
+}
+
 serve() { # port name extra-args...; sets SRV
+  if [ "${SERVER:-rtsp-serve}" = neolink ]; then serve_neolink "$@"; return; fi
   p=$1; n=$2; shift 2
   "$BIN/xtask" rtsp-serve --bind 127.0.0.1:$p --main "$F/plain_h265.bcm" --sub "$F/plain_h264.bcm" \
     --loop --ready-file "$W/ready.$n" --stats "$W/stats.$n.json" "$@" > "$W/server.$n.log" 2>&1 &

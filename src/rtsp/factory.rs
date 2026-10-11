@@ -171,7 +171,9 @@ pub(super) async fn make_factory(
 
                         // Start the camera
                         let config = camera.config().await?.borrow().clone();
-                        let mut media_rx = camera.stream_while_live(stream).await?;
+                        let mut media_rx = camera
+                            .stream_while_live(stream, Some(tokio::time::Duration::from_secs(5)))
+                            .await?;
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
                         // Learn the camera data type

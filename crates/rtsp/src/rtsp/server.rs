@@ -75,7 +75,8 @@ impl Default for ServerConfig {
 pub struct Server {
     pub config: ServerConfig,
     pub routes: Routes,
-    pub auth: Auth,
+    /// Swapped whole when users change (`set_auth`)
+    auth: std::sync::RwLock<Arc<Auth>>,
     pub provider: Arc<dyn Provider>,
     connections: AtomicUsize,
     /// Keyed by `ip_key`, as is `failed_auth`
@@ -106,7 +107,7 @@ impl Server {
         Arc::new(Self {
             config,
             routes,
-            auth,
+            auth: std::sync::RwLock::new(Arc::new(auth)),
             provider,
             connections: AtomicUsize::new(0),
             unauth_per_ip: Mutex::new(HashMap::new()),
@@ -115,6 +116,22 @@ impl Server {
             next_session: AtomicU64::new(rand::random::<u32>() as u64),
             ntp_epoch_us: unix_us + NTP_UNIX_OFFSET * 1_000_000,
         })
+    }
+
+    /// Connections open now
+    pub fn connection_count(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    /// The current users and schemes
+    pub fn auth(&self) -> Arc<Auth> {
+        self.auth.read().unwrap().clone()
+    }
+
+    /// Replace the users and schemes (hot reload). Outstanding Digest nonces become
+    /// invalid; clients answer the next 401 with new credentials.
+    pub fn set_auth(&self, auth: Auth) {
+        *self.auth.write().unwrap() = Arc::new(auth);
     }
 
     /// Accept connections until `cancel`
@@ -268,7 +285,7 @@ impl Server {
             }
             // With users configured, authenticate within a bound (playing an anonymous
             // mount is exempt): unauthenticated clients can't hold slots forever
-            if !conn.authenticated && !conn.playing() && self.auth.have_users() {
+            if !conn.authenticated && !conn.playing() && self.auth().have_users() {
                 idle_deadline = idle_deadline.min(connected + self.config.unauthenticated_lifetime);
             }
             let n = tokio::select! {
@@ -460,6 +477,12 @@ impl Conn {
 
     async fn teardown(&mut self) {
         if let Some(s) = self.session.take() {
+            log::info!(
+                "rtsp: {} stopped {}/{}",
+                self.ip,
+                s.target.camera,
+                s.target.kind.name()
+            );
             s.hub.unsubscribe(s.num).await;
             s.closed.cancel();
         }
@@ -476,7 +499,7 @@ impl Conn {
         req: &Request,
         allowed: Allowed,
     ) -> Result<Option<String>, Response> {
-        match self.server.auth.check(
+        match self.server.auth().check(
             &allowed,
             &req.method,
             &req.uri,
@@ -608,7 +631,7 @@ impl Conn {
         let Some((target, path)) = self.server.routes.lookup(&req.uri) else {
             // With users configured, an unauthenticated client must not learn which mounts
             // exist: check the credentials (any user) before answering 404
-            if self.server.auth.have_users() {
+            if self.server.auth().have_users() {
                 self.authorize_with(req, Allowed::Everyone).await?;
             }
             return Err(Response::new(404));
@@ -799,6 +822,14 @@ impl Conn {
         }
         let _ = done_rx.await;
         s.playing = true;
+        // SPEC R28: who plays what
+        log::info!(
+            "rtsp: {} playing {}/{} as {}",
+            self.ip,
+            s.target.camera,
+            s.target.kind.name(),
+            s.user.as_deref().unwrap_or("anonymous")
+        );
         Ok(None)
     }
 
@@ -960,7 +991,15 @@ async fn writer(
             Either::Ctl(WriterCmd::Close) => break,
             Either::Frame(f) => {
                 last_wire_seen = last_wire_seen.max(f.wire_us);
-                send_frame(&mut w, &mut tracks, &f, stall).await
+                let first = tracks.get(&f.track).is_some_and(|t| t.state.packets == 0);
+                let mut r = send_frame(&mut w, &mut tracks, &f, stall).await;
+                // A track's first packets get an SR at once: until one arrives, live555
+                // (VLC) can't place them on the shared clock, and a track that starts
+                // later (audio after a late joiner's IRAP) would wait for the next tick
+                if r.is_ok() && first && rtcp_sr {
+                    r = send_sr(&mut w, &tracks, last_wire_seen, ntp_epoch_us, stall).await;
+                }
+                r
             }
             Either::Sr => {
                 if rtcp_sr {

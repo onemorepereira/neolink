@@ -1911,6 +1911,7 @@ dependencies = [
  "log",
  "md5",
  "neolink_core",
+ "neolink_rtsp",
  "once_cell",
  "quick-xml",
  "regex",
