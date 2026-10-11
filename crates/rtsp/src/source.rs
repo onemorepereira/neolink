@@ -145,7 +145,7 @@ impl StreamSource for FixtureSource {
                 let first = units.first().map(|u| u.at_us).unwrap_or(0);
                 for u in units.iter() {
                     let at = std::time::Duration::from_micros(
-                        ((u.at_us - first) as f64 / speed.max(1e-6)) as u64,
+                        (u.at_us.saturating_sub(first) as f64 / speed.max(1e-6)) as u64,
                     );
                     tokio::select! {
                         _ = cancel.cancelled() => break,

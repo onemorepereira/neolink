@@ -17,7 +17,7 @@ use super::wire::{eos_nal, Bridge, BridgeOut, SessionGuard, SourceState, Track, 
 use crate::codec::aac::{adts_access_units, silent_au, AdtsHeader};
 use crate::codec::annexb::{is_irap, split_nals, NalFilter, VideoCodec};
 use crate::rtp::packetize::{self, RtpChunk};
-use crate::source::{SourceUnit, StartMode, StreamSource};
+use crate::source::{SourceUnit, StartMode, StartResult, StreamSource};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -175,6 +175,8 @@ pub struct HubStats {
     pub guard_engaged: u64,
     pub pacer_underruns: u64,
     pub max_queued_bytes: usize,
+    /// Frames waiting in the pacer (Hub memory)
+    pub pacer_queued: usize,
     /// N2: added latency (release lateness + processing) per frame, µs, log2 buckets:
     /// bucket i counts latencies in [2^i, 2^(i+1))
     pub added_latency_hist: [u64; 24],
@@ -293,17 +295,26 @@ struct Hub {
     codec: Option<VideoCodec>,
     restarted: bool,
     ever_started: bool,
+    /// Drop video until the first IRAP after a (re)start (DESIGN §4.4)
+    need_irap: bool,
     state: SourceState,
     // Source
     source_cancel: Option<CancellationToken>,
     source_rx: Option<mpsc::Receiver<SourceUnit>>,
     source_mode: Option<StartMode>,
+    /// A start in progress: it never blocks the Hub (a battery wake can take seconds)
+    starting: Option<oneshot::Receiver<(StartMode, CancellationToken, StartResult)>>,
+    starting_mode: Option<StartMode>,
+    retry_at: Option<Instant>,
+    retry_backoff: Duration,
+    started_at: Option<Instant>,
     learn_deadline: Option<Instant>,
     last_learn: Option<Instant>,
     linger_until: Option<Instant>,
     // Output
     sessions: HashMap<u64, Session>,
     describe_waiters: Vec<oneshot::Sender<Result<StreamDesc, DescribeError>>>,
+    /// The last *released* IRAP: what late joiners and the bridge show
     cached_irap: Option<Vec<Bytes>>,
     irap_policy: IrapWritePolicy,
     last_video_wall: Option<u64>,
@@ -317,7 +328,23 @@ struct Hub {
 
 const LEARN_INTERVAL: Duration = Duration::from_secs(600);
 const LEARN_MAX: Duration = Duration::from_secs(10);
+/// After the desc is ready, a learning start waits this long for the PLAY
+const LEARN_AFTER_READY: Duration = Duration::from_secs(3);
 const MIN_BUDGET: usize = 4 * 1024 * 1024;
+const RETRY_MIN: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+
+impl Drop for Hub {
+    /// Also on a panic: the camera stream and the sessions must not outlive the Hub
+    fn drop(&mut self) {
+        if let Some(c) = self.source_cancel.take() {
+            c.cancel();
+        }
+        for s in self.sessions.values() {
+            s.closed.cancel();
+        }
+    }
+}
 
 impl Hub {
     fn new(cfg: HubConfig, source: Arc<dyn StreamSource>) -> Self {
@@ -326,21 +353,35 @@ impl Hub {
             (Some(c), Some(d)) => c.load_irap(d),
             _ => None,
         };
-        let au_us = if cfg.audio { 64_000 } else { 0 };
+        let rate = cached
+            .as_ref()
+            .and_then(|d| d.audio.as_ref())
+            .map(|a| a.sample_rate)
+            .unwrap_or(16000);
+        let mut clock = MediaClock::new(rate, cfg.skew_estimate_us);
+        clock.set_sample_rate(rate);
+        let au_us = if cfg.audio { clock.au_us() } else { 0 };
+        let codec = cached.as_ref().map(|d| d.video.codec.into());
         Self {
-            clock: MediaClock::new(16000, cfg.skew_estimate_us),
+            clock,
             learner: DescLearner::new(cfg.audio, cached),
             pacer: Pacer::new(cfg.latency_us),
             wire: WireClock::new(),
             bridge: Bridge::new(cfg.latency_us, cfg.bridge_fps, au_us, cfg.bridge_max_s),
             filter: NalFilter::default(),
-            codec: None,
+            codec,
             restarted: false,
             ever_started: false,
+            need_irap: true,
             state: SourceState::Streaming,
             source_cancel: None,
             source_rx: None,
             source_mode: None,
+            starting: None,
+            starting_mode: None,
+            retry_at: None,
+            retry_backoff: RETRY_MIN,
+            started_at: None,
             learn_deadline: None,
             last_learn: None,
             linger_until: None,
@@ -372,6 +413,10 @@ impl Hub {
         self.sessions.values().filter(|s| s.playing).count()
     }
 
+    fn running_mode(&self) -> Option<StartMode> {
+        self.source_mode.or(self.starting_mode)
+    }
+
     async fn run(mut self, cmds: &mut mpsc::Receiver<Cmd>) {
         let mut stats_tick = tokio::time::interval(Duration::from_secs(60));
         stats_tick.tick().await;
@@ -379,22 +424,19 @@ impl Hub {
             let wake = self.next_wake();
             tokio::select! {
                 cmd = cmds.recv() => match cmd {
-                    Some(cmd) => self.command(cmd).await,
+                    Some(cmd) => self.command(cmd),
                     None => break,
                 },
+                started = recv_start(&mut self.starting) => self.started(started),
                 unit = recv_opt(&mut self.source_rx) => match unit {
                     Some(unit) => self.ingest(unit),
-                    None => {
-                        // The source ended: treat as an outage until demand restarts it
-                        self.source_rx = None;
-                        self.state = SourceState::Retrying;
-                    }
+                    None => self.source_ended(),
                 },
                 _ = sleep_opt(wake) => {}
                 _ = stats_tick.tick() => self.log_stats(),
             }
             self.release();
-            self.housekeeping().await;
+            self.housekeeping();
         }
         self.stop_source();
         for s in self.sessions.values() {
@@ -421,28 +463,35 @@ impl Hub {
             .into_iter()
             .min()
             .map(|us| self.epoch + Duration::from_micros(us));
-        for e in [self.linger_until, self.learn_deadline]
+        for e in [self.linger_until, self.learn_deadline, self.retry_at]
             .into_iter()
             .flatten()
         {
             wake = Some(wake.map_or(e, |w| w.min(e)));
         }
+        // A pending outage still needs bridge_max checks
+        if self.state == SourceState::Retrying && self.playing() > 0 {
+            let e = Instant::now() + Duration::from_secs(1);
+            wake = Some(wake.map_or(e, |w| w.min(e)));
+        }
         wake
     }
 
-    async fn command(&mut self, cmd: Cmd) {
+    fn command(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Describe(reply) => {
                 if let Some(d) = self.learner.current() {
                     let _ = reply.send(Ok(d.clone()));
                     return;
                 }
-                if !self.learning_allowed() {
-                    let _ = reply.send(Err(DescribeError::NotReady));
-                    return;
-                }
-                if self.source_rx.is_none() {
-                    self.start_source(StartMode::Learn).await;
+                // A learning (or any) start already running: wait for it
+                let running = self.running_mode().is_some();
+                if !running {
+                    if !self.learning_allowed() {
+                        let _ = reply.send(Err(DescribeError::NotReady));
+                        return;
+                    }
+                    self.start_source(StartMode::Learn);
                 }
                 let wait = self.cfg.describe_wait;
                 let (tx, rx) = oneshot::channel();
@@ -467,7 +516,7 @@ impl Hub {
                 let (tx, rx) = mpsc::channel(4096);
                 let queued = Arc::new(AtomicUsize::new(0));
                 let closed = CancellationToken::new();
-                self.sessions.insert(
+                let old = self.sessions.insert(
                     id,
                     Session {
                         tx,
@@ -480,6 +529,9 @@ impl Hub {
                         audio_from: None,
                     },
                 );
+                if let Some(old) = old {
+                    old.closed.cancel();
+                }
                 let _ = reply.send(Ok(Subscription {
                     desc,
                     rx,
@@ -489,34 +541,45 @@ impl Hub {
             }
             Cmd::Play(id) => {
                 let now = self.now_us();
-                let late = self.cached_irap.clone();
-                let codec = self.codec;
-                let mut restamp = None;
+                let restamp = match (&self.cached_irap, self.codec, self.sessions.get(&id)) {
+                    (Some(nals), Some(codec), Some(s)) if !s.playing => {
+                        // Late joiner: the last released IRAP, at the last wire time, plus
+                        // EOS; live video then flows from the next IRAP (DESIGN §4.6)
+                        let wire = self
+                            .wire
+                            .last_out_wire()
+                            .unwrap_or_else(|| self.wire.virtual_now(now));
+                        let mut nals = nals.clone();
+                        nals.push(eos_nal(codec));
+                        Some(self.video_frame(codec, &nals, true, wire))
+                    }
+                    _ => None,
+                };
+                let budget = self.budget();
                 if let Some(s) = self.sessions.get_mut(&id) {
                     s.playing = true;
-                    // Late joiner: the cached IRAP restamped at the last wire time, plus EOS
-                    if let (Some(nals), Some(codec)) = (late, codec) {
-                        let wire = self.wire.virtual_now(now);
-                        restamp = Some((wire, nals, codec));
-                    }
-                }
-                if let Some((wire, mut nals, codec)) = restamp {
-                    nals.push(eos_nal(codec));
-                    let frame = self.video_frame(codec, &nals, true, wire);
-                    let budget = self.budget();
-                    if let Some(s) = self.sessions.get_mut(&id) {
+                    if let Some(frame) = restamp {
+                        let wire = frame.wire_us;
                         if s.guard.admit(Track::Video, wire, true) {
                             s.audio_from = Some(wire);
                             send(s, frame, budget, &mut self.stats);
+                            s.guard.after_restamp();
                         }
                     }
                 }
                 self.linger_until = None;
-                if self.source_rx.is_none() || self.source_mode == Some(StartMode::Learn) {
-                    if self.source_mode == Some(StartMode::Learn) {
-                        self.stop_source();
+                match self.running_mode() {
+                    // A learning start simply becomes the demand start: no second wake
+                    Some(StartMode::Learn) => {
+                        if self.source_mode == Some(StartMode::Learn) {
+                            self.source_mode = Some(StartMode::Demand);
+                        } else {
+                            self.starting_mode = Some(StartMode::Demand);
+                        }
+                        self.learn_deadline = None;
                     }
-                    self.start_source(StartMode::Demand).await;
+                    Some(StartMode::Demand) => {}
+                    None => self.start_source(StartMode::Demand),
                 }
             }
             Cmd::Pause(id) => {
@@ -530,15 +593,17 @@ impl Hub {
                 }
             }
             Cmd::Stats(reply) => {
+                let now = self.now_us();
                 let mut st = self.stats.clone();
                 st.sessions = self.sessions.len();
                 st.playing = self.playing();
                 st.source_running = self.source_rx.is_some();
                 st.budget = self.budget();
-                st.bridged_us = self.bridge.bridged_us;
+                st.bridged_us = self.bridge.bridged_total(now);
                 st.drift_corrections = self.clock.drift_corrections;
                 st.guard_engaged = self.wire.stats.guard_engaged;
                 st.pacer_underruns = self.pacer.stats.underruns;
+                st.pacer_queued = self.pacer.queued();
                 let _ = reply.send(st);
             }
         }
@@ -558,7 +623,7 @@ impl Hub {
             self.clock.drift_corrections,
             self.wire.stats.guard_engaged,
             self.pacer.stats.underruns,
-            self.bridge.bridged_us / 1_000_000,
+            self.bridge.bridged_total(self.now_us()) / 1_000_000,
             self.stats.learning_starts,
         );
     }
@@ -570,7 +635,11 @@ impl Hub {
                 .is_none_or(|t| t.elapsed() >= LEARN_INTERVAL)
     }
 
-    async fn start_source(&mut self, mode: StartMode) {
+    /// Start the source without blocking the Hub; the result arrives in `started`
+    fn start_source(&mut self, mode: StartMode) {
+        if self.running_mode().is_some() {
+            return;
+        }
         let cancel = CancellationToken::new();
         if mode == StartMode::Learn {
             self.last_learn = Some(Instant::now());
@@ -579,23 +648,75 @@ impl Hub {
         } else {
             self.learn_deadline = None;
         }
-        match self.source.start(mode, cancel.clone()).await {
+        self.retry_at = None;
+        let fut = self.source.start(mode, cancel.clone());
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let r = fut.await;
+            let _ = tx.send((mode, cancel, r));
+        });
+        self.starting = Some(rx);
+        self.starting_mode = Some(mode);
+    }
+
+    fn started(&mut self, started: Option<(StartMode, CancellationToken, StartResult)>) {
+        self.starting = None;
+        let mode = self.starting_mode.take();
+        let Some((_, cancel, result)) = started else {
+            // The start itself failed (it panicked): an outage
+            self.state = SourceState::Retrying;
+            self.schedule_retry();
+            return;
+        };
+        match result {
             Ok(rx) => {
                 if self.ever_started {
                     // Not the first start: its timeline is discontinuous with the last
                     self.restarted = true;
                 }
+                self.ever_started = true;
+                self.need_irap = true;
+                let mode = mode.unwrap_or(StartMode::Demand);
                 log::info!("{}: source started ({mode:?})", self.cfg.name);
                 self.source_rx = Some(rx);
                 self.source_cancel = Some(cancel);
                 self.source_mode = Some(mode);
                 self.state = SourceState::Streaming;
+                self.started_at = Some(Instant::now());
             }
             Err(e) => {
+                cancel.cancel();
                 log::warn!("{}: source failed to start: {e}", self.cfg.name);
                 self.state = SourceState::Retrying;
+                self.schedule_retry();
             }
         }
+    }
+
+    /// The source closed its channel: cancel it (the only way it is stopped) and retry
+    /// with backoff while there is demand
+    fn source_ended(&mut self) {
+        log::info!("{}: source ended", self.cfg.name);
+        // A source that ran for a while starts the backoff afresh; one that keeps ending
+        // quickly backs off further
+        if self
+            .started_at
+            .is_some_and(|t| t.elapsed() >= Duration::from_secs(30))
+        {
+            self.retry_backoff = RETRY_MIN;
+        }
+        if let Some(c) = self.source_cancel.take() {
+            c.cancel();
+        }
+        self.source_rx = None;
+        self.source_mode = None;
+        self.state = SourceState::Retrying;
+        self.schedule_retry();
+    }
+
+    fn schedule_retry(&mut self) {
+        self.retry_at = Some(Instant::now() + self.retry_backoff);
+        self.retry_backoff = (self.retry_backoff * 2).min(RETRY_MAX);
     }
 
     fn stop_source(&mut self) {
@@ -605,10 +726,20 @@ impl Hub {
         }
         self.source_rx = None;
         self.source_mode = None;
+        // A start still in flight is cancelled when it lands
+        if let Some(mut rx) = self.starting.take() {
+            tokio::spawn(async move {
+                if let Ok((_, cancel, _)) = (&mut rx).await {
+                    cancel.cancel();
+                }
+            });
+        }
+        self.starting_mode = None;
         self.learn_deadline = None;
+        self.retry_at = None;
         // Frames of a stopped source are never released
         self.pacer.clear();
-        self.ever_started = true;
+        self.bridge.reset();
     }
 
     fn ingest(&mut self, unit: SourceUnit) {
@@ -629,6 +760,10 @@ impl Hub {
                     return;
                 }
                 let irap = irap || nals.iter().any(|n| is_irap(codec, n));
+                if self.need_irap && !irap {
+                    return; // nothing decodes before the first IRAP of a start
+                }
+                self.need_irap = false;
                 let restarted = std::mem::take(&mut self.restarted);
                 let t = self.clock.video(cam_us, restarted, now);
                 if restarted || t.discontinuity {
@@ -636,14 +771,6 @@ impl Hub {
                 }
                 if let Some(ev) = self.learner.video(codec, &nals, irap, t.media_us, now) {
                     self.desc_event(ev);
-                }
-                if irap {
-                    self.cached_irap = Some(nals.clone());
-                    if let (Some(cache), Some(desc)) = (&self.cfg.cache, self.learner.current()) {
-                        if self.irap_policy.should_write(now, false, false) {
-                            let _ = cache.save_irap(desc, &nals);
-                        }
-                    }
                 }
                 self.pacer.push(
                     now,
@@ -664,6 +791,8 @@ impl Hub {
                     return;
                 };
                 self.audio_channels = header.channel_config.max(1);
+                self.clock.set_sample_rate(header.sample_rate());
+                self.bridge.set_au_us(self.clock.au_us());
                 if let Some(ev) = self.learner.audio(&header, now) {
                     self.desc_event(ev);
                 }
@@ -687,11 +816,37 @@ impl Hub {
                     }
                 }
             }
-            SourceUnit::Restarted => self.restarted = true,
+            SourceUnit::Restarted => {
+                self.restarted = true;
+                self.need_irap = true;
+            }
             SourceUnit::State(s) => self.state = s,
         }
         if let Some(ev) = self.learner.check_timeout(now) {
             self.desc_event(ev);
+        }
+    }
+
+    /// Cache writes happen on the blocking pool, never on the Hub task
+    fn save_desc(&self, d: &StreamDesc) {
+        if let Some(c) = self.cfg.cache.clone() {
+            let d = d.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = c.save_desc(&d) {
+                    log::warn!("could not save the stream desc: {e}");
+                }
+            });
+        }
+    }
+
+    fn save_irap(&self, nals: &[Bytes]) {
+        if let (Some(c), Some(d)) = (self.cfg.cache.clone(), self.learner.current().cloned()) {
+            let nals = nals.to_vec();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = c.save_irap(&d, &nals) {
+                    log::warn!("could not save the cached IRAP: {e}");
+                }
+            });
         }
     }
 
@@ -705,11 +860,14 @@ impl Hub {
                     d.video.width,
                     d.video.height
                 );
-                if let Some(c) = &self.cfg.cache {
-                    let _ = c.save_desc(&d);
-                }
+                self.save_desc(&d);
                 for w in self.describe_waiters.drain(..) {
                     let _ = w.send(Ok(d.clone()));
+                }
+                // A learning start now only waits a little for the PLAY
+                if self.source_mode == Some(StartMode::Learn) {
+                    let soon = Instant::now() + LEARN_AFTER_READY;
+                    self.learn_deadline = Some(self.learn_deadline.map_or(soon, |d| d.min(soon)));
                 }
             }
             DescEvent::Changed(d) => {
@@ -718,9 +876,10 @@ impl Hub {
                     self.cfg.name,
                     d.gen
                 );
-                if let Some(c) = &self.cfg.cache {
-                    let _ = c.save_desc(&d);
-                }
+                self.save_desc(&d);
+                // The cached IRAP belongs to the old stream
+                self.cached_irap = None;
+                self.irap_policy = IrapWritePolicy::default();
                 for s in self.sessions.values() {
                     if s.gen != d.gen {
                         s.closed.cancel();
@@ -728,11 +887,7 @@ impl Hub {
                 }
                 self.sessions.retain(|_, s| !s.closed.is_cancelled());
             }
-            DescEvent::LateAudio(d) => {
-                if let Some(c) = &self.cfg.cache {
-                    let _ = c.save_desc(&d);
-                }
-            }
+            DescEvent::LateAudio(d) => self.save_desc(&d),
         }
     }
 
@@ -778,8 +933,13 @@ impl Hub {
             let Some(codec) = self.codec else { continue };
             let wire = match item.track {
                 Track::Video => {
-                    // Resuming after a bridge, or a MediaClock discontinuity, re-latches
-                    if (item.irap && self.bridge.live(now)) || item.discontinuity {
+                    if self.bridge.active() {
+                        if !item.irap {
+                            continue; // live video resumes from an IRAP only
+                        }
+                        self.bridge.live(now);
+                        self.wire.relatch(item.media_us, now);
+                    } else if item.discontinuity {
                         self.wire.relatch(item.media_us, now);
                     }
                     self.last_video_wall = Some(now);
@@ -789,7 +949,12 @@ impl Hub {
                     if self.bridge.active() {
                         continue; // live audio is dropped while bridging
                     }
-                    self.wire.stamp(Track::Audio, item.media_us, now)
+                    // Right after a resume, live audio can overlap the bridge's silent
+                    // audio: drop it rather than send it out of order
+                    match self.wire.stamp_if_after(Track::Audio, item.media_us, now) {
+                        Some(w) => w,
+                        None => continue,
+                    }
                 }
             };
             let frame = match item.track {
@@ -800,6 +965,10 @@ impl Hub {
                 if item.irap {
                     self.max_gop_bytes = self.max_gop_bytes.max(self.gop_bytes);
                     self.gop_bytes = 0;
+                    if self.irap_policy.should_write(now, false, false) {
+                        self.save_irap(&item.data);
+                    }
+                    self.cached_irap = Some(item.data.clone());
                 }
                 self.gop_bytes += frame.bytes;
             } else {
@@ -807,10 +976,10 @@ impl Hub {
             }
             self.fan_out(frame);
         }
-        if released > 0 {
+        if let Some(per) = (started.elapsed().as_micros() as u64).checked_div(released) {
             // N2: lateness against the due time plus the work done here, per frame
             let late = due.map_or(0, |d| now.saturating_sub(d));
-            let work = started.elapsed().as_micros() as u64 / released;
+            let work = per;
             let us = (late + work).max(1);
             let bucket = (63 - us.leading_zeros() as usize).min(23);
             self.stats.added_latency_hist[bucket] += released;
@@ -833,21 +1002,25 @@ impl Hub {
                                 self.fan_out(f);
                             }
                         }
-                        BridgeOut::Expired => {
-                            log::info!(
-                                "{}: bridge_max reached during an outage; closing sessions",
-                                self.cfg.name
-                            );
-                            for s in self.sessions.values() {
-                                s.closed.cancel();
-                            }
-                            self.sessions.clear();
-                            self.stop_source();
-                        }
+                        BridgeOut::Expired => self.expire(),
                     }
                 }
             }
         }
+    }
+
+    /// bridge_max ran out during an outage: close the sessions and go Idle
+    fn expire(&mut self) {
+        log::info!(
+            "{}: bridge_max reached during an outage; closing sessions",
+            self.cfg.name
+        );
+        for s in self.sessions.values() {
+            s.closed.cancel();
+        }
+        self.sessions.clear();
+        self.stop_source();
+        self.state = SourceState::Streaming;
     }
 
     fn fan_out(&mut self, frame: Arc<Frame>) {
@@ -860,8 +1033,13 @@ impl Hub {
             if frame.track == Track::Audio && s.audio_from.is_some_and(|w| frame.wire_us < w) {
                 continue;
             }
+            let was_waiting = s.guard.waiting();
             if !s.guard.admit(frame.track, frame.wire_us, frame.irap) {
                 continue;
+            }
+            if was_waiting && frame.track == Track::Video {
+                // Audio from this picture on
+                s.audio_from = Some(frame.wire_us);
             }
             if !send(s, frame.clone(), budget, &mut self.stats) {
                 // Over budget: resync on the next IRAP; 3 in 60 s close the session (R13)
@@ -888,8 +1066,9 @@ impl Hub {
         }
     }
 
-    async fn housekeeping(&mut self) {
+    fn housekeeping(&mut self) {
         let now = Instant::now();
+        self.describe_waiters.retain(|w| !w.is_closed());
         // Sessions whose receivers went away
         let gone: Vec<u64> = self
             .sessions
@@ -901,7 +1080,7 @@ impl Hub {
             self.sessions.remove(&id);
         }
         // Demand: linger, then stop
-        if self.source_mode == Some(StartMode::Demand) {
+        if self.running_mode() == Some(StartMode::Demand) {
             if self.playing() == 0 {
                 match self.linger_until {
                     None => self.linger_until = Some(now + self.cfg.linger),
@@ -915,39 +1094,62 @@ impl Hub {
                 self.linger_until = None;
             }
         }
-        // A learning start ends at its deadline, or once the desc is ready
-        if self.source_mode == Some(StartMode::Learn) {
-            let done =
-                self.learner.current().is_some() || self.learn_deadline.is_some_and(|d| now >= d);
-            if done && self.playing() == 0 {
-                self.stop_source();
-            }
+        // A learning start ends at its deadline unless a PLAY turned it into demand
+        if self.running_mode() == Some(StartMode::Learn)
+            && self.learn_deadline.is_some_and(|d| now >= d)
+            && self.playing() == 0
+        {
+            self.stop_source();
         }
-        // Restart after an outage while there is demand
-        if self.source_rx.is_none() && self.playing() > 0 && self.state == SourceState::Retrying {
-            self.start_source(StartMode::Demand).await;
+        // A retry time only matters during an outage with viewers; never leave a past one
+        // behind (it would make the loop spin)
+        let retrying = self.state == SourceState::Retrying && self.running_mode().is_none();
+        if (!retrying || self.playing() == 0) && self.retry_at.is_some_and(|t| now >= t) {
+            self.retry_at = None;
+        }
+        // An outage with nobody watching ends retries; with viewers, bridge_max applies
+        // even before any video was released
+        if retrying {
+            if self.playing() == 0 {
+                self.retry_at = None;
+            } else if self.last_video_wall.is_none() && self.bridge.retrying(self.now_us()) {
+                self.expire();
+            } else if self.retry_at.is_some_and(|t| now >= t) {
+                self.start_source(StartMode::Demand);
+            }
         }
     }
 }
 
 /// Send under the byte budget; false when over budget (the frame is not sent)
 fn send(s: &mut Session, frame: Arc<Frame>, budget: usize, stats: &mut HubStats) -> bool {
-    let queued = s.queued.load(Ordering::Relaxed);
-    if queued + frame.bytes > budget {
+    let bytes = frame.bytes;
+    // Count before handing the frame over, so the reader's decrement can't come first
+    let queued = s.queued.fetch_add(bytes, Ordering::Relaxed);
+    if queued + bytes > budget {
+        s.queued.fetch_sub(bytes, Ordering::Relaxed);
         stats.dropped_by_budget += 1;
         return false;
     }
-    let bytes = frame.bytes;
     match s.tx.try_send(frame) {
         Ok(()) => {
-            s.queued.fetch_add(bytes, Ordering::Relaxed);
             stats.frames_out += 1;
             true
         }
         Err(_) => {
+            s.queued.fetch_sub(bytes, Ordering::Relaxed);
             stats.dropped_by_budget += 1;
             false
         }
+    }
+}
+
+async fn recv_start(
+    rx: &mut Option<oneshot::Receiver<(StartMode, CancellationToken, StartResult)>>,
+) -> Option<(StartMode, CancellationToken, StartResult)> {
+    match rx {
+        Some(rx) => rx.await.ok(),
+        None => std::future::pending().await,
     }
 }
 
@@ -1077,6 +1279,9 @@ mod tests {
         let (fa, fb, fc) = tokio::join!(drain(a, 15), drain(b, 15), drain(c, 15));
         counts.extend([fa.len(), fb.len(), fc.len()]);
         let st = h.stats().await.unwrap();
+        // Hub memory: the stuck queue is capped by the budget, and the pacer holds only
+        // about its latency's worth of frames
+        assert!(st.pacer_queued < 200, "{st:?}");
         assert!(
             stuck.queued_bytes() <= st.budget + st.budget / 10,
             "stuck queue {} > budget {}",
@@ -1100,10 +1305,8 @@ mod tests {
         let max_gap = wall.windows(2).map(|w| w[1] - w[0]).max().unwrap();
         assert!(max_gap < 5_000_000, "max wire gap {max_gap} µs");
         let st = h.stats().await.unwrap();
-        assert!(
-            st.bridged_us > 0 || frames.iter().any(|f| f.bytes < 100),
-            "{st:?}"
-        );
+        assert!(st.bridged_us > 1_000_000, "{st:?}");
+        assert_eq!(st.guard_engaged, 0, "{st:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1140,7 +1343,9 @@ mod tests {
                 .map(|f| f.wire_us)
                 .collect();
             assert!(video.len() > 200, "{name}: {} video frames", video.len());
-            let (i, max_jump) = video
+            // From the first live frame: the first is the restamped IRAP of a late join,
+            // followed by the next live IRAP up to one GOP later
+            let (i, max_jump) = video[1..]
                 .windows(2)
                 .map(|w| w[1] - w[0])
                 .enumerate()
@@ -1174,7 +1379,7 @@ mod tests {
         }
     }
 
-    /// A Hub that panics is restarted and keeps answering
+    /// A source whose start panics doesn't take the Hub down
     #[tokio::test(start_paused = true)]
     async fn test_supervisor_restarts_after_panic() {
         let source = Arc::new(PanicSource(Default::default()));
@@ -1192,5 +1397,210 @@ mod tests {
         // After two panics the third start runs normally; the Hub is alive
         assert!(h.stats().await.is_some());
         assert!(source.0.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    }
+
+    fn delay_window(
+        mut units: Vec<crate::source::FixtureUnit>,
+        from: u64,
+        to: u64,
+    ) -> Vec<crate::source::FixtureUnit> {
+        for u in units.iter_mut() {
+            if u.at_us >= from && u.at_us < to {
+                u.at_us = to;
+            }
+        }
+        units
+    }
+
+    fn hub_with(
+        units: Vec<crate::source::FixtureUnit>,
+        latency_us: u64,
+    ) -> (HubHandle, Arc<FixtureSource>) {
+        let source = Arc::new(FixtureSource::new(units, 1.0, Some(false)));
+        let mut cfg = HubConfig::new("test");
+        cfg.battery = false;
+        cfg.latency_us = latency_us;
+        (spawn(cfg, source.clone()), source)
+    }
+
+    /// Review #1: while bridging, live P-frames are dropped; live resumes on an IRAP
+    #[tokio::test(start_paused = true)]
+    async fn test_bridge_resumes_on_irap_only() {
+        let units = delay_window(fixture("plain_h265.bcm"), 6_300_000, 11_500_000);
+        let (h, _s) = hub_with(units, 300_000);
+        h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        let frames = drain(&mut sub, 19).await;
+        let st = h.stats().await.unwrap();
+        assert_eq!(st.guard_engaged, 0, "{st:?}");
+        assert!(st.bridged_us > 0, "{st:?}");
+        let video: Vec<u64> = frames
+            .iter()
+            .filter(|f| f.track == Track::Video)
+            .map(|f| f.wire_us)
+            .collect();
+        assert!(
+            video.windows(2).all(|w| w[1] - w[0] >= 1_000),
+            "packed frames"
+        );
+    }
+
+    /// Review #2: a late joiner gets the cached IRAP, then nothing but the next live IRAP
+    #[tokio::test(start_paused = true)]
+    async fn test_late_joiner_starts_clean() {
+        let (h, _s) = hub("plain_h265.bcm", false);
+        h.describe().await.unwrap();
+        let mut a = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        drain(&mut a, 3).await;
+        let mut b = h.subscribe(2).await.unwrap();
+        h.play(2).await;
+        let (_fa, fb) = tokio::join!(drain(&mut a, 6), drain(&mut b, 6));
+        let kinds: Vec<bool> = fb
+            .iter()
+            .filter(|f| f.track == Track::Video)
+            .map(|f| f.irap)
+            .collect();
+        assert!(kinds[0], "the late joiner starts on an IRAP");
+        assert!(
+            kinds[1],
+            "then the next live IRAP, not P-frames: {:?}",
+            &kinds[..5]
+        );
+        let first_live = fb
+            .iter()
+            .filter(|f| f.track == Track::Video)
+            .nth(1)
+            .unwrap()
+            .wire_us;
+        assert!(fb
+            .iter()
+            .filter(|f| f.track == Track::Audio)
+            .all(|f| f.wire_us >= first_live));
+    }
+
+    /// Review #3: audio timing follows the stream's sample rate
+    #[tokio::test(start_paused = true)]
+    async fn test_48k_audio_timing() {
+        let mut out = vec![];
+        for u in fixture("plain_h264.bcm") {
+            match &u.unit {
+                SourceUnit::Aac { adts } => {
+                    let mut a = adts.to_vec();
+                    a[2] = (a[2] & !0x3c) | (3 << 2);
+                    for k in 0..3u64 {
+                        out.push(crate::source::FixtureUnit {
+                            at_us: u.at_us + k * 21_333,
+                            unit: SourceUnit::Aac {
+                                adts: Bytes::from(a.clone()),
+                            },
+                        });
+                    }
+                }
+                _ => out.push(u),
+            }
+        }
+        out.sort_by_key(|u| u.at_us);
+        let (h, _s) = hub_with(out, 1_500_000);
+        let d = h.describe().await.unwrap();
+        assert_eq!(d.audio.as_ref().unwrap().sample_rate, 48000);
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        let frames = drain(&mut sub, 10).await;
+        let mut aw: Vec<u64> = frames
+            .iter()
+            .filter(|f| f.track == Track::Audio)
+            .map(|f| f.wire_us)
+            .collect();
+        aw.sort_unstable();
+        let mut deltas: Vec<u64> = aw.windows(2).map(|w| w[1] - w[0]).collect();
+        deltas.sort_unstable();
+        let median = deltas[deltas.len() / 2];
+        assert!(
+            (21_000..=21_700).contains(&median),
+            "median audio delta {median} µs"
+        );
+        let st = h.stats().await.unwrap();
+        assert!(st.drift_corrections <= 1, "{st:?}");
+    }
+
+    struct Ending(
+        Arc<Vec<crate::source::FixtureUnit>>,
+        Arc<std::sync::atomic::AtomicU32>,
+    );
+    impl StreamSource for Ending {
+        fn start(
+            &self,
+            _: StartMode,
+            _: CancellationToken,
+        ) -> futures::future::BoxFuture<'static, StartResult> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            let units = self.0.clone();
+            Box::pin(async move {
+                let (tx, rx) = mpsc::channel(512);
+                tokio::spawn(async move {
+                    for u in units.iter().take(60) {
+                        let _ = tx.send(u.unit.clone()).await;
+                    }
+                });
+                Ok(rx)
+            })
+        }
+        fn availability(&self) -> tokio::sync::watch::Receiver<crate::source::Availability> {
+            tokio::sync::watch::channel(Default::default()).1
+        }
+    }
+
+    /// Review #4: a source that keeps ending is retried with backoff, not in a storm
+    #[tokio::test(start_paused = true)]
+    async fn test_retry_backoff() {
+        let starts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let src = Arc::new(Ending(Arc::new(fixture("plain_h264.bcm")), starts.clone()));
+        let mut cfg = HubConfig::new("test");
+        cfg.battery = false;
+        let h = spawn(cfg, src);
+        h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        drain(&mut sub, 20).await;
+        let n = starts.load(Ordering::SeqCst);
+        assert!(n <= 8, "{n} starts in 20 s");
+    }
+
+    /// Review #5, #6: a second DESCRIBE during the learning start waits for it, and the
+    /// PLAY continues the same start (one camera wake)
+    #[tokio::test(start_paused = true)]
+    async fn test_one_start_for_describe_describe_play() {
+        let (h, source) = hub("plain_h265.bcm", true);
+        let h2 = h.clone();
+        let first = tokio::spawn(async move { h2.describe().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(h.describe().await.is_ok());
+        assert!(first.await.unwrap().is_ok());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        let frames = drain(&mut sub, 5).await;
+        assert!(frames.len() > 50);
+        assert_eq!(
+            source.starts.lock().unwrap().as_slice(),
+            &[StartMode::Learn]
+        );
+    }
+
+    /// DESIGN §4.4: the congestion fixture at both default latencies keeps wire time clean
+    #[tokio::test(start_paused = true)]
+    async fn test_congestion_at_both_latencies() {
+        for latency in [300_000u64, 1_500_000] {
+            let (h, _s) = hub_with(fixture("congestion_h265.bcm"), latency);
+            h.describe().await.unwrap();
+            let mut sub = h.subscribe(1).await.unwrap();
+            h.play(1).await;
+            let frames = drain(&mut sub, 110).await;
+            assert!(frames.len() > 1000, "{latency}: {}", frames.len());
+            let st = h.stats().await.unwrap();
+            assert_eq!(st.guard_engaged, 0, "{latency}: {st:?}");
+        }
     }
 }

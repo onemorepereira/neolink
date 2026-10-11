@@ -57,6 +57,11 @@ impl WireClock {
         }
     }
 
+    /// The last wire time released, on any track
+    pub fn last_out_wire(&self) -> Option<u64> {
+        self.last_out.map(|(w, _)| w)
+    }
+
     /// Wire time that tracks wall time since the last release
     pub fn virtual_now(&self, now_wall: u64) -> u64 {
         match self.last_out {
@@ -85,6 +90,20 @@ impl WireClock {
         }
         let wire = (media_us as i64 + self.offset.unwrap()).max(0) as u64;
         self.out(track, wire, now_wall)
+    }
+
+    /// Like [`Self::stamp`], but `None` when the frame would not be after the track's last
+    /// one (live audio overlapping the bridge's silent audio after a resume): the caller
+    /// drops it instead of nudging it forward
+    pub fn stamp_if_after(&mut self, track: Track, media_us: u64, now_wall: u64) -> Option<u64> {
+        if self.offset.is_none() {
+            return Some(self.stamp(track, media_us, now_wall));
+        }
+        let wire = (media_us as i64 + self.offset.unwrap()).max(0) as u64;
+        if self.last_track[track.index()].is_some_and(|l| wire <= l) {
+            return None;
+        }
+        Some(self.out(track, wire, now_wall))
     }
 
     /// The wire time of a synthetic (bridge) frame released at `now_wall`
@@ -175,6 +194,28 @@ impl Bridge {
         self.active_since.is_some()
     }
 
+    /// The silent-audio cadence: the AU duration of the stream's sample rate (0: none)
+    pub fn set_au_us(&mut self, au_us: u64) {
+        self.au_us = au_us;
+    }
+
+    /// Time spent bridging so far, including a bridge still running
+    pub fn bridged_total(&self, now_wall: u64) -> u64 {
+        self.bridged_us + self.active_since.map_or(0, |s| now_wall.saturating_sub(s))
+    }
+
+    /// Forget bridge and outage state (after `Expired`, or a new start)
+    pub fn reset(&mut self) {
+        self.active_since = None;
+        self.retrying_since = None;
+    }
+
+    /// Note an outage even before any video was released (so bridge_max still applies)
+    pub fn retrying(&mut self, now_wall: u64) -> bool {
+        let since = *self.retrying_since.get_or_insert(now_wall);
+        now_wall.saturating_sub(since) >= self.max_us
+    }
+
     /// Live video was released: leave the bridge. Returns true if it was active, which
     /// means the caller must re-latch the wire clock on this (IRAP) frame
     pub fn live(&mut self, now_wall: u64) -> bool {
@@ -241,14 +282,30 @@ impl Bridge {
 /// Per-session ordering guard (F-ds 7): each session remembers its last wire time per
 /// track. Video below it is skipped until the next IRAP above; audio below it is skipped.
 /// This keeps late-joiner restamps safe even during a pacer underrun.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SessionGuard {
     last: [Option<u64>; 2],
     waiting_irap: bool,
     pub skipped: u64,
 }
 
+impl Default for SessionGuard {
+    /// A new session starts on an IRAP: no P-frames (or audio) before its first picture
+    fn default() -> Self {
+        Self {
+            last: [None, None],
+            waiting_irap: true,
+            skipped: 0,
+        }
+    }
+}
+
 impl SessionGuard {
+    /// Waiting for an IRAP (no video and no audio until one is admitted)
+    pub fn waiting(&self) -> bool {
+        self.waiting_irap
+    }
+
     /// Whether to send this frame to the session
     pub fn admit(&mut self, track: Track, wire_us: u64, irap: bool) -> bool {
         let i = track.index();
@@ -267,7 +324,8 @@ impl SessionGuard {
                 self.waiting_irap = false;
             }
             Track::Audio => {
-                if !ok {
+                // No audio until the picture it belongs with (resync, late join)
+                if !ok || self.waiting_irap {
                     self.skipped += 1;
                     return false;
                 }
@@ -277,8 +335,14 @@ impl SessionGuard {
         true
     }
 
-    /// The session must resync: no video until the next IRAP (byte budget, R13)
+    /// The session must resync: no video until the next IRAP (byte budget, R13), and no
+    /// audio until then either
     pub fn resync(&mut self) {
+        self.waiting_irap = true;
+    }
+
+    /// After a restamped IRAP (late joiner): live video only from the next IRAP
+    pub fn after_restamp(&mut self) {
         self.waiting_irap = true;
     }
 }
@@ -379,61 +443,54 @@ mod tests {
         assert!(!g.admit(Track::Audio, 50, false));
     }
 
-    /// A22 (wire part): under random schedules of live frames, pauses, outages (bridge),
-    /// resumes, discontinuities, underruns and late joiners, wire time is monotonic per
-    /// track, and per session after the guard
+    /// A22 (wire part): under random schedules of live frames, outages and pauses (the
+    /// bridge), resumes, camera-time discontinuities, underruns and late joiners, applying
+    /// the Hub's rules (resume only on an IRAP, live media dropped while bridging, re-latch
+    /// on resume and on discontinuities), wire time is monotonic per track **without the
+    /// guard ever engaging**, and per session after the session guard.
     #[test]
     fn test_a22_wire_monotonic_property() {
         for seed in 0..300u64 {
             let mut rng = Rng(seed);
             let mut clock = WireClock::new();
             let mut bridge = Bridge::new(rng.below(3_000_000), 0.2, 64_000, 120);
-            let mut sessions: Vec<(SessionGuard, [Option<u64>; 2])> = vec![];
+            let mut sessions: Vec<SessionGuard> = vec![];
+            let mut session_last: Vec<[Option<u64>; 2]> = vec![];
             let mut wall = 0u64;
             let mut media = rng.below(10_000_000);
+            let mut audio_media = media;
             let mut last_video_wall = 0u64;
-            let mut track_last: [Option<u64>; 2] = [None, None];
-            let mut emit =
-                |track: Track,
-                 wire: u64,
-                 irap: bool,
-                 sessions: &mut Vec<(SessionGuard, [Option<u64>; 2])>| {
-                    let i = track.index();
-                    assert!(
-                        track_last[i].is_none_or(|l| wire > l),
-                        "seed {seed}: track {track:?} {wire} after {:?}",
-                        track_last[i]
-                    );
-                    track_last[i] = Some(wire);
-                    for (g, last) in sessions.iter_mut() {
-                        if g.admit(track, wire, irap) {
-                            assert!(
-                                last[i].is_none_or(|l| wire > l),
-                                "seed {seed}: session went backwards"
-                            );
-                            last[i] = Some(wire);
-                        }
-                    }
-                };
-            for step in 0..400 {
+            let mut discontinuity = false;
+            let mut gop = 0u64;
+            for _ in 0..400 {
+                let mut out: Vec<(Track, u64, bool)> = vec![];
                 match rng.below(10) {
-                    // Live video and audio
+                    // Live video (and its audio)
                     0..=4 => {
                         wall += rng.below(200_000);
                         media += 66_667;
-                        let irap = step % 30 == 0 || rng.below(10) == 0;
-                        if bridge.live(wall) && irap {
+                        gop += 1;
+                        let irap = gop % 30 == 0;
+                        if bridge.active() {
+                            if !irap {
+                                continue;
+                            }
+                            bridge.live(wall);
                             clock.relatch(media, wall);
+                            discontinuity = false;
+                        } else if discontinuity {
+                            clock.relatch(media, wall);
+                            discontinuity = false;
                         }
-                        let w = clock.stamp(Track::Video, media, wall);
                         last_video_wall = wall;
-                        emit(Track::Video, w, irap, &mut sessions);
-                        let a = clock.stamp(
-                            Track::Audio,
-                            media.saturating_sub(rng.below(100_000)),
-                            wall,
-                        );
-                        emit(Track::Audio, a, false, &mut sessions);
+                        out.push((Track::Video, clock.stamp(Track::Video, media, wall), irap));
+                        if !bridge.active() {
+                            audio_media = audio_media.max(media.saturating_sub(rng.below(80_000)));
+                            if let Some(w) = clock.stamp_if_after(Track::Audio, audio_media, wall) {
+                                out.push((Track::Audio, w, false));
+                            }
+                            audio_media += 64_000;
+                        }
                     }
                     // A gap: pause or outage, the bridge runs
                     5 | 6 => {
@@ -446,38 +503,58 @@ mod tests {
                         for o in bridge.tick(wall, last_video_wall, state, &mut clock) {
                             match o {
                                 BridgeOut::Video { wire_us } => {
-                                    emit(Track::Video, wire_us, true, &mut sessions)
+                                    out.push((Track::Video, wire_us, true))
                                 }
                                 BridgeOut::Audio { wire_us } => {
-                                    emit(Track::Audio, wire_us, false, &mut sessions)
+                                    out.push((Track::Audio, wire_us, false))
                                 }
-                                BridgeOut::Expired => {}
+                                BridgeOut::Expired => bridge.reset(),
                             }
                         }
                     }
-                    // Discontinuity: camera time jumps either way
+                    // Discontinuity: camera time jumps either way (re-latched on the next frame)
                     7 => {
                         media = if rng.below(2) == 0 {
                             media / 2
                         } else {
                             media + 5_000_000
                         };
-                        clock.relatch(media, wall);
+                        audio_media = media;
+                        discontinuity = true;
                     }
-                    // Late joiner: gets the cached IRAP restamped at last_wire_out
+                    // Late joiner: the cached IRAP at the last wire time, then the next IRAP
                     8 => {
                         let mut g = SessionGuard::default();
                         let mut last = [None, None];
-                        let restamp = clock.virtual_now(wall).saturating_sub(rng.below(500_000));
-                        if g.admit(Track::Video, restamp, true) {
-                            last[0] = Some(restamp);
+                        if let Some(w) = clock.last_out_wire() {
+                            if g.admit(Track::Video, w, true) {
+                                last[0] = Some(w);
+                            }
+                            g.after_restamp();
                         }
-                        sessions.push((g, last));
+                        sessions.push(g);
+                        session_last.push(last);
                     }
                     // Underrun: a long wait, then a burst
                     _ => wall += 2_000_000 + rng.below(3_000_000),
                 }
+                for (track, wire, irap) in out {
+                    for (g, last) in sessions.iter_mut().zip(session_last.iter_mut()) {
+                        let i = track.index();
+                        if g.admit(track, wire, irap) {
+                            assert!(
+                                last[i].is_none_or(|l| wire > l),
+                                "seed {seed}: session went backwards"
+                            );
+                            last[i] = Some(wire);
+                        }
+                    }
+                }
             }
+            assert_eq!(
+                clock.stats.guard_engaged, 0,
+                "seed {seed}: the wire guard engaged"
+            );
         }
     }
 

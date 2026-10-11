@@ -190,7 +190,12 @@ impl DescLearner {
     pub fn audio(&mut self, adts: &AdtsHeader, host_us: u64) -> Option<DescEvent> {
         let desc = AudioDesc::from_adts(adts);
         let first = self.audio.is_none();
-        let changed = self.audio.as_ref().is_some_and(|a| a.asc != desc.asc);
+        // Compare with what we saw, or else with the cached desc's audio
+        let known = self
+            .audio
+            .as_ref()
+            .or_else(|| self.current.as_ref().and_then(|c| c.audio.as_ref()));
+        let changed = known.is_some_and(|a| a.asc != desc.asc);
         self.audio = Some(desc.clone());
         if let Some((identity, _)) = self.pending.take() {
             let d = self.make(identity, Some(desc));
@@ -273,12 +278,9 @@ pub struct DescCache {
     dir: PathBuf,
 }
 
-#[derive(Serialize, Deserialize)]
-struct IrapFile {
-    desc_hash: String,
-    /// The IRAP AU's NALs
-    nals: Vec<Vec<u8>>,
-}
+/// `irap.bin`: `NLIRAP1\n`, the desc hash (16 hex chars), `\n`, then per NAL a u32 BE
+/// length and the bytes
+const IRAP_MAGIC: &[u8] = b"NLIRAP1\n";
 
 const IRAP_INTERVAL_US: u64 = 3_600_000_000;
 
@@ -308,17 +310,38 @@ impl DescCache {
 
     /// The cached IRAP, only if it belongs to `desc`
     pub fn load_irap(&self, desc: &StreamDesc) -> Option<Vec<Bytes>> {
-        let b = std::fs::read(self.dir.join("irap.bin")).ok()?;
-        let f: IrapFile = serde_json::from_slice(&b).ok()?;
-        (f.desc_hash == desc.hash()).then(|| f.nals.into_iter().map(Bytes::from).collect())
+        let b = Bytes::from(std::fs::read(self.dir.join("irap.bin")).ok()?);
+        let hash = desc.hash();
+        let head = IRAP_MAGIC.len() + hash.len() + 1;
+        if b.len() < head || &b[..IRAP_MAGIC.len()] != IRAP_MAGIC {
+            return None;
+        }
+        if &b[IRAP_MAGIC.len()..head - 1] != hash.as_bytes() {
+            return None;
+        }
+        let mut nals = vec![];
+        let mut i = head;
+        while i + 4 <= b.len() {
+            let len = u32::from_be_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            if i + len > b.len() {
+                return None;
+            }
+            nals.push(b.slice(i..i + len));
+            i += len;
+        }
+        (i == b.len() && !nals.is_empty()).then_some(nals)
     }
 
     pub fn save_irap(&self, desc: &StreamDesc, nals: &[Bytes]) -> std::io::Result<()> {
-        let f = IrapFile {
-            desc_hash: desc.hash(),
-            nals: nals.iter().map(|n| n.to_vec()).collect(),
-        };
-        write_atomic(&self.dir.join("irap.bin"), &serde_json::to_vec(&f)?)
+        let mut out = IRAP_MAGIC.to_vec();
+        out.extend_from_slice(desc.hash().as_bytes());
+        out.push(b'\n');
+        for n in nals {
+            out.extend_from_slice(&(n.len() as u32).to_be_bytes());
+            out.extend_from_slice(n);
+        }
+        write_atomic(&self.dir.join("irap.bin"), &out)
     }
 }
 
@@ -487,6 +510,20 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_cached_audio_change_is_detected() {
+        let mut l = DescLearner::new(true, None);
+        l.video(VideoCodec::H264, &argus_sub_irap(), true, 0, 0);
+        let Some(DescEvent::Ready(d)) = l.audio(&adts_mono_16k(), 1) else {
+            panic!()
+        };
+        // A new process, the cache says 16 kHz, the camera now sends 48 kHz
+        let mut l2 = DescLearner::new(true, Some(d));
+        let h48 = AdtsHeader::parse(&[0xff, 0xf1, 0x4c, 0x40, 0x41, 0x7f, 0xfc]).unwrap();
+        assert_eq!(h48.sample_rate(), 48000);
+        assert!(matches!(l2.audio(&h48, 2), Some(DescEvent::Changed(_))));
     }
 
     #[test]

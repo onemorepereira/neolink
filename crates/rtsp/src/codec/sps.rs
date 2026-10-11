@@ -52,10 +52,11 @@ fn h264(nal: &[u8]) -> Result<PictureSize, BitError> {
             for i in 0..lists {
                 if r.bit()? {
                     let size = if i < 6 { 16 } else { 64 };
-                    let (mut last, mut next) = (8i32, 8i32);
+                    let (mut last, mut next) = (8i64, 8i64);
                     for _ in 0..size {
                         if next != 0 {
-                            next = (last + r.se()? + 256) % 256;
+                            // delta_scale is in -128..=127; a corrupt one must not overflow
+                            next = (last + r.se()? as i64).rem_euclid(256);
                         }
                         last = if next == 0 { last } else { next };
                     }

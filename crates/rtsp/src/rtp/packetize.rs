@@ -45,10 +45,14 @@ impl RtpChunk {
 /// RTP header size
 pub const RTP_HEADER: usize = 12;
 
+/// The smallest `rtp_mtu` accepted (smaller values are raised to it): room for the
+/// header, a 4-byte prefix and some payload
+pub const MIN_MTU: usize = 64;
+
 /// Packetize one video access unit (its NALs, without start codes). The marker is set on
 /// the last packet of the AU. `mtu` is the whole RTP packet (header + payload) limit.
 pub fn video(codec: VideoCodec, nals: &[Bytes], mtu: usize) -> Vec<RtpChunk> {
-    let max = mtu.saturating_sub(RTP_HEADER).max(16);
+    let max = mtu.max(MIN_MTU) - RTP_HEADER;
     let mut out = vec![];
     for (i, nal) in nals.iter().enumerate() {
         let last_nal = i + 1 == nals.len();
@@ -102,7 +106,7 @@ pub fn aac(au: &Bytes, mtu: usize) -> Vec<RtpChunk> {
     let size = au.len() as u16;
     // AU-headers-length = 16 bits, then AU-size (13) | AU-Index (3) = 0
     let prefix = [0x00, 0x10, (size >> 5) as u8, ((size & 0x1f) << 3) as u8];
-    let room = mtu.saturating_sub(RTP_HEADER).max(16) - prefix.len();
+    let room = mtu.max(MIN_MTU) - RTP_HEADER - prefix.len();
     let mut out = vec![];
     let mut off = 0;
     while off < au.len() {

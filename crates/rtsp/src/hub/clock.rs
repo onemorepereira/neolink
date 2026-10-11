@@ -59,6 +59,8 @@ pub struct MediaClock {
     last_correction_host: Option<u64>,
     /// Corrections applied (stats)
     pub drift_corrections: u64,
+    /// The last audio media time sent, so a re-anchor never goes backwards
+    last_audio_us: Option<u64>,
 }
 
 impl MediaClock {
@@ -77,7 +79,21 @@ impl MediaClock {
             correcting: false,
             last_correction_host: None,
             drift_corrections: 0,
+            last_audio_us: None,
         }
+    }
+
+    /// The audio sample rate (from the ADTS header); a change re-anchors audio
+    pub fn set_sample_rate(&mut self, rate: u32) {
+        if rate > 0 && rate != self.sample_rate {
+            self.sample_rate = rate;
+            self.anchor_us = None;
+        }
+    }
+
+    /// Duration of one 1024-sample AU, µs
+    pub fn au_us(&self) -> u64 {
+        1024 * 1_000_000 / self.sample_rate as u64
     }
 
     /// Current video media time
@@ -109,9 +125,11 @@ impl MediaClock {
             (None, _) => true,
         };
         self.last_cam = Some(cam_us);
-        if discontinuity && self.last_cam.is_some() && self.anchor_us.is_some() {
-            // Audio re-anchors to video after a discontinuity
+        if discontinuity && self.anchor_us.is_some() {
+            // Audio re-anchors to video after a discontinuity, and may re-anchor once more
+            // if the new anchor is far off
             self.anchor_us = None;
+            self.reanchored = false;
         }
         // Offset estimate, sampled at each video frame
         if let Some(pos) = self.audio_pos_us() {
@@ -153,7 +171,11 @@ impl MediaClock {
                 // No video yet: nothing to anchor to
                 return AudioTime::Drop;
             }
-            let anchor = (self.media_us as i64 + self.skew_estimate_us).max(0) as u64;
+            let mut anchor = (self.media_us as i64 + self.skew_estimate_us).max(0) as u64;
+            // Never behind what was already sent (DESIGN: audio media >= last + 1 AU)
+            if let Some(last) = self.last_audio_us {
+                anchor = anchor.max(last + self.au_us());
+            }
             self.anchor_us = Some(anchor);
             self.samples = 0;
             self.anchored_at_host = host_us;
@@ -168,15 +190,22 @@ impl MediaClock {
         {
             self.reanchored = true;
             if let Some(m) = median.filter(|m| m.abs() > REANCHOR_ABOVE_US) {
-                let anchor = self.anchor_us.unwrap() as i64 - m;
-                self.anchor_us = Some(anchor.max(0) as u64);
+                // Nobody has heard audio yet, so this one jump may go backwards; audio
+                // already queued is then dropped by the wire clock until it is in order
+                let anchor = (self.anchor_us.unwrap() as i64 - m).max(0) as u64;
+                self.anchor_us = Some(anchor);
+                self.last_audio_us = None;
                 self.errs.clear();
             }
         }
         let mut skip = false;
         let au_us = (1024 * 1_000_000 / self.sample_rate as u64) as i64;
-        // Enough samples for a median (2 s of video), else no correction yet
-        let median = (self.errs.len() >= 30).then(|| self.median_err()).flatten();
+        // Enough history for a median (2 s), else no correction yet
+        let span = match (self.errs.front(), self.errs.back()) {
+            (Some(a), Some(b)) => b.0.saturating_sub(a.0),
+            _ => 0,
+        };
+        let median = (span >= INITIAL_US).then(|| self.median_err()).flatten();
         if let Some(m) = median {
             if m.abs() > CORRECT_ABOVE_US {
                 self.correcting = true;
@@ -214,6 +243,7 @@ impl MediaClock {
         let media_us = self.audio_pos_us().unwrap();
         let samples = self.samples;
         self.samples += 1024;
+        self.last_audio_us = Some(media_us);
         AudioTime::Send { media_us, samples }
     }
 }
