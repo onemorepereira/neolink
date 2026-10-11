@@ -25,7 +25,7 @@
 //! request paths, status codes, header presence, the shape of Transport, Session, Public,
 //! RTP-Info, Range and WWW-Authenticate, SDP attribute sets, rtpmap and fmtp keys, and the
 //! interleaved channel/payload-type set. It ignores values that depend on the source
-//! (sprop, profile-level-id, resolution) and volatile ones.
+//! (sprop, profile-level-id, resolution, `a=framerate`/`framesize`) and volatile ones.
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -673,6 +673,10 @@ fn sdp_shape(body: &[String], s: &mut BTreeMap<String, String>) {
             }
             "a" => {
                 let (name, val) = v.split_once(':').unwrap_or((v, ""));
+                // Derived from the source's parameter sets (SPS VUI timing, size)
+                if matches!(name, "framerate" | "framesize" | "x-dimensions") {
+                    continue;
+                }
                 attrs
                     .entry(section.clone())
                     .or_default()
