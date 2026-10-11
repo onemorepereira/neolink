@@ -203,6 +203,51 @@ session leaked; motion `Start` survived a disconnect and could hold a permit.
 - `cargo +1.82 check -p neolink_rtsp` passes.
 - Red-team review.
 
+**Status (2026-10-11).** Done on `feature/native-rtsp-p2`. Gate 2 evidence:
+- Unit and property tests: 54 pass, repeated runs stable. Clippy `-D warnings` and fmt are clean.
+- A22 (wire part): `test_a22_wire_monotonic_property` covers 300 seeds and also requires
+  `guard_engaged == 0`: the Hub never relies on the guard.
+- A17 (clock part): `test_a17_wrap_and_reset` measures from the first live frame.
+- Pacer: `test_argus_like_fixture_is_smooth` (p99 jitter < 10 ms, no steady-state slips) and
+  `test_congestion_at_both_latencies`.
+- Memory: `test_stuck_session_is_bounded`, with 1 stuck and 3 healthy subscribers, also bounds
+  `pacer_queued`.
+- Fuzz smoke at 60 s per target: annexb, adts and sps are clean. The first sps run found an i32
+  overflow in the scaling list, now fixed with i64 and `rem_euclid`; the crash input replays
+  clean.
+- MSRV: `cargo +1.82 check --locked --all-targets -p neolink_rtsp` passes.
+- Red-team review: 20 findings, all fixed except those deferred below.
+  - **Fixed, Hub:**
+    - the session guard waits for an IRAP;
+    - the bridge resumes only on an IRAP;
+    - ingest is gated on the first IRAP;
+    - late joiners get the last released IRAP restamped at `last_out_wire`;
+    - the source start is non-blocking, with backoff 1–30 s;
+    - a single wake covers DESCRIBE, DESCRIBE, PLAY;
+    - bridge_max applies before any video;
+    - a duplicate subscribe replaces the old session;
+    - `Drop` cancels everything;
+    - cache writes go through `spawn_blocking`.
+  - **Fixed, clock and desc:**
+    - corrections begin only after a 2 s span and stay within half an AU;
+    - the audio sample rate comes from ADTS (48 kHz test);
+    - audio re-anchors stay monotonic after the first audio is heard (the one initial jump may
+      go backwards);
+    - the cached desc detects an audio change;
+    - `irap.bin` is a binary, hash-bound format.
+- Re-review of the fixes: two Hub spins, where a learning or linger deadline was left behind
+  after the source went away (a failed start, or the source ending during linger), are fixed.
+  `test_*_does_not_spin` cover them, use a `wakeups` stat and a watchdog, and fail without the
+  fix. A start still in flight is now cancelled if the Hub is gone.
+- **Deferred:**
+  - availability watching (needs the Phase 4 source);
+  - multi-block ADTS without CRC in the desc;
+  - B-frames (Argus has none; to revisit in Phase 5);
+  - persisting `skew_estimate` across restarts;
+  - supervisor panic coverage is test-only;
+  - a Learn→Demand conversion does not re-apply `pause.on_motion` (Phase 4, where the policy
+    lives).
+
 ## Phase 3: RTSP server (10–14 d; 0 hardware)
 
 | # | Task | Design ref |

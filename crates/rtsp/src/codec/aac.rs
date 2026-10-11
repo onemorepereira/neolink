@@ -20,13 +20,128 @@ pub fn silent_au(channels: u8) -> Option<&'static [u8]> {
     }
 }
 
+/// AAC sampling frequency index table (ISO 14496-3 Table 1.18)
+pub const SAMPLE_RATES: [u32; 13] = [
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+];
+
+/// A parsed ADTS frame header
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdtsHeader {
+    /// Audio object type (profile + 1): 2 is AAC-LC
+    pub object_type: u8,
+    pub sample_rate_index: u8,
+    pub channel_config: u8,
+    /// Whole frame, header included
+    pub frame_length: usize,
+    /// 7, or 9 with a CRC
+    pub header_length: usize,
+    /// number_of_raw_data_blocks_in_frame + 1
+    pub blocks: usize,
+}
+
+/// Why an ADTS frame was rejected
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdtsError {
+    Sync,
+    Truncated,
+    BadLength,
+    BadSampleRate,
+    /// Several raw blocks without a CRC can't be split (SPEC R3)
+    MultiBlockNoCrc,
+}
+
+impl AdtsHeader {
+    pub fn parse(d: &[u8]) -> Result<Self, AdtsError> {
+        if d.len() < 7 {
+            return Err(AdtsError::Truncated);
+        }
+        if d[0] != 0xff || d[1] & 0xf6 != 0xf0 {
+            return Err(AdtsError::Sync);
+        }
+        let protection_absent = d[1] & 1 == 1;
+        let object_type = (d[2] >> 6) + 1;
+        let sample_rate_index = (d[2] >> 2) & 0x0f;
+        if sample_rate_index as usize >= SAMPLE_RATES.len() {
+            return Err(AdtsError::BadSampleRate);
+        }
+        let channel_config = ((d[2] & 1) << 2) | (d[3] >> 6);
+        let frame_length =
+            (((d[3] & 3) as usize) << 11) | ((d[4] as usize) << 3) | ((d[5] as usize) >> 5);
+        let blocks = (d[6] & 3) as usize + 1;
+        let header_length = if protection_absent { 7 } else { 9 };
+        if frame_length < header_length {
+            return Err(AdtsError::BadLength);
+        }
+        Ok(Self {
+            object_type,
+            sample_rate_index,
+            channel_config,
+            frame_length,
+            header_length,
+            blocks,
+        })
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        SAMPLE_RATES[self.sample_rate_index as usize]
+    }
+
+    /// The 2-byte AudioSpecificConfig for the SDP `config=` (RFC 3640)
+    pub fn audio_specific_config(&self) -> [u8; 2] {
+        let v: u16 = ((self.object_type as u16) << 11)
+            | ((self.sample_rate_index as u16) << 7)
+            | ((self.channel_config as u16) << 3);
+        v.to_be_bytes()
+    }
+}
+
+/// The raw AAC access units of one ADTS frame (headers and CRCs removed)
+///
+/// One block: the payload after the header. Several blocks with a CRC: split with
+/// `raw_data_block_position[]`, dropping each block's trailing CRC. Several blocks
+/// without a CRC: an error, and the caller drops the frame (SPEC R3). The Argus always
+/// sends one block.
+pub fn adts_access_units(
+    frame: &bytes::Bytes,
+) -> Result<(AdtsHeader, Vec<bytes::Bytes>), AdtsError> {
+    let h = AdtsHeader::parse(frame)?;
+    if frame.len() < h.frame_length {
+        return Err(AdtsError::Truncated);
+    }
+    if h.blocks == 1 {
+        return Ok((h, vec![frame.slice(h.header_length..h.frame_length)]));
+    }
+    if h.header_length == 7 {
+        return Err(AdtsError::MultiBlockNoCrc);
+    }
+    // adts_header_error_check: raw_data_block_position[1..blocks] then crc_check, after the
+    // 7 fixed bytes. Positions are offsets from the first raw block
+    let first = 7 + 2 * (h.blocks - 1) + 2;
+    if first > h.frame_length {
+        return Err(AdtsError::BadLength);
+    }
+    let mut starts = vec![0usize];
+    for i in 0..h.blocks - 1 {
+        let p = 7 + 2 * i;
+        starts.push(u16::from_be_bytes([frame[p], frame[p + 1]]) as usize);
+    }
+    let body_len = h.frame_length - first;
+    let mut aus = vec![];
+    for (n, &s) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(body_len);
+        // Each block is followed by a 16-bit CRC
+        if s + 2 > end || end > body_len {
+            return Err(AdtsError::BadLength);
+        }
+        aus.push(frame.slice(first + s..first + end - 2));
+    }
+    Ok((h, aus))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SAMPLE_RATES: [u32; 13] = [
-        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-    ];
 
     fn adts(au: &[u8], sample_rate: u32, channels: u8) -> Vec<u8> {
         let sr = SAMPLE_RATES.iter().position(|&r| r == sample_rate).unwrap() as u8;
@@ -127,6 +242,64 @@ mod tests {
                 assert_eq!(output.stdout.len(), 50 * 1024 * 2 * channels as usize);
                 assert!(output.stdout.iter().all(|&b| b == 0));
             }
+        }
+    }
+
+    #[test]
+    fn test_adts_argus() {
+        // An Argus frame header: AAC-LC, 16 kHz (index 8), mono, 523 bytes, one block
+        let mut frame = adts(&[0u8; 516], 16000, 1);
+        let h = AdtsHeader::parse(&frame).unwrap();
+        assert_eq!(
+            (h.object_type, h.sample_rate(), h.channel_config),
+            (2, 16000, 1)
+        );
+        assert_eq!((h.frame_length, h.header_length, h.blocks), (523, 7, 1));
+        assert_eq!(h.audio_specific_config(), [0x14, 0x08]);
+        let (_, aus) = adts_access_units(&bytes::Bytes::from(frame.clone())).unwrap();
+        assert_eq!(aus.len(), 1);
+        assert_eq!(aus[0].len(), 516);
+        frame[0] = 0;
+        assert_eq!(AdtsHeader::parse(&frame), Err(AdtsError::Sync));
+    }
+
+    #[test]
+    fn test_adts_multi_block() {
+        // Two blocks, no CRC: rejected
+        let mut f = adts(&[1, 2, 3, 4], 16000, 1);
+        f[6] |= 1;
+        assert_eq!(
+            adts_access_units(&bytes::Bytes::from(f)).unwrap_err(),
+            AdtsError::MultiBlockNoCrc
+        );
+        // Two blocks with CRC: header 7 + position(2) + crc(2), blocks "aa"+crc, "bbb"+crc
+        let body: Vec<u8> = [&[0xaa, 0xaa, 0, 0][..], &[0xbb, 0xbb, 0xbb, 0, 0]].concat();
+        let len = 7 + 2 + 2 + body.len();
+        let mut f = vec![
+            0xff,
+            0xf0, // CRC present
+            (1 << 6) | (8 << 2),
+            (1 << 6) | (len >> 11) as u8,
+            (len >> 3) as u8,
+            ((len & 7) << 5) as u8 | 0x1f,
+            0xfc | 1,
+        ];
+        f.extend_from_slice(&4u16.to_be_bytes()); // second block at offset 4
+        f.extend_from_slice(&[0, 0]); // header crc
+        f.extend_from_slice(&body);
+        let (h, aus) = adts_access_units(&bytes::Bytes::from(f)).unwrap();
+        assert_eq!((h.blocks, h.header_length), (2, 9));
+        assert_eq!(&aus[0][..], &[0xaa, 0xaa]);
+        assert_eq!(&aus[1][..], &[0xbb, 0xbb, 0xbb]);
+    }
+
+    #[test]
+    fn test_adts_garbage_does_not_panic() {
+        for len in 0..30usize {
+            let d: Vec<u8> = (0..len)
+                .map(|i| if i < 2 { 0xff } else { (i * 91) as u8 })
+                .collect();
+            let _ = adts_access_units(&bytes::Bytes::from(d));
         }
     }
 }

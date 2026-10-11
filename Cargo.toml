@@ -11,6 +11,7 @@ license = "AGPL-3.0-or-later"
 members = [
   "crates/*",
 ]
+exclude = ["crates/rtsp/fuzz"]
 
 [dependencies]
 anyhow = "1.0.70"
