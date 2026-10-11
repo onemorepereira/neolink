@@ -65,6 +65,8 @@ pub mod bc_protocol;
 pub mod bcmedia;
 ///  Contains low level structures and formats for the udpstream
 pub mod bcudp;
+/// Reading and writing `.bcm` media fixtures
+pub mod fixture;
 
 /// This is the top level error structure of the library
 ///

@@ -13,3 +13,5 @@ linker = "i686-linux-gnu-gcc"
 
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
+[alias]
+xtask = "run -q -p xtask --"

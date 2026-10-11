@@ -11,16 +11,13 @@
 //! Arguments: stream (main|sub|extern), seconds, output path, and optionally a second
 //! stream to run concurrently (to check whether the camera allows it).
 //!
-//! Fixture format, little endian, repeated per frame:
-//! `u64 host_us | u8 kind | u32 cam_us | u32 cam_time | u32 len | data`
-//! where kind is 1 InfoV1, 2 InfoV2, 3 I-frame, 4 P-frame, 5 AAC, 6 ADPCM, and the high bit
-//! of kind is set for H265 video. For Info frames data is `u32 width | u32 height | u8 fps`.
+//! The output is a `.bcm` fixture, see [`neolink_core::fixture`].
 
 use neolink_core::bc_protocol::{
     BcCamera, BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, StreamKind,
 };
 use neolink_core::bcmedia::model::*;
-use std::io::Write;
+use neolink_core::fixture::{Kind, Record};
 use std::time::{Duration, Instant};
 
 fn stream_kind(s: &str) -> StreamKind {
@@ -64,8 +61,7 @@ async fn capture(
     let mut stream = camera.start_video(kind, 0, false).await?;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(secs) {
-        let media = match tokio::time::timeout(Duration::from_secs(10), stream.get_data()).await
-        {
+        let media = match tokio::time::timeout(Duration::from_secs(10), stream.get_data()).await {
             Ok(r) => r??,
             Err(_) => {
                 println!("{} timeout waiting for media", name);
@@ -73,27 +69,38 @@ async fn capture(
             }
         };
         let host_us = start.elapsed().as_micros() as u64;
-        let (k, cam_us, cam_time, data, desc): (u8, u32, u32, Vec<u8>, String) = match &media {
+        let (kind, h265, cam_us, cam_time, data, desc) = match &media {
             BcMedia::InfoV1(i) => (
-                1,
+                Kind::InfoV1,
+                false,
                 0,
                 0,
-                [&i.video_width.to_le_bytes()[..], &i.video_height.to_le_bytes(), &[i.fps]]
-                    .concat(),
+                [
+                    &i.video_width.to_le_bytes()[..],
+                    &i.video_height.to_le_bytes(),
+                    &[i.fps],
+                ]
+                .concat(),
                 format!("{}x{} fps={}", i.video_width, i.video_height, i.fps),
             ),
             BcMedia::InfoV2(i) => (
-                2,
+                Kind::InfoV2,
+                false,
                 0,
                 0,
-                [&i.video_width.to_le_bytes()[..], &i.video_height.to_le_bytes(), &[i.fps]]
-                    .concat(),
+                [
+                    &i.video_width.to_le_bytes()[..],
+                    &i.video_height.to_le_bytes(),
+                    &[i.fps],
+                ]
+                .concat(),
                 format!("{}x{} fps={}", i.video_width, i.video_height, i.fps),
             ),
             BcMedia::Iframe(f) => {
                 let h265 = matches!(f.video_type, VideoType::H265);
                 (
-                    3 | if h265 { 0x80 } else { 0 },
+                    Kind::Iframe,
+                    h265,
                     f.microseconds,
                     f.time.unwrap_or(0),
                     f.data.clone(),
@@ -103,7 +110,8 @@ async fn capture(
             BcMedia::Pframe(f) => {
                 let h265 = matches!(f.video_type, VideoType::H265);
                 (
-                    4 | if h265 { 0x80 } else { 0 },
+                    Kind::Pframe,
+                    h265,
                     f.microseconds,
                     0,
                     f.data.clone(),
@@ -124,27 +132,38 @@ async fn capture(
                 } else {
                     "not adts".to_string()
                 };
-                (5, 0, 0, d.clone(), desc)
+                (Kind::Aac, false, 0, 0, d.clone(), desc)
             }
-            BcMedia::Adpcm(a) => (6, 0, 0, a.data.clone(), format!("dur_us={:?}", a.duration())),
+            BcMedia::Adpcm(a) => (
+                Kind::Adpcm,
+                false,
+                0,
+                0,
+                a.data.clone(),
+                format!("dur_us={:?}", a.duration()),
+            ),
         };
         println!(
-            "{} host_us={} kind={} cam_us={} cam_time={} len={} {}",
+            "{} host_us={} kind={:?} cam_us={} cam_time={} len={} {}",
             name,
             host_us,
-            k & 0x7f,
+            kind,
             cam_us,
             cam_time,
             data.len(),
             desc
         );
         if let Some(f) = file.as_mut() {
-            f.write_all(&host_us.to_le_bytes()).unwrap();
-            f.write_all(&[k]).unwrap();
-            f.write_all(&cam_us.to_le_bytes()).unwrap();
-            f.write_all(&cam_time.to_le_bytes()).unwrap();
-            f.write_all(&(data.len() as u32).to_le_bytes()).unwrap();
-            f.write_all(&data).unwrap();
+            Record {
+                host_us,
+                kind,
+                h265,
+                cam_us,
+                cam_time,
+                data,
+            }
+            .write_to(f)
+            .unwrap();
         }
     }
     Ok(())
@@ -162,7 +181,10 @@ async fn main() -> Result<(), neolink_core::Error> {
     let options = BcCameraOpt {
         name: "dump".to_string(),
         channel_id: 0,
-        addrs: vec![std::env::var("NEO_ADDR").expect("NEO_ADDR").parse().unwrap()],
+        addrs: vec![std::env::var("NEO_ADDR")
+            .expect("NEO_ADDR")
+            .parse()
+            .unwrap()],
         port: None,
         uid: std::env::var("NEO_UID").ok(),
         protocol: ConnectionProtocol::TcpUdp,
