@@ -72,7 +72,8 @@ async fn main() -> Result<()> {
         env!("NEOLINK_PROFILE")
     );
 
-    let opt = Opt::parse();
+    raise_fd_limit();
+    let opt = Opt::parse_from(args_with_mode(std::env::args_os().collect()));
 
     let conf_path = opt.config.context("Must supply --config file")?;
     let config_text = fs::read_to_string(&conf_path)
@@ -194,5 +195,66 @@ async fn shutdown_signal() -> &'static str {
     {
         let _ = tokio::signal::ctrl_c().await;
         "Ctrl-C"
+    }
+}
+
+/// `NEO_LINK_MODE` (the container's mode variable) supplies the subcommand when the
+/// command line has none, so the image can use exec-form CMD with neolink as PID 1 and
+/// still let users pick the mode with an environment variable (PLAN 1.9)
+fn args_with_mode(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    use clap::CommandFactory;
+    let Some(mode) = std::env::var_os("NEO_LINK_MODE").filter(|m| !m.is_empty()) else {
+        return args;
+    };
+    let command = Opt::command();
+    let has_subcommand = args.iter().skip(1).any(|a| {
+        command
+            .get_subcommands()
+            .any(|c| a.to_str() == Some(c.get_name()))
+    });
+    if !has_subcommand {
+        args.insert(1.min(args.len()), mode);
+    }
+    args
+}
+
+/// Raise the open-file soft limit to the hard limit (the entrypoint's `ulimit -n` did
+/// this before); each RTSP client and camera connection needs descriptors
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    // SAFETY: getrlimit/setrlimit only read and write the struct we pass
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+            lim.rlim_cur = lim.rlim_max;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn test_args_with_mode() {
+        let args = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        std::env::set_var("NEO_LINK_MODE", "mqtt");
+        assert_eq!(
+            args_with_mode(args(&["neolink", "--config", "/etc/neolink.toml"])),
+            args(&["neolink", "mqtt", "--config", "/etc/neolink.toml"])
+        );
+        assert_eq!(
+            args_with_mode(args(&["neolink", "battery", "--config", "c", "cam"])),
+            args(&["neolink", "battery", "--config", "c", "cam"])
+        );
+        std::env::remove_var("NEO_LINK_MODE");
+        assert_eq!(
+            args_with_mode(args(&["neolink", "--config", "c"])),
+            args(&["neolink", "--config", "c"])
+        );
     }
 }
