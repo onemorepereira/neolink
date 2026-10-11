@@ -118,6 +118,12 @@ pub struct FixtureSource {
     pub fail_starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Close the stream at the end of the fixture instead of holding it open
     pub end_at_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Replay the fixture forever with a continuous camera clock (long client tests)
+    pub looping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// While set, nothing is sent and the replay clock stands still (a stalled camera)
+    pub stalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Simulated wake time: each start takes this long, in ms, before media can flow
+    pub start_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FixtureSource {
@@ -134,6 +140,9 @@ impl FixtureSource {
             running: Default::default(),
             fail_starts: Default::default(),
             end_at_eof: Default::default(),
+            looping: Default::default(),
+            stalled: Default::default(),
+            start_delay_ms: Default::default(),
         }
     }
 }
@@ -156,25 +165,82 @@ impl StreamSource for FixtureSource {
             }
         }
         let end_at_eof = self.end_at_eof.load(SeqCst);
+        let looping = self.looping.load(SeqCst);
+        let stalled = self.stalled.clone();
+        let delay = std::time::Duration::from_millis(self.start_delay_ms.load(SeqCst));
         Box::pin(async move {
             if fail {
                 return Err("fixture: start failed".to_string());
             }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("fixture: cancelled while waking".into()),
+                _ = tokio::time::sleep(delay) => {}
+            }
             let (tx, rx) = mpsc::channel(256);
             running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::spawn(async move {
-                let start = tokio::time::Instant::now();
+                let mut start = tokio::time::Instant::now();
                 let first = units.first().map(|u| u.at_us).unwrap_or(0);
-                for u in units.iter() {
-                    let at = std::time::Duration::from_micros(
-                        (u.at_us.saturating_sub(first) as f64 / speed.max(1e-6)) as u64,
-                    );
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep_until(start + at) => {}
+                // Each lap moves both clocks by the media span, so wall time and media
+                // time advance together; audio is topped up to the same length
+                let period = lap_period(&units);
+                let (at_period, cam_period) = (period, period);
+                let last_adts = units.iter().rev().find_map(|u| match &u.unit {
+                    SourceUnit::Aac { adts } => Some(adts.clone()),
+                    _ => None,
+                });
+                let au_us = last_adts
+                    .as_ref()
+                    .and_then(|a| crate::codec::aac::AdtsHeader::parse(a).ok())
+                    .map(|h| 1024 * 1_000_000 / h.sample_rate().max(1) as u64)
+                    .unwrap_or(0);
+                let mut audio_us = 0u64;
+                let mut lap = 0u64;
+                'replay: loop {
+                    for u in units.iter() {
+                        let rel = u.at_us.saturating_sub(first) + lap * at_period;
+                        let at =
+                            std::time::Duration::from_micros((rel as f64 / speed.max(1e-6)) as u64);
+                        tokio::select! {
+                            _ = cancel.cancelled() => break 'replay,
+                            _ = tokio::time::sleep_until(start + at) => {}
+                        }
+                        while stalled.load(SeqCst) {
+                            let step = std::time::Duration::from_millis(50);
+                            tokio::select! {
+                                _ = cancel.cancelled() => break 'replay,
+                                _ = tokio::time::sleep(step) => start += step,
+                            }
+                        }
+                        let mut unit = u.unit.clone();
+                        if let SourceUnit::Video { cam_us, .. } = &mut unit {
+                            *cam_us = cam_us.wrapping_add((lap * cam_period) as u32);
+                        }
+                        if lap > 0 && matches!(unit, SourceUnit::Restarted) {
+                            continue;
+                        }
+                        if matches!(unit, SourceUnit::Aac { .. }) {
+                            audio_us += au_us;
+                        }
+                        if tx.send(unit).await.is_err() {
+                            break 'replay;
+                        }
                     }
-                    if tx.send(u.unit.clone()).await.is_err() {
+                    if !looping {
                         break;
+                    }
+                    lap += 1;
+                    if let Some(adts) = &last_adts {
+                        while au_us > 0 && audio_us + au_us / 2 < lap * period {
+                            audio_us += au_us;
+                            if tx
+                                .send(SourceUnit::Aac { adts: adts.clone() })
+                                .await
+                                .is_err()
+                            {
+                                break 'replay;
+                            }
+                        }
                     }
                 }
                 // Hold the stream open until cancelled, like a camera with nothing new
@@ -190,5 +256,76 @@ impl StreamSource for FixtureSource {
 
     fn availability(&self) -> watch::Receiver<Availability> {
         self.availability.subscribe()
+    }
+}
+
+/// How far each lap of a looped fixture moves the clocks: the video span on the camera
+/// clock plus one mean frame interval (the arrival span is shorter: a start-up burst)
+fn lap_period(units: &[FixtureUnit]) -> u64 {
+    let cams: Vec<u32> = units
+        .iter()
+        .filter_map(|u| match &u.unit {
+            SourceUnit::Video { cam_us, .. } => Some(*cam_us),
+            _ => None,
+        })
+        .collect();
+    if cams.len() < 2 {
+        let at = match (units.first(), units.last()) {
+            (Some(a), Some(b)) => b.at_us.saturating_sub(a.at_us),
+            _ => 0,
+        };
+        return at.max(1);
+    }
+    let span = cams.last().unwrap().wrapping_sub(cams[0]) as u64;
+    span + span / (cams.len() as u64 - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A looped fixture keeps audio and video the same length lap after lap, and its
+    /// arrivals keep pace with media time (no drift for A16, no jump for the pacer)
+    #[tokio::test(start_paused = true)]
+    async fn test_looping_keeps_tracks_and_wall_time_together() {
+        let path = format!(
+            "{}/../../fixtures/synth/plain_h265.bcm",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let units = parse_bcm(&std::fs::read(&path).expect("cargo xtask mkfixture --standard"));
+        let src = FixtureSource::new(units, 1.0, Some(false));
+        src.looping.store(true, SeqCst);
+        let mut rx = src
+            .start(StartMode::Demand, CancellationToken::new())
+            .await
+            .unwrap();
+        let t0 = tokio::time::Instant::now();
+        let (mut frames, mut aus) = (0u64, 0u64);
+        let mut last_cam: Option<u32> = None;
+        while t0.elapsed() < std::time::Duration::from_secs(65) {
+            match rx.recv().await.unwrap() {
+                SourceUnit::Video { cam_us, .. } => {
+                    if let Some(l) = last_cam {
+                        let d = cam_us.wrapping_sub(l);
+                        assert!((60_000..=75_000).contains(&d), "camera step {d} µs");
+                    }
+                    last_cam = Some(cam_us);
+                    frames += 1;
+                }
+                SourceUnit::Aac { .. } => aus += 1,
+                _ => {}
+            }
+        }
+        let video_us = frames * 1_000_000 / 15;
+        let audio_us = aus * 64_000;
+        assert!(
+            video_us.abs_diff(audio_us) <= 2 * 64_000,
+            "video {video_us} µs vs audio {audio_us} µs after 3 laps"
+        );
+        // Media sent by 65 s of wall time: at most the 1.9 s start-up burst ahead
+        assert!(
+            video_us.abs_diff(65_000_000) <= 2_500_000,
+            "{video_us} µs of video in 65 s"
+        );
     }
 }

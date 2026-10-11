@@ -437,7 +437,7 @@ IRAP, and the session's sender registration.
 - **H.265** (RFC 7798): single NAL or FU (type 49), with the PayloadHdr built from the
   original layer and TID. S and E are set by fragment index. No AP.
 - **Parameter sets** (`parameter_sets = "strip" | "passthrough" | "inject"`, F-ds 6):
-  - `strip` is the provisional default. It removes in-band VPS/SPS/PPS, including the
+  - `strip` is the default (confirmed by A4b at Gate 3, SPEC §9). It removes in-band VPS/SPS/PPS, including the
     camera's own copies (the Argus sends them with every IRAP), and relies on the SDP. That
     is bairelay's fix for the HA `ffmpeg:` re-publish → go2rtc `frame.jpeg` exit-183 bug.
   - `passthrough` forwards the camera's in-band copies unchanged.
@@ -665,7 +665,7 @@ The initial no-credentials 401 does not.
 | `rtp_mtu` | top | 576–9000, `1400` | |
 | `audio` | camera | `"aac"\|"none"`, `"aac"` | |
 | `pacing_latency_ms` | camera | 0–3000, auto (§4.4) | |
-| `parameter_sets` | camera | `"strip"\|"passthrough"\|"inject"`, `"strip"` (provisional, A4b) | |
+| `parameter_sets` | camera | `"strip"\|"passthrough"\|"inject"`, `"strip"` (A4b, Gate 3) | |
 | `bridge_fps` | camera | 0.1–2, `0.2` | |
 | `battery` | camera | bool, auto-detected (`None` → battery) | Overrides detection |
 | `rtcp_sr` | camera | bool, `true` | |
