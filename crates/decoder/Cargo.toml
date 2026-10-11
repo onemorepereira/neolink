@@ -4,6 +4,7 @@ description = "A cli decoder for the AES encrypted packets"
 version = "0.6.3-rc.3"
 authors = ["Andrew King <sheepchaan@gmail.com>"]
 edition = "2018"
+rust-version = "1.82"
 license = "AGPL-3.0-or-later"
 
 [dependencies]

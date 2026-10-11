@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+description = "Development tasks for neolink: fixture generation and golden transcripts"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+anyhow = "1.0.70"
+clap = { version = "4.2.2", features = ["derive"] }
+neolink_core = { path = "../core" }
+regex = "1.7.3"
+sha2 = "0.10.8"

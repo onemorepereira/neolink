@@ -1,0 +1,15 @@
+[package]
+name = "neolink_rtsp"
+description = "A GStreamer-free RTSP 1.0 server for live camera streams"
+version = "0.6.3-rc.3"
+authors = ["Andrew King <sheepchaan@gmail.com>"]
+edition = "2021"
+rust-version = "1.82"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+log = "0.4.17"
+
+[dev-dependencies]
+symphonia = { version = "0.5.4", default-features = false, features = ["aac"] }

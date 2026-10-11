@@ -1,0 +1,22 @@
+# conn 1
+> OPTIONS rtsp://HOST/argus/extern RTSP/1.0
+> CSeq: 1
+> User-Agent: Lavf
+>
+< RTSP/1.0 200 OK
+< CSeq: 1
+< Public: OPTIONS, DESCRIBE, ANNOUNCE, GET_PARAMETER, PAUSE, PLAY, RECORD, SETUP, SET_PARAMETER, TEARDOWN
+< Server: GStreamer RTSP server
+< Date: DATE
+<
+> DESCRIBE rtsp://HOST/argus/extern RTSP/1.0
+> Accept: application/sdp
+> CSeq: 2
+> User-Agent: Lavf
+>
+< RTSP/1.0 400 Bad Request
+< CSeq: 2
+< Server: GStreamer RTSP server
+< Date: DATE
+<
+# conn 1 closed:
