@@ -508,6 +508,10 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                         .with_context(|| {
                                             format!("{}: Failed to publish preview", camera_name)
                                         })?;
+                                // A sleeping camera gets one preview per wake (SPEC P14)
+                                if camera_snap.config().await?.borrow().sleeps() {
+                                    camera_snap.next_connection().await?;
+                                }
                             }
                             AnyResult::Ok(())
                         }.await;
@@ -552,6 +556,10 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                         .with_context(|| {
                                             format!("{}: Failed to publish battery", camera_name)
                                         })?;
+                                // A sleeping camera gets one battery read per wake (SPEC P14)
+                                if camera_battery.config().await?.borrow().sleeps() {
+                                    camera_battery.next_connection().await?;
+                                }
                             }
                             AnyResult::Ok(())
                         }.await;

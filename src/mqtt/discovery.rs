@@ -239,10 +239,12 @@ pub(crate) async fn enable_discovery(
         sw_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
 
+    // Available while neolink runs, not while the camera is connected: a sleeping battery
+    // camera is not "unavailable" (SPEC P14). The camera's connection is the Awake sensor
     let availability = DiscoveryAvaliablity {
-        topic: format!("neolink/{}/status", cam_config.name),
+        topic: "neolink/status".to_string(),
         payload_available: Some("connected".to_string()),
-        payload_not_available: None,
+        payload_not_available: Some("offline".to_string()),
     };
 
     for feature in &discovery_config.features {
@@ -626,6 +628,34 @@ pub(crate) async fn enable_discovery(
             }
         }
     }
+
+    let awake = DiscoveryBinarySensor {
+        device: device.clone(),
+        availability: availability.clone(),
+        name: format!("{} Awake", friendly_name.as_str()),
+        unique_id: format!("neolink_{}_awake", cam_config.name),
+        icon: Some("mdi:sleep-off".to_string()),
+        state_topic: format!("neolink/{}/status", cam_config.name),
+        payload_off: "disconnected".to_string(),
+        payload_on: "connected".to_string(),
+    };
+    mqtt.send_message_with_root_topic(
+        &format!(
+            "{}/binary_sensor/{}",
+            discovery_config.topic, &awake.unique_id
+        ),
+        "config",
+        &serde_json::to_string(&awake)
+            .with_context(|| "Cound not serialise discovery awake config into json")?,
+        true,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to publish awake auto-discover data on over MQTT for {}",
+            cam_config.name
+        )
+    })?;
 
     info!(
         "Enabled MQTT discovery for {} with friendly name {}",

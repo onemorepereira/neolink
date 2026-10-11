@@ -309,9 +309,21 @@ impl<'a> MqttBackend<'a> {
                                         }
                                     }
                                     Event::Incoming(Incoming::Publish(published_message)) => {
+                                        // Retained commands are replays from before we started:
+                                        // acting on them on every broker reconnect would wake
+                                        // battery cameras or undo settings (SPEC P14)
+                                        let stale = published_message.retain
+                                            && is_command_topic(&published_message.topic);
+                                        if stale {
+                                            log::warn!(
+                                                "Ignoring retained MQTT message on {}; publish commands without retain",
+                                                published_message.topic
+                                            );
+                                        }
                                         if let Some(sub_topic) = published_message
                                             .topic
                                             .strip_prefix("neolink/")
+                                            .filter(|_| !stale)
                                         {
                                             let _ = incomming_tx
                                                 .send(MqttReply {
@@ -336,6 +348,33 @@ impl<'a> MqttBackend<'a> {
             break r;
         }?;
         Ok(())
+    }
+}
+
+/// Topics that make neolink act: `neolink/config`, `neolink/<cam>/control/..`,
+/// `neolink/<cam>/query/..`
+fn is_command_topic(topic: &str) -> bool {
+    let Some(sub) = topic.strip_prefix("neolink/") else {
+        return false;
+    };
+    sub == "config"
+        || sub
+            .split('/')
+            .nth(1)
+            .is_some_and(|t| t == "control" || t == "query")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_is_command_topic() {
+        use super::is_command_topic;
+        assert!(is_command_topic("neolink/config"));
+        assert!(is_command_topic("neolink/argus/control/wakeup"));
+        assert!(is_command_topic("neolink/argus/query/battery"));
+        assert!(!is_command_topic("neolink/argus/status/battery_level"));
+        assert!(!is_command_topic("neolink/status"));
+        assert!(!is_command_topic("other/argus/control/x"));
     }
 }
 

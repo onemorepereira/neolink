@@ -200,8 +200,11 @@ impl BcCamera {
                 DiscoveryMethods::Debug => (false, false, true, false),
             };
 
-            let res = tokio::select! {
-                Ok(v) = async {
+            // Local first, the Reolink cloud only if that fails and `discovery` allows it,
+            // never both at once: a parallel cloud registration wakes battery cameras
+            // through Reolink's servers on every attempt (SPEC P9)
+            let local_result: Result<CameraLocation> = if allow_local {
+                async {
                     let uid_local = uid.clone();
                     info!("{}: Trying local discovery", options.name);
                     let result = discovery.local(&uid_local, Some(sockets)).await;
@@ -214,97 +217,120 @@ impl BcCamera {
                                 disc.get_addr()
                             );
                             Ok(CameraLocation::Udp(disc))
-                        },
-                        Err(e) => Err(e)
-                    }
-                }, if allow_local => Ok(v),
-                Ok(v) = async {
-                    let mut discovery = Discovery::new().await?;
-                    let reg_result;
-                    // Registration is looped as it seems that reolink
-                    // only updates the registration lazily when someone attempts
-                    // to connect. The first few connects fails until the server data
-                    // is updated
-                    //
-                    // We loop infinitly and allow the caller to timeout at the
-                    // interval they desire
-                    let mut retry = 0;
-                    let max_retry: usize = options.max_discovery_retries;
-                    loop {
-                        tokio::task::yield_now().await;
-                        if let Ok(result) = discovery.get_registration(uid).await {
-                            reg_result = result;
-                            break;
                         }
-                        if retry >= max_retry && max_retry > 0 {
-                            return Err(Error::DiscoveryTimeout);
-                        }
-                        log::info!("{}: Registration with reolink servers failed. Retrying: {}/{}", options.name, retry + 1, if max_retry > 0 {format!("{}", max_retry)} else {"infinite".to_string()});
-                        retry += 1;
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        // New discovery to get new client IDs
-                        discovery = Discovery::new().await?;
-                    };
-                    tokio::select! {
-                        Ok(v) = async {
-                            let uid_remote = uid.clone();
-                            info!("{}: Trying remote discovery", options.name);
-                            let result = discovery
-                                .remote(&uid_remote, &reg_result)
-                                .await;
-                            match result {
-                                Ok(disc) => {
-                                    info!(
-                                        "{}: Remote discovery success {} at {}",
-                                        options.name,
-                                        uid_remote,
-                                        disc.get_addr()
-                                    );
-                                    Ok(CameraLocation::Udp(disc))
-                                },
-                                Err(e) => Err(e)
-                            }
-                        }, if allow_remote => Ok(v),
-                        Ok(v) = async {
-                            let uid_map = uid.clone();
-                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-                            info!("{}: Trying map discovery", options.name);
-                            let result = discovery.map(&reg_result).await;
-                            match result {
-                                Ok(disc) => {
-                                    info!(
-                                        "{}: Map success {} at {}",
-                                        options.name,
-                                        uid_map,
-                                        disc.get_addr()
-                                    );
-                                    Ok(CameraLocation::Udp(disc))
-                                },
-                                Err(e) => Err(e),
-                            }
-                        }, if allow_map => Ok(v),
-                        Ok(v) = async {
-                            let uid_relay = uid.clone();
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                            info!("{}: Trying relay discovery", options.name);
-                            let result = discovery.relay(&reg_result).await;
-                            match result {
-                                Ok(disc) => {
-                                    info!(
-                                        "{}: Relay success {} at {}",
-                                        options.name,
-                                        uid_relay,
-                                        disc.get_addr()
-                                    );
-                                    Ok(CameraLocation::Udp(disc))
-                                },
-                                Err(e) => Err(e),
-                            }
-                        }, if allow_relay => Ok(v),
-                        else => Err(Error::DiscoveryTimeout),
+                        Err(e) => Err(e),
                     }
-                }, if allow_remote || allow_map || allow_relay => Ok(v),
-                else => Err(Error::DiscoveryTimeout),
+                }
+                .await
+            } else {
+                Err(Error::DiscoveryTimeout)
+            };
+            let res = match local_result {
+                Ok(v) => Ok(v),
+                Err(_) if allow_remote || allow_map || allow_relay => {
+                    info!(
+                        "{}: Local discovery failed, trying the Reolink cloud",
+                        options.name
+                    );
+                    let cloud: Result<CameraLocation> = async {
+                        let mut discovery = Discovery::new().await?;
+                        let reg_result;
+                        // Registration is looped as it seems that reolink
+                        // only updates the registration lazily when someone attempts
+                        // to connect. The first few connects fails until the server data
+                        // is updated
+                        //
+                        // We loop infinitly and allow the caller to timeout at the
+                        // interval they desire
+                        let mut retry = 0;
+                        let max_retry: usize = options.max_discovery_retries;
+                        loop {
+                            tokio::task::yield_now().await;
+                            if let Ok(result) = discovery.get_registration(uid).await {
+                                reg_result = result;
+                                break;
+                            }
+                            if retry >= max_retry && max_retry > 0 {
+                                return Err(Error::DiscoveryTimeout);
+                            }
+                            log::info!(
+                                "{}: Registration with reolink servers failed. Retrying: {}/{}",
+                                options.name,
+                                retry + 1,
+                                if max_retry > 0 {
+                                    format!("{}", max_retry)
+                                } else {
+                                    "infinite".to_string()
+                                }
+                            );
+                            retry += 1;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            // New discovery to get new client IDs
+                            discovery = Discovery::new().await?;
+                        }
+                        tokio::select! {
+                            Ok(v) = async {
+                                let uid_remote = uid.clone();
+                                info!("{}: Trying remote discovery", options.name);
+                                let result = discovery
+                                    .remote(&uid_remote, &reg_result)
+                                    .await;
+                                match result {
+                                    Ok(disc) => {
+                                        info!(
+                                            "{}: Remote discovery success {} at {}",
+                                            options.name,
+                                            uid_remote,
+                                            disc.get_addr()
+                                        );
+                                        Ok(CameraLocation::Udp(disc))
+                                    },
+                                    Err(e) => Err(e)
+                                }
+                            }, if allow_remote => Ok(v),
+                            Ok(v) = async {
+                                let uid_map = uid.clone();
+                                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                                info!("{}: Trying map discovery", options.name);
+                                let result = discovery.map(&reg_result).await;
+                                match result {
+                                    Ok(disc) => {
+                                        info!(
+                                            "{}: Map success {} at {}",
+                                            options.name,
+                                            uid_map,
+                                            disc.get_addr()
+                                        );
+                                        Ok(CameraLocation::Udp(disc))
+                                    },
+                                    Err(e) => Err(e),
+                                }
+                            }, if allow_map => Ok(v),
+                            Ok(v) = async {
+                                let uid_relay = uid.clone();
+                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                info!("{}: Trying relay discovery", options.name);
+                                let result = discovery.relay(&reg_result).await;
+                                match result {
+                                    Ok(disc) => {
+                                        info!(
+                                            "{}: Relay success {} at {}",
+                                            options.name,
+                                            uid_relay,
+                                            disc.get_addr()
+                                        );
+                                        Ok(CameraLocation::Udp(disc))
+                                    },
+                                    Err(e) => Err(e),
+                                }
+                            }, if allow_relay => Ok(v),
+                            else => Err(Error::DiscoveryTimeout),
+                        }
+                    }
+                    .await;
+                    cloud
+                }
+                Err(e) => Err(e),
             }?;
 
             return Ok(res);

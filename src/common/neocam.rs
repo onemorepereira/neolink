@@ -434,8 +434,17 @@ impl NeoCam {
         self.ledger.clone()
     }
 
+    /// Only a changed config is pushed, so re-publishing the same config does not
+    /// reconnect anything (SPEC P14)
     pub(crate) async fn update_config(&self, config: CameraConfig) -> Result<()> {
-        self.config_watch.send_replace(config);
+        self.config_watch.send_if_modified(|old| {
+            if *old != config {
+                *old = config;
+                true
+            } else {
+                false
+            }
+        });
         Ok(())
     }
 }

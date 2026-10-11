@@ -49,7 +49,7 @@ impl NeoCamThread {
             Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
                 return Ok(Exit::Released);
             }
-            Ok(_) = config_rec.changed() => return Ok(Exit::Released),
+            Ok(_) = config_rec.wait_for(|new| connection_changed(new, config)) => return Ok(Exit::Released),
         };
         log::trace!("  - Connected");
 
@@ -77,7 +77,8 @@ impl NeoCamThread {
             Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
                 Ok(Exit::Released)
             }
-            Ok(_) = config_rec.changed() => {
+            // Only settings that affect the connection reconnect (SPEC P14)
+            Ok(_) = config_rec.wait_for(|new| connection_changed(new, config)) => {
                 Ok(Exit::Released)
             }
             v = camera.join() => {
@@ -214,6 +215,19 @@ enum Exit {
     Shutdown,
     /// Released (idle, or config change); connect again when needed
     Released,
+}
+
+/// Whether a new config needs a new connection
+fn connection_changed(new: &CameraConfig, old: &CameraConfig) -> bool {
+    new.camera_addr != old.camera_addr
+        || new.camera_uid != old.camera_uid
+        || new.username != old.username
+        || new.password != old.password
+        || new.channel_id != old.channel_id
+        || new.discovery != old.discovery
+        || new.max_encryption != old.max_encryption
+        || new.debug != old.debug
+        || new.max_discovery_retries != old.max_discovery_retries
 }
 
 /// A 400 reply, which cameras send while still waking up

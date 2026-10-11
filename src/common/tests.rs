@@ -189,3 +189,34 @@ async fn test_no_retry_without_demand() {
         "kept retrying without demand"
     );
 }
+
+/// P14: re-publishing a config, or changing a key that doesn't affect the connection,
+/// does not reconnect
+#[tokio::test]
+async fn test_config_push_reconnects_only_when_needed() {
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
+    let config = config_for(&cam, "idle_disconnect = false");
+    let neocam = new_neocam(config.clone()).await;
+    wait_stats(&cam, 10, |s| s.logins == 1).await;
+
+    neocam.update_config(config.clone()).await.unwrap();
+    let mut changed = config.clone();
+    changed.idle_grace_s = 99;
+    changed.use_splash = !changed.use_splash;
+    neocam.update_config(changed.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        cam.stats().logins,
+        1,
+        "reconnected for a non-connection change"
+    );
+
+    // A different (equivalent) address is a connection change
+    let mut moved = changed.clone();
+    moved.camera_addr = Some(format!("localhost:{}", cam.addr().port()));
+    neocam.update_config(moved).await.unwrap();
+    wait_stats(&cam, 10, |s| s.logins == 2).await;
+    assert_eq!(cam.stats().logouts, 1);
+}

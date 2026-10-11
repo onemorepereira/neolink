@@ -289,6 +289,17 @@ impl NeoInstance {
         Ok(instance_rx.await?)
     }
 
+    /// Wait for the next connection: a different camera than the current one, or any
+    /// camera if there is none now. Never causes a connection
+    pub(crate) async fn next_connection(&self) -> Result<()> {
+        let mut watch = self.camera_watch.clone();
+        let current = watch.borrow_and_update().clone();
+        watch
+            .wait_for(|cam| !Weak::ptr_eq(cam, &current) && cam.upgrade().is_some())
+            .await?;
+        Ok(())
+    }
+
     pub(crate) fn camera(&self) -> WatchReceiver<Weak<BcCamera>> {
         self.camera_watch.clone()
     }
