@@ -212,7 +212,7 @@ fn encode_video(opts: &Opts, secs: u32, width: u32, height: u32) -> Result<Vec<A
         cmd.args(["-c:v", "libx265", "-preset", "ultrafast", "-b:v", "300k"])
             .args([
                 "-x265-params",
-                "keyint=30:min-keyint=30:scenecut=0:bframes=0:repeat-headers=1:\
+                "keyint=30:min-keyint=30:scenecut=0:bframes=0:repeat-headers=1:open-gop=0:\
                  pools=none:frame-threads=1:wpp=0:info=0:asm=none:log-level=error",
             ])
             .args(["-f", "hevc", "pipe:1"]);

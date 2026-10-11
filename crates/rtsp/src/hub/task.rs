@@ -568,13 +568,13 @@ impl Hub {
                 let restamp = match (&self.cached_irap, self.codec, self.sessions.get(&id)) {
                     (Some(nals), Some(codec), Some(s)) if !s.playing => {
                         // Late joiner: the last released IRAP, at the last wire time, plus
-                        // EOS; live video then flows from the next IRAP (DESIGN §4.6)
+                        // EOS where needed; live video then flows from the next IRAP (DESIGN §4.6)
                         let wire = self
                             .wire
                             .last_out_wire()
                             .unwrap_or_else(|| self.wire.virtual_now(now));
                         let mut nals = nals.clone();
-                        nals.push(eos_nal(codec));
+                        nals.extend(eos_nal(codec, &nals));
                         Some(self.video_frame(codec, &nals, true, wire))
                     }
                     _ => None,
@@ -1060,7 +1060,7 @@ impl Hub {
                     match out {
                         BridgeOut::Video { wire_us } => {
                             if let Some(mut nals) = self.cached_irap.clone() {
-                                nals.push(eos_nal(codec));
+                                nals.extend(eos_nal(codec, &nals));
                                 let f = self.video_frame(codec, &nals, true, wire_us);
                                 self.fan_out(f);
                             }

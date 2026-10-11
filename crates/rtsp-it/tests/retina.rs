@@ -275,15 +275,13 @@ async fn test_a6_byte_identical_basic_and_digest() {
             got.video[0].1,
             "{schemes:?}: the first frame is a random access point"
         );
-        // A late joiner first gets the last released IRAP followed by an EOS NAL (H.265
-        // type 36), then live media from the next IRAP (DESIGN §4.6)
-        let mut first = got_v[0].clone();
-        assert_eq!(
-            first.last().map(|n| ((n[0] >> 1) & 0x3f, n.len())),
-            Some((36, 2)),
-            "{schemes:?}: the cached IRAP ends with EOS"
+        // A late joiner first gets the last released IRAP (with EOS only after a CRA/BLA,
+        // not after the fixture's IDRs), then live media from the next IRAP (DESIGN §4.6)
+        let first = got_v[0].clone();
+        assert!(
+            first.iter().all(|n| (n[0] >> 1) & 0x3f != 36),
+            "{schemes:?}: no EOS after an IDR"
         );
-        first.pop();
         assert!(
             want_v.contains(&first),
             "{schemes:?}: the cached IRAP is from the input"

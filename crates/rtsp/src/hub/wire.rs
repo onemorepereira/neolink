@@ -130,12 +130,22 @@ impl WireClock {
     }
 }
 
-/// End-of-sequence NAL, appended to every bridged picture so each starts a new coded
-/// video sequence (no duplicate POC or idr_pic_id)
-pub fn eos_nal(codec: VideoCodec) -> Bytes {
+/// The end-of-sequence NAL to append to a repeated picture (bridge, late joiner), so each
+/// repeat starts a new coded video sequence: H.264 needs it for every IDR repeat (the same
+/// idr_pic_id twice is invalid); H.265 only after a CRA/BLA (a repeated IDR resets POC).
+/// The H.265 EOS is a 2-byte packet that ffmpeg's depacketizer rejects ("Too short
+/// RTP/HEVC packet"), so it is sent only where it is needed. The Argus sends IDR_W_RADL.
+pub fn eos_nal(codec: VideoCodec, nals: &[Bytes]) -> Option<Bytes> {
     match codec {
-        VideoCodec::H264 => Bytes::from_static(&[0x0a]),
-        VideoCodec::H265 => Bytes::from_static(&[0x48, 0x01]),
+        VideoCodec::H264 => Some(Bytes::from_static(&[0x0a])),
+        VideoCodec::H265 => {
+            let cra_or_bla = nals.iter().any(|n| {
+                n.first().is_some_and(|b| {
+                    (16..=18).contains(&((b >> 1) & 0x3f)) || (b >> 1) & 0x3f == 21
+                })
+            });
+            cra_or_bla.then(|| Bytes::from_static(&[0x48, 0x01]))
+        }
     }
 }
 

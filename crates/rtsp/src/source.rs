@@ -181,7 +181,20 @@ impl StreamSource for FixtureSource {
             tokio::spawn(async move {
                 let mut start = tokio::time::Instant::now();
                 let first = units.first().map(|u| u.at_us).unwrap_or(0);
-                let (at_period, cam_period) = loop_periods(&units);
+                // Each lap moves both clocks by the media span, so wall time and media
+                // time advance together; audio is topped up to the same length
+                let period = lap_period(&units);
+                let (at_period, cam_period) = (period, period);
+                let last_adts = units.iter().rev().find_map(|u| match &u.unit {
+                    SourceUnit::Aac { adts } => Some(adts.clone()),
+                    _ => None,
+                });
+                let au_us = last_adts
+                    .as_ref()
+                    .and_then(|a| crate::codec::aac::AdtsHeader::parse(a).ok())
+                    .map(|h| 1024 * 1_000_000 / h.sample_rate().max(1) as u64)
+                    .unwrap_or(0);
+                let mut audio_us = 0u64;
                 let mut lap = 0u64;
                 'replay: loop {
                     for u in units.iter() {
@@ -206,6 +219,9 @@ impl StreamSource for FixtureSource {
                         if lap > 0 && matches!(unit, SourceUnit::Restarted) {
                             continue;
                         }
+                        if matches!(unit, SourceUnit::Aac { .. }) {
+                            audio_us += au_us;
+                        }
                         if tx.send(unit).await.is_err() {
                             break 'replay;
                         }
@@ -214,6 +230,18 @@ impl StreamSource for FixtureSource {
                         break;
                     }
                     lap += 1;
+                    if let Some(adts) = &last_adts {
+                        while au_us > 0 && audio_us + au_us / 2 < lap * period {
+                            audio_us += au_us;
+                            if tx
+                                .send(SourceUnit::Aac { adts: adts.clone() })
+                                .await
+                                .is_err()
+                            {
+                                break 'replay;
+                            }
+                        }
+                    }
                 }
                 // Hold the stream open until cancelled, like a camera with nothing new
                 if end_at_eof {
@@ -231,13 +259,9 @@ impl StreamSource for FixtureSource {
     }
 }
 
-/// How far each lap of a looped fixture moves the arrival clock and the camera clock: the
-/// span plus one mean frame interval, so the timeline continues without a jump
-fn loop_periods(units: &[FixtureUnit]) -> (u64, u64) {
-    let at = match (units.first(), units.last()) {
-        (Some(a), Some(b)) => b.at_us.saturating_sub(a.at_us),
-        _ => 0,
-    };
+/// How far each lap of a looped fixture moves the clocks: the video span on the camera
+/// clock plus one mean frame interval (the arrival span is shorter: a start-up burst)
+fn lap_period(units: &[FixtureUnit]) -> u64 {
     let cams: Vec<u32> = units
         .iter()
         .filter_map(|u| match &u.unit {
@@ -246,9 +270,62 @@ fn loop_periods(units: &[FixtureUnit]) -> (u64, u64) {
         })
         .collect();
     if cams.len() < 2 {
-        return (at.max(1), 0);
+        let at = match (units.first(), units.last()) {
+            (Some(a), Some(b)) => b.at_us.saturating_sub(a.at_us),
+            _ => 0,
+        };
+        return at.max(1);
     }
     let span = cams.last().unwrap().wrapping_sub(cams[0]) as u64;
-    let step = span / (cams.len() as u64 - 1);
-    ((at + step).max(1), span + step)
+    span + span / (cams.len() as u64 - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A looped fixture keeps audio and video the same length lap after lap, and its
+    /// arrivals keep pace with media time (no drift for A16, no jump for the pacer)
+    #[tokio::test(start_paused = true)]
+    async fn test_looping_keeps_tracks_and_wall_time_together() {
+        let path = format!(
+            "{}/../../fixtures/synth/plain_h265.bcm",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let units = parse_bcm(&std::fs::read(&path).expect("cargo xtask mkfixture --standard"));
+        let src = FixtureSource::new(units, 1.0, Some(false));
+        src.looping.store(true, SeqCst);
+        let mut rx = src
+            .start(StartMode::Demand, CancellationToken::new())
+            .await
+            .unwrap();
+        let t0 = tokio::time::Instant::now();
+        let (mut frames, mut aus) = (0u64, 0u64);
+        let mut last_cam: Option<u32> = None;
+        while t0.elapsed() < std::time::Duration::from_secs(65) {
+            match rx.recv().await.unwrap() {
+                SourceUnit::Video { cam_us, .. } => {
+                    if let Some(l) = last_cam {
+                        let d = cam_us.wrapping_sub(l);
+                        assert!((60_000..=75_000).contains(&d), "camera step {d} µs");
+                    }
+                    last_cam = Some(cam_us);
+                    frames += 1;
+                }
+                SourceUnit::Aac { .. } => aus += 1,
+                _ => {}
+            }
+        }
+        let video_us = frames * 1_000_000 / 15;
+        let audio_us = aus * 64_000;
+        assert!(
+            video_us.abs_diff(audio_us) <= 2 * 64_000,
+            "video {video_us} µs vs audio {audio_us} µs after 3 laps"
+        );
+        // Media sent by 65 s of wall time: at most the 1.9 s start-up burst ahead
+        assert!(
+            video_us.abs_diff(65_000_000) <= 2_500_000,
+            "{video_us} µs of video in 65 s"
+        );
+    }
 }
