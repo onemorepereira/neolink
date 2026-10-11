@@ -45,6 +45,10 @@ jobs:
           cargo xtask mkfixture --standard --out fixtures/synth --check /tmp/SHA256SUMS
       - name: cargo test
         run: cargo test --workspace
+      - name: Golden structural diff, native server vs GStreamer (A19)
+        run: |
+          cargo build --release -p xtask
+          E2E_WORK=$(mktemp -d) tests/e2e/golden-native.sh
 
   msrv:
     name: MSRV (1.82)

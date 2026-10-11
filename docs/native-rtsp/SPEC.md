@@ -179,6 +179,9 @@ encoding, replacing GStreamer for `talk` and `image --use-stream`, Unifi Protect
 | Session timeout | `timeout=30` | `timeout=60`, bound to the TCP connection; keepalives accepted, not required | TCP only in v1 |
 | SDP | `s=Session streamed with GStreamer`, `a=tool:GStreamer`, `a=ts-refclk`, `a=mediaclk`, `a=ssrc`, PT 96 on both m-lines | `s=`/`a=tool` say neolink; refclk/mediaclk/ssrc attributes dropped (SSRC stays in Transport); `a=framerate` added; PT 96 kept on both | Honest identification; fps for clients |
 | Default transport for plain ffmpeg | UDP (measured) | 461, then TCP fallback (A2b) | v1 is TCP-only |
+| `Public` header | Also lists ANNOUNCE and RECORD | Play methods only (RECORD/ANNOUNCE get 405) | Honest capabilities |
+| Stream the camera doesn't have (e.g. the Argus's extern) | Mount exists; DESCRIBE answers 400 | No mount: 404 | Correct status |
+| After TEARDOWN | `Connection: close` and close, no BYE | Same; BYE only when the server ends a session (e.g. A18) | Matches GStreamer |
 | A/V start offset | Audio starts about 1.9 s before video (measured with ffprobe start times) | One wire clock (R5); A16 ≤ 150 ms | Bug fix |
 
 ### 5.2 Config keys

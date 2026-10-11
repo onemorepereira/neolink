@@ -3855,10 +3855,12 @@ dependencies = [
  "anyhow",
  "clap",
  "neolink_core",
+ "neolink_rtsp",
  "regex",
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

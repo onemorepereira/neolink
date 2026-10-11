@@ -118,6 +118,10 @@ pub struct FixtureSource {
     pub fail_starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Close the stream at the end of the fixture instead of holding it open
     pub end_at_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Replay the fixture forever with a continuous camera clock (long client tests)
+    pub looping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// While set, nothing is sent and the replay clock stands still (a stalled camera)
+    pub stalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FixtureSource {
@@ -134,6 +138,8 @@ impl FixtureSource {
             running: Default::default(),
             fail_starts: Default::default(),
             end_at_eof: Default::default(),
+            looping: Default::default(),
+            stalled: Default::default(),
         }
     }
 }
@@ -156,6 +162,8 @@ impl StreamSource for FixtureSource {
             }
         }
         let end_at_eof = self.end_at_eof.load(SeqCst);
+        let looping = self.looping.load(SeqCst);
+        let stalled = self.stalled.clone();
         Box::pin(async move {
             if fail {
                 return Err("fixture: start failed".to_string());
@@ -163,19 +171,41 @@ impl StreamSource for FixtureSource {
             let (tx, rx) = mpsc::channel(256);
             running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::spawn(async move {
-                let start = tokio::time::Instant::now();
+                let mut start = tokio::time::Instant::now();
                 let first = units.first().map(|u| u.at_us).unwrap_or(0);
-                for u in units.iter() {
-                    let at = std::time::Duration::from_micros(
-                        (u.at_us.saturating_sub(first) as f64 / speed.max(1e-6)) as u64,
-                    );
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep_until(start + at) => {}
+                let (at_period, cam_period) = loop_periods(&units);
+                let mut lap = 0u64;
+                'replay: loop {
+                    for u in units.iter() {
+                        let rel = u.at_us.saturating_sub(first) + lap * at_period;
+                        let at =
+                            std::time::Duration::from_micros((rel as f64 / speed.max(1e-6)) as u64);
+                        tokio::select! {
+                            _ = cancel.cancelled() => break 'replay,
+                            _ = tokio::time::sleep_until(start + at) => {}
+                        }
+                        while stalled.load(SeqCst) {
+                            let step = std::time::Duration::from_millis(50);
+                            tokio::select! {
+                                _ = cancel.cancelled() => break 'replay,
+                                _ = tokio::time::sleep(step) => start += step,
+                            }
+                        }
+                        let mut unit = u.unit.clone();
+                        if let SourceUnit::Video { cam_us, .. } = &mut unit {
+                            *cam_us = cam_us.wrapping_add((lap * cam_period) as u32);
+                        }
+                        if lap > 0 && matches!(unit, SourceUnit::Restarted) {
+                            continue;
+                        }
+                        if tx.send(unit).await.is_err() {
+                            break 'replay;
+                        }
                     }
-                    if tx.send(u.unit.clone()).await.is_err() {
+                    if !looping {
                         break;
                     }
+                    lap += 1;
                 }
                 // Hold the stream open until cancelled, like a camera with nothing new
                 if end_at_eof {
@@ -191,4 +221,26 @@ impl StreamSource for FixtureSource {
     fn availability(&self) -> watch::Receiver<Availability> {
         self.availability.subscribe()
     }
+}
+
+/// How far each lap of a looped fixture moves the arrival clock and the camera clock: the
+/// span plus one mean frame interval, so the timeline continues without a jump
+fn loop_periods(units: &[FixtureUnit]) -> (u64, u64) {
+    let at = match (units.first(), units.last()) {
+        (Some(a), Some(b)) => b.at_us.saturating_sub(a.at_us),
+        _ => 0,
+    };
+    let cams: Vec<u32> = units
+        .iter()
+        .filter_map(|u| match &u.unit {
+            SourceUnit::Video { cam_us, .. } => Some(*cam_us),
+            _ => None,
+        })
+        .collect();
+    if cams.len() < 2 {
+        return (at.max(1), 0);
+    }
+    let span = cams.last().unwrap().wrapping_sub(cams[0]) as u64;
+    let step = span / (cams.len() as u64 - 1);
+    ((at + step).max(1), span + step)
 }

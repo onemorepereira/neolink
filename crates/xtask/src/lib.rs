@@ -4,3 +4,4 @@ pub mod annexb;
 pub mod fakecam;
 pub mod golden;
 pub mod mkfixture;
+pub mod rtsp_serve;

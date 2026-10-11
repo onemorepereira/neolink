@@ -1,0 +1,9 @@
+^$
+public: ANNOUNCE,DESCRIBE,GET_PARAMETER,OPTIONS,PAUSE,PLAY,RECORD,SETUP,SET_PARAMETER,TEARDOWN vs DESCRIBE,GET_PARAMETER,OPTIONS,PAUSE,PLAY,SETUP,SET_PARAMETER,TEARDOWN$
+session: SESSION1 timeout=30 vs SESSION1 timeout=60$
+sdp\.m1\.rtpmap: L16/16000/2 vs MPEG4-GENERIC/16000/1$
+sdp\.m1\.lines: c=,control,mediaclk,rtpmap,ssrc,ts-refclk vs c=,control,fmtp,rtpmap$
+sdp\.m1\.fmtp-values: \(absent\) vs indexdeltalength=3,indexlength=3,mode=AAC-hbr,sizelength=13,streamtype=5$
+sdp\.m1\.fmtp: \(absent\) vs config,indexdeltalength,indexlength,mode,profile-level-id,sizelength,streamtype$
+sdp\.m0\.lines: c=,control,fmtp,mediaclk,rtpmap,ssrc,ts-refclk vs c=,control,fmtp,rtpmap$
+www-authenticate: Basic realm vs Digest nonce,realm \| Basic

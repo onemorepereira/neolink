@@ -311,6 +311,8 @@ enum WriterCmd {
         reply: Bytes,
         done: tokio::sync::oneshot::Sender<Vec<(Track, TrackState)>>,
     },
+    /// Stop media without a BYE (the client asked: TEARDOWN)
+    Forget,
     Close,
 }
 
@@ -412,14 +414,20 @@ impl Conn {
                 Ok(Some(r)) | Err(r) => r,
             },
             "TEARDOWN" => {
-                let r = self.session_header_ok(&req);
-                if r.is_ok() {
-                    self.teardown().await;
+                if let Err(r) = self.session_header_ok(&req) {
+                    return self.send(r, cseq).await;
                 }
-                match r {
-                    Ok(()) => Response::new(200),
-                    Err(r) => r,
+                // Like GStreamer: echo the session, then close the connection
+                let mut r = Response::new(200);
+                if let Some(s) = &self.session {
+                    let t = self.server.config.session_timeout_s;
+                    r = r.header("Session", format!("{};timeout={t}", s.id));
                 }
+                self.teardown().await;
+                let _ = self.ctl.send(WriterCmd::Forget).await;
+                let r = r.header("Connection", "close");
+                self.send(r, cseq).await;
+                return false;
             }
             "RECORD" | "ANNOUNCE" => Response::new(405).header("Allow", PUBLIC),
             _ => Response::new(501),
@@ -751,6 +759,11 @@ async fn writer(
                 let _ = done.send(tracks.iter().map(|(k, t)| (*k, t.state)).collect());
                 r
             }
+            Either::Ctl(WriterCmd::Forget) => {
+                sub = None;
+                tracks.clear();
+                Ok(())
+            }
             Either::Ctl(WriterCmd::Close) => break,
             Either::Frame(f) => {
                 last_wire_seen = last_wire_seen.max(f.wire_us);
@@ -769,7 +782,8 @@ async fn writer(
             break;
         }
     }
-    // BYE for each track, then shutdown(Write)
+    // BYE for each track still set up (the server is ending the session), then
+    // shutdown(Write)
     if !tracks.is_empty() {
         let mut bye = BytesMut::new();
         for t in tracks.values() {
