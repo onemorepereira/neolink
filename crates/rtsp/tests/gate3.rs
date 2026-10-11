@@ -85,6 +85,7 @@ async fn test_a8_hundred_cycles() {
         async move {
             let mut c = Client::connect(addr).await;
             let (session, _) = c.play(&base, None).await;
+            while c.take_packet() {}
             while !c.packets.iter().any(|(ch, _)| *ch == 0) {
                 assert!(c.fill().await, "cycle {n}: no media");
                 while c.take_packet() {}
@@ -412,18 +413,30 @@ async fn test_a20_security() {
     assert_eq!(r.status, 200);
 }
 
-/// Time from sending DESCRIBE to the first video RTP packet of a fresh client
-async fn describe_to_first_video(h: &Harness) -> Duration {
+/// Time from sending DESCRIBE to a fresh client's first video RTP packet, and to its
+/// first live frame (the next video timestamp: the first frame may be the cached IRAP)
+async fn describe_to_first_video(h: &Harness) -> (Duration, Duration) {
     let base = format!("rtsp://{}/argus/main", h.addr);
     let mut c = Client::connect(h.addr).await;
     let t = Instant::now();
     c.play(&base, None).await;
-    while !c.packets.iter().any(|(ch, _)| *ch == 0) {
+    // Packets that came in the same read as the PLAY reply are already buffered
+    let video_ts = |c: &Client| -> Vec<(u32, Instant)> {
+        let mut v: Vec<(u32, Instant)> = vec![];
+        for (i, (ch, p)) in c.packets.iter().enumerate() {
+            if *ch == 0 && v.last().is_none_or(|l| l.0 != rtp_ts(p)) {
+                v.push((rtp_ts(p), c.arrivals[i]));
+            }
+        }
+        v
+    };
+    while c.take_packet() {}
+    while video_ts(&c).len() < 2 {
         assert!(c.fill().await, "no media");
         while c.take_packet() {}
     }
-    let i = c.packets.iter().position(|(ch, _)| *ch == 0).unwrap();
-    c.arrivals[i].duration_since(t)
+    let v = video_ts(&c);
+    (v[0].1.duration_since(t), v[1].1.duration_since(t))
 }
 
 /// N1: DESCRIBE → first video RTP ≤ 2 s with the camera streaming, and ≤ 2 s plus the
@@ -443,8 +456,8 @@ async fn test_n1_time_to_first_video() {
             .play(&format!("rtsp://{}/argus/main", h.addr), None)
             .await;
         keeper.collect(Duration::from_secs(3)).await;
-        let d = describe_to_first_video(&h).await;
-        eprintln!("N1 streaming: {d:?}");
+        let (d, live) = describe_to_first_video(&h).await;
+        eprintln!("N1 streaming: first video {d:?}, first live {live:?}");
         assert!(d <= Duration::from_secs(2), "streaming: {d:?}");
     }
     // Asleep: the desc comes from the cache; PLAY wakes the camera
@@ -455,9 +468,13 @@ async fn test_n1_time_to_first_video() {
         ..Default::default()
     })
     .await;
-    let d = describe_to_first_video(&h).await;
-    eprintln!("N1 asleep (wake {wake:?}): {d:?}");
+    let (d, live) = describe_to_first_video(&h).await;
+    eprintln!("N1 asleep (wake {wake:?}): first video {d:?}, first live {live:?}");
     assert!(d <= Duration::from_secs(2) + wake, "asleep: {d:?}");
+    assert!(
+        live <= Duration::from_secs(2) + wake,
+        "asleep, live: {live:?}"
+    );
     assert_eq!(
         h.sources[0].starts.lock().unwrap().as_slice(),
         &[neolink_rtsp::source::StartMode::Demand],
