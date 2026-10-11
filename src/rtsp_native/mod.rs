@@ -17,7 +17,7 @@ use crate::config::{CameraConfig, Config, UserConfig};
 use anyhow::{bail, Context, Result};
 use neolink_core::bc_protocol::StreamKind as BcStreamKind;
 use neolink_rtsp::hub::desc::DescCache;
-use neolink_rtsp::hub::task::{spawn as spawn_hub, HubConfig, HubHandle, ParameterSets};
+use neolink_rtsp::hub::task::{spawn as spawn_hub, HubConfig, HubHandle, LearnGate, ParameterSets};
 use neolink_rtsp::rtsp::auth::{Allowed, Auth, Schemes, User};
 use neolink_rtsp::rtsp::route::{aliases, MountTarget, Routes, StreamKind};
 use neolink_rtsp::rtsp::server::{Provider, Server, ServerConfig};
@@ -32,45 +32,80 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) mod source;
 
-/// What the server asks neolink for
+/// What the server asks neolink for. Each entry carries the generation of the
+/// `camera_main` that made it, so a teardown never removes its successor's entries.
+/// A camera's mounts, tagged with the generation that set them
+type Mounts = (u64, Vec<(String, MountTarget)>);
+/// A camera's `permitted_users`, tagged with the generation that set them
+type Permitted = (u64, Option<Vec<String>>);
+
 #[derive(Default)]
 struct NativeProvider {
-    hubs: RwLock<HashMap<MountTarget, HubHandle>>,
+    hubs: RwLock<HashMap<MountTarget, (u64, HubHandle)>>,
     /// camera → `permitted_users`
-    permitted: RwLock<HashMap<String, Option<Vec<String>>>>,
+    permitted: RwLock<HashMap<String, Permitted>>,
     have_users: AtomicBool,
     /// camera → its mounts; the route table is their union
-    mounts: RwLock<HashMap<String, Vec<(String, MountTarget)>>>,
+    mounts: RwLock<HashMap<String, Mounts>>,
     routes: Routes,
 }
 
 impl Provider for NativeProvider {
     fn hub(&self, target: &MountTarget) -> Option<HubHandle> {
-        self.hubs.read().unwrap().get(target).cloned()
+        self.hubs
+            .read()
+            .unwrap()
+            .get(target)
+            .map(|(_, h)| h.clone())
     }
 
     fn allowed(&self, camera: &str) -> Allowed {
         let permitted = self.permitted.read().unwrap();
-        let list = permitted.get(camera).cloned().flatten();
+        let list = permitted.get(camera).and_then(|(_, l)| l.clone());
         Allowed::from_config(list.as_deref(), self.have_users.load(Ordering::SeqCst))
     }
 }
 
 impl NativeProvider {
-    fn set_mounts(&self, camera: &str, mounts: Vec<(String, MountTarget)>) {
+    fn set_mounts(&self, camera: &str, gen: u64, mounts: Vec<(String, MountTarget)>) {
         let mut all = self.mounts.write().unwrap();
         if mounts.is_empty() {
-            all.remove(camera);
+            if all.get(camera).is_some_and(|(g, _)| *g == gen) {
+                all.remove(camera);
+            }
         } else {
-            all.insert(camera.to_string(), mounts);
+            all.insert(camera.to_string(), (gen, mounts));
         }
         self.routes.set(
             all.values()
-                .flat_map(|m| m.iter().cloned())
+                .flat_map(|(_, m)| m.iter().cloned())
                 .collect::<Vec<_>>(),
         );
     }
+
+    fn set_permitted(&self, camera: &str, gen: u64, list: Option<Vec<String>>) {
+        self.permitted
+            .write()
+            .unwrap()
+            .insert(camera.to_string(), (gen, list));
+    }
+
+    fn remove_permitted(&self, camera: &str, gen: u64) {
+        let mut p = self.permitted.write().unwrap();
+        if p.get(camera).is_some_and(|(g, _)| *g == gen) {
+            p.remove(camera);
+        }
+    }
+
+    fn remove_hub(&self, target: &MountTarget, gen: u64) {
+        let mut h = self.hubs.write().unwrap();
+        if h.get(target).is_some_and(|(g, _)| *g == gen) {
+            h.remove(target);
+        }
+    }
 }
+
+static NEXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn kind_of(k: BcStreamKind) -> StreamKind {
     match k {
@@ -197,13 +232,75 @@ pub(crate) fn hub_config(c: &CameraConfig, kind: StreamKind, rtp_mtu: u16) -> Hu
         _ => ParameterSets::Strip,
     };
     h.cache = Some(DescCache::new(&state_dir(), &c.name, kind.name()));
+    // The camera connection's own idle_grace_s already covers a quick reconnect: a long
+    // linger here would only add to the awake time (SPEC P17)
+    h.linger = Duration::from_millis(500);
     h
 }
 
+/// The camera's learning-start gate, shared by its streams and kept in the state dir
+/// (SPEC P18)
+fn learn_gate(c: &CameraConfig) -> Arc<LearnGate> {
+    let safe: String = c
+        .name
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    Arc::new(LearnGate::standard(Some(
+        state_dir().join(format!("learn-{safe}.txt")),
+    )))
+}
+
+/// Servers still tearing down, for [`shutdown`] to await
+static STOPPING: std::sync::Mutex<Vec<(u64, tokio::task::JoinHandle<Result<()>>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Runs the native backend. The work happens in a task of its own: dropping this future
+/// (a signal in `main`) cancels it, and [`shutdown`] waits for its orderly end.
 pub(crate) async fn main(reactor: NeoReactor) -> Result<()> {
-    let mut config_rx = reactor.config().await?;
-    let config = config_rx.borrow_and_update().clone();
+    let config = reactor.config().await?.borrow().clone();
     check_unsupported(&config)?;
+    crate::config::set_native_rtsp_active(true);
+    let cancel = CancellationToken::new();
+    let _guard = cancel.clone().drop_guard();
+    let id = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            let r = run(reactor, cancel).await;
+            let ok = r.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+            let _ = done_tx.send(ok);
+            r
+        }
+    });
+    STOPPING.lock().unwrap().push((id, handle));
+    let r = done_rx.await;
+    STOPPING.lock().unwrap().retain(|(i, _)| *i != id);
+    match r {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+        Err(_) => Err(anyhow::anyhow!("the RTSP server task ended abnormally")),
+    }
+}
+
+/// R27: wait (≤ 3 s) for the native servers to end in order after their `main` was
+/// dropped: Hubs shut down (sessions get BYE, camera streams stop), connections drain.
+/// Call before the reactor's shutdown.
+pub(crate) async fn shutdown() {
+    let handles: Vec<_> = std::mem::take(&mut *STOPPING.lock().unwrap());
+    for (_, h) in handles {
+        if tokio::time::timeout(Duration::from_secs(3), h)
+            .await
+            .is_err()
+        {
+            log::warn!("RTSP server (native) did not stop within 3 s");
+        }
+    }
+}
+
+async fn run(reactor: NeoReactor, cancel: CancellationToken) -> Result<()> {
+    let config = reactor.config().await?.borrow().clone();
     let provider = Arc::new(NativeProvider::default());
     provider
         .have_users
@@ -214,15 +311,18 @@ pub(crate) async fn main(reactor: NeoReactor) -> Result<()> {
         auth(&config),
         provider.clone(),
     );
-    let cancel = CancellationToken::new();
-    // Dropping this future (shutdown) ends the server: sessions get BYE
-    let _guard = cancel.clone().drop_guard();
     let mut set: JoinSet<Result<()>> = JoinSet::new();
 
-    // Cached snapshots for sleeping cameras (SPEC P5)
+    // Cached snapshots for sleeping cameras (SPEC P5). Not fatal: its port may be taken
+    // (8555 is also go2rtc's WebRTC default)
     {
         let (reactor, cancel) = (reactor.clone(), cancel.clone());
-        set.spawn(async move { crate::snapshot::serve(reactor, cancel).await });
+        set.spawn(async move {
+            if let Err(e) = crate::snapshot::serve(reactor, cancel).await {
+                log::error!("Snapshot endpoint stopped: {e:?}");
+            }
+            Ok(())
+        });
     }
 
     // Users and auth schemes
@@ -238,10 +338,6 @@ pub(crate) async fn main(reactor: NeoReactor) -> Result<()> {
                     r = rx.changed() => r.context("config watch")?,
                 }
                 let config = rx.borrow_and_update().clone();
-                if let Err(e) = check_unsupported(&config) {
-                    log::error!("Config reload rejected: {e}");
-                    continue;
-                }
                 if key(&config) != current {
                     current = key(&config);
                     provider
@@ -254,54 +350,62 @@ pub(crate) async fn main(reactor: NeoReactor) -> Result<()> {
         });
     }
 
-    // Cameras added and removed
+    // Cameras added and removed; a camera whose task ended is started again
     {
         let (provider, cancel, reactor) = (provider.clone(), cancel.clone(), reactor.clone());
         let mut rx = reactor.config().await?;
         set.spawn(async move {
             let mut running: HashMap<String, CancellationToken> = HashMap::new();
-            let mut tasks: JoinSet<()> = JoinSet::new();
+            let mut tasks: JoinSet<String> = JoinSet::new();
             loop {
                 let config = rx.borrow_and_update().clone();
-                if check_unsupported(&config).is_ok() {
-                    let wanted: HashSet<String> = config
-                        .cameras
-                        .iter()
-                        .filter(|c| c.enabled)
-                        .map(|c| c.name.clone())
-                        .collect();
-                    running.retain(|name, token| {
-                        let keep = wanted.contains(name);
-                        if !keep {
-                            log::info!("{name}: RTSP stopping (removed from the config)");
-                            token.cancel();
-                        }
-                        keep
-                    });
-                    for name in wanted {
-                        if running.contains_key(&name) {
-                            continue;
-                        }
-                        log::info!("{name}: RTSP starting");
-                        let token = cancel.child_token();
-                        running.insert(name.clone(), token.clone());
-                        let (provider, reactor) = (provider.clone(), reactor.clone());
-                        let rtp_mtu = config.rtp_mtu;
-                        tasks.spawn(async move {
-                            if let Err(e) =
-                                camera_main(&name, reactor, provider, token, rtp_mtu).await
-                            {
-                                log::error!("{name}: RTSP stopped: {e:#}");
-                            }
-                        });
+                let wanted: HashSet<String> = config
+                    .cameras
+                    .iter()
+                    .filter(|c| c.enabled)
+                    .map(|c| c.name.clone())
+                    .collect();
+                running.retain(|name, token| {
+                    let keep = wanted.contains(name);
+                    if !keep {
+                        log::info!("{name}: RTSP stopping (removed from the config)");
+                        token.cancel();
                     }
+                    keep
+                });
+                for name in wanted {
+                    if running.contains_key(&name) {
+                        continue;
+                    }
+                    log::info!("{name}: RTSP starting");
+                    let token = cancel.child_token();
+                    running.insert(name.clone(), token.clone());
+                    let (provider, reactor) = (provider.clone(), reactor.clone());
+                    tasks.spawn(async move {
+                        let ended = camera_main(&name, reactor, provider, token.clone()).await;
+                        if let Err(e) = ended {
+                            log::error!("{name}: RTSP stopped: {e:#}; restarting in 5 s");
+                            tokio::select! {
+                                _ = token.cancelled() => {}
+                                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                            }
+                        }
+                        name
+                    });
                 }
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     r = rx.changed() => r.context("config watch")?,
-                    Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                    Some(ended) = tasks.join_next(), if !tasks.is_empty() => {
+                        // Ended on its own (error, or its instance went away): forget it,
+                        // so the loop starts it again if it is still configured
+                        if let Ok(name) = ended {
+                            running.remove(&name);
+                        }
+                    }
                 }
             }
+            // Shutdown: every camera tears down (Hubs shut down, sessions get BYE)
             for t in running.values() {
                 t.cancel();
             }
@@ -323,20 +427,23 @@ pub(crate) async fn main(reactor: NeoReactor) -> Result<()> {
         });
     }
 
+    let mut result = Ok(());
     while let Some(r) = set.join_next().await {
-        match r {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                cancel.cancel();
-                return Err(e);
-            }
-            Err(e) => {
-                cancel.cancel();
-                return Err(e.into());
-            }
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = r {
+            cancel.cancel();
+            result = Err(e);
         }
     }
-    Ok(())
+    // Every task has ended; let the connections send their BYE and close (≤ 1 s)
+    let t = tokio::time::Instant::now();
+    while server.connection_count() > 0 && t.elapsed() < Duration::from_secs(1) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    result
 }
 
 /// One camera: its Hubs, mounts and permitted users, until removed or cancelled
@@ -345,24 +452,24 @@ async fn camera_main(
     reactor: NeoReactor,
     provider: Arc<NativeProvider>,
     cancel: CancellationToken,
-    rtp_mtu: u16,
 ) -> Result<()> {
+    let gen = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
     let instance = reactor.get(name).await?;
     let mut config_rx = instance.config().await?;
+    let global = reactor.config().await?;
     let supported = supported_streams(instance.clone(), cancel.clone()).await?;
     let result = async {
         loop {
             let config = config_rx.borrow_and_update().clone();
             let shape = HubShape::of(&config);
-            provider
-                .permitted
-                .write()
-                .unwrap()
-                .insert(name.to_string(), config.permitted_users.clone());
+            provider.set_permitted(name, gen, config.permitted_users.clone());
             let (availability_tx, availability_rx) = watch::channel(Availability {
                 supported: Some(true),
                 battery: Some(config.sleeps()),
             });
+            // rtp_mtu applies when a camera's Hubs are (re)created
+            let rtp_mtu = global.borrow().rtp_mtu;
+            let gate = learn_gate(&config);
             let mut hubs: Vec<(StreamKind, HubHandle)> = vec![];
             for kind in shape.kinds.iter().copied() {
                 let source = Arc::new(source::NativeSource::new(
@@ -373,7 +480,9 @@ async fn camera_main(
                     availability_rx.clone(),
                 ));
                 let k = kind_of(kind);
-                hubs.push((k, spawn_hub(hub_config(&config, k, rtp_mtu), source)));
+                let mut hc = hub_config(&config, k, rtp_mtu);
+                hc.learn_gate = Some(gate.clone());
+                hubs.push((k, spawn_hub(hc, source)));
             }
             {
                 let mut all = provider.hubs.write().unwrap();
@@ -383,10 +492,42 @@ async fn camera_main(
                             camera: name.to_string(),
                             kind: *k,
                         },
-                        h.clone(),
+                        (gen, h.clone()),
                     );
                 }
             }
+            // SPEC P18: one wake teaches every stream kind. Whenever the camera connects,
+            // each Hub without a desc learns it now, while that is free (a Hub that has
+            // one answers at once without starting anything)
+            let teach = {
+                let mut cam = instance.camera();
+                let have = supported.clone();
+                let hubs: Vec<(StreamKind, HubHandle)> = hubs.clone();
+                let cancel = cancel.child_token();
+                let stop = cancel.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if cam.borrow_and_update().upgrade().is_some() {
+                            // Only the kinds the camera has (no extern on an Argus)
+                            let have = have.borrow().clone();
+                            for (k, h) in &hubs {
+                                if !have.iter().any(|b| kind_of(*b) == *k) {
+                                    continue;
+                                }
+                                let h = h.clone();
+                                tokio::spawn(async move {
+                                    let _ = h.describe().await;
+                                });
+                            }
+                        }
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            r = cam.changed() => if r.is_err() { break },
+                        }
+                    }
+                });
+                stop
+            };
             let mut supported = supported.clone();
             let shape_changed = loop {
                 // Mounts for the configured kinds the camera has (SPEC P16 seeds them)
@@ -397,7 +538,7 @@ async fn camera_main(
                     .filter(|k| have.contains(k))
                     .map(|k| kind_of(*k))
                     .collect();
-                provider.set_mounts(name, aliases(name, &kinds));
+                provider.set_mounts(name, gen, aliases(name, &kinds));
                 let _ = availability_tx.send_replace(Availability {
                     supported: Some(true),
                     battery: Some(config.sleeps()),
@@ -410,11 +551,7 @@ async fn camera_main(
                             break false;
                         }
                         let new = config_rx.borrow().clone();
-                        provider
-                            .permitted
-                            .write()
-                            .unwrap()
-                            .insert(name.to_string(), new.permitted_users.clone());
+                        provider.set_permitted(name, gen, new.permitted_users.clone());
                         if HubShape::of(&new) != shape {
                             break true;
                         }
@@ -422,15 +559,16 @@ async fn camera_main(
                 }
             };
             // Tear this generation down: mounts first, then the Hubs (BYE to sessions)
-            provider.set_mounts(name, vec![]);
-            {
-                let mut all = provider.hubs.write().unwrap();
-                for (k, _) in &hubs {
-                    all.remove(&MountTarget {
+            teach.cancel();
+            provider.set_mounts(name, gen, vec![]);
+            for (k, _) in &hubs {
+                provider.remove_hub(
+                    &MountTarget {
                         camera: name.to_string(),
                         kind: *k,
-                    });
-                }
+                    },
+                    gen,
+                );
             }
             for (_, h) in &hubs {
                 h.shutdown().await;
@@ -443,7 +581,7 @@ async fn camera_main(
         Result::<()>::Ok(())
     }
     .await;
-    provider.permitted.write().unwrap().remove(name);
+    provider.remove_permitted(name, gen);
     result
 }
 

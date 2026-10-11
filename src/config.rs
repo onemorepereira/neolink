@@ -910,6 +910,32 @@ const PAUSE_KEYS: &[&str] = &[
     "mode",
 ];
 
+static NATIVE_RTSP_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The native RTSP backend is serving: reloads it can't apply are refused (SPEC R7)
+#[cfg_attr(not(feature = "native-rtsp"), allow(dead_code))]
+pub(crate) fn set_native_rtsp_active(active: bool) {
+    NATIVE_RTSP_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Why a reloaded config must not be applied at all, if it mustn't. The whole config is
+/// refused, so the previous one stays everywhere (cameras included).
+pub(crate) fn reload_rejection(config: &Config) -> Option<String> {
+    if !NATIVE_RTSP_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    if config.certificate.is_some() {
+        return Some(
+            "RTSPS is not yet supported by the native backend: `certificate` is not allowed".into(),
+        );
+    }
+    if config.tls_client_auth != "none" {
+        return Some("tls_client_auth is not supported by the native backend".into());
+    }
+    None
+}
+
 /// Keys in a config text that neolink does not know, as dotted paths
 pub(crate) fn unknown_keys(text: &str) -> Vec<String> {
     let Ok(toml::Value::Table(root)) = text.parse::<toml::Value>() else {

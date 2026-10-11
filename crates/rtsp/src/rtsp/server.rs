@@ -118,6 +118,11 @@ impl Server {
         })
     }
 
+    /// Connections open now
+    pub fn connection_count(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
     /// The current users and schemes
     pub fn auth(&self) -> Arc<Auth> {
         self.auth.read().unwrap().clone()

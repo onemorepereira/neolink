@@ -334,6 +334,7 @@ async fn test_stalled_stream_cancel_releases_permit() {
 }
 
 /// PLAN 1.3: the pause.on_motion watchers stop with the stream
+#[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
 #[tokio::test]
 async fn test_on_motion_stream_drop_stops_tasks() {
     let cam = FakeCamera::start(FakeCameraConfig::default())

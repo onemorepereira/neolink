@@ -58,6 +58,61 @@ pub struct HubConfig {
     pub parameter_sets: ParameterSets,
     /// Keep the last IRAP in the cache, to show while the camera wakes
     pub persist_irap: bool,
+    /// Shared by a camera's Hubs and persisted (SPEC P18); `None`: per Hub, in memory
+    pub learn_gate: Option<Arc<LearnGate>>,
+}
+
+/// At most one learning start per camera per interval, across its streams and restarts
+/// (SPEC R11, P18). The time of the last one is kept in a file when given one.
+#[derive(Debug)]
+pub struct LearnGate {
+    interval: Duration,
+    path: Option<std::path::PathBuf>,
+    last: std::sync::Mutex<Option<std::time::SystemTime>>,
+}
+
+impl LearnGate {
+    pub fn new(interval: Duration, path: Option<std::path::PathBuf>) -> Self {
+        let last = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .map(|s| std::time::UNIX_EPOCH + Duration::from_secs(s));
+        Self {
+            interval,
+            path,
+            last: std::sync::Mutex::new(last),
+        }
+    }
+
+    /// The SPEC's 10 minutes
+    pub fn standard(path: Option<std::path::PathBuf>) -> Self {
+        Self::new(LEARN_INTERVAL, path)
+    }
+
+    /// True (and taken) if no learning start ran within the interval
+    pub fn try_take(&self) -> bool {
+        let now = std::time::SystemTime::now();
+        let mut last = self.last.lock().unwrap();
+        // A clock that went back counts as recent
+        if last.is_some_and(|t| now.duration_since(t).map_or(true, |d| d < self.interval)) {
+            return false;
+        }
+        *last = Some(now);
+        if let Some(p) = &self.path {
+            let secs = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(p, secs.to_string()) {
+                log::warn!("could not persist the learning-start time: {e}");
+            }
+        }
+        true
+    }
 }
 
 /// In-band parameter sets (SPEC R10, DESIGN §5.1). The SDP always carries them.
@@ -90,6 +145,7 @@ impl HubConfig {
             describe_wait: Duration::from_secs(2),
             parameter_sets: ParameterSets::default(),
             persist_irap: true,
+            learn_gate: None,
         }
     }
 }
@@ -673,11 +729,17 @@ impl Hub {
         );
     }
 
+    /// Whether a learning start may run now; with a shared gate this takes it
     fn learning_allowed(&self) -> bool {
-        !self.cfg.battery
-            || self
+        if !self.cfg.battery || self.source.wake_is_free() {
+            return true;
+        }
+        match &self.cfg.learn_gate {
+            Some(g) => g.try_take(),
+            None => self
                 .last_learn
-                .is_none_or(|t| t.elapsed() >= LEARN_INTERVAL)
+                .is_none_or(|t| t.elapsed() >= LEARN_INTERVAL),
+        }
     }
 
     /// Start the source without blocking the Hub; the result arrives in `started`
@@ -1838,6 +1900,30 @@ mod tests {
             step < 3_000_000,
             "first frame then live: {step} µs on the wire"
         );
+    }
+
+    /// P18: one learning start per camera across its streams and restarts
+    #[test]
+    fn test_learn_gate_shared_and_persisted() {
+        let path = std::env::temp_dir().join(format!(
+            "neolink-learn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let g = Arc::new(LearnGate::standard(Some(path.clone())));
+        assert!(g.try_take(), "the first");
+        assert!(!g.try_take(), "the second, e.g. the sub stream's");
+        // A restart reads the time back
+        let again = LearnGate::standard(Some(path.clone()));
+        assert!(!again.try_take());
+        // ... and after the interval it is allowed
+        let short = LearnGate::new(Duration::from_millis(1), Some(path.clone()));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(short.try_take());
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A spinning Hub never lets paused time advance, so these tests would hang: fail

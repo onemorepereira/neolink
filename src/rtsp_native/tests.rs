@@ -237,7 +237,14 @@ async fn test_native_describe_play_release() {
     assert!(c.collect(Duration::from_secs(3)).await);
     assert!(c.video() > 30, "{} video packets", c.video());
     assert!(c.packets.get(&2).copied().unwrap_or(0) > 10, "audio");
-    assert_eq!(cam.stats().video_starts, 1, "one wake for DESCRIBE + PLAY");
+    // One wake (login) for DESCRIBE + PLAY; while awake the sub stream learns its desc
+    // too (P18: one wake teaches every stream kind)
+    let st = cam.stats();
+    assert_eq!(st.logins, 1, "one wake for DESCRIBE + PLAY");
+    assert_eq!(
+        st.video_starts, 2,
+        "main, and sub learning in the same wake"
+    );
     let t = c.request("TEARDOWN", &url, &[]).await;
     assert_eq!(t.status, 200);
     // Hub linger (4 s), then the camera's idle grace (1 s): stop, logout, closed
@@ -277,7 +284,8 @@ async fn test_native_a21_probes_on_cached_mount() {
     let before = cam.stats();
     let port = free_port();
     let r = run(config(&cam, port, "native-a21", "", "", "")).await;
-    for _ in 0..12 {
+    // Longer than the 15 s stream-info poll, which must not wake it either
+    for _ in 0..22 {
         let mut c = Client::connect(r.port).await;
         let d = c
             .request(
@@ -287,7 +295,7 @@ async fn test_native_a21_probes_on_cached_mount() {
             )
             .await;
         assert_eq!(d.status, 200, "{}", d.head);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
     }
     let after = cam.stats();
     assert_eq!(
@@ -311,18 +319,18 @@ async fn test_native_a12_pause_on_motion() {
         port,
         "native-a12",
         "",
-        // bridge_max_s at its minimum: the 12 s idle below outlasts it, so the motion pause
+        // bridge_max_s at its minimum: the 60 s idle below outlasts it, so the motion pause
         // must not be capped by it (A12's 10 min variant, scaled)
-        "idle_disconnect = false\nbridge_max_s = 10\n[cameras.pause]\non_motion = true",
+        "stream = \"main\"\nidle_disconnect = false\nbridge_max_s = 10\n[cameras.pause]\non_motion = true",
         "",
     ))
     .await;
     let url = format!("rtsp://127.0.0.1:{port}/native-a12/main");
     let mut c = Client::connect(r.port).await;
     c.play(&url, &[]).await;
-    // The DESCRIBE learning start ends; no motion: no further camera stream
+    // The DESCRIBE learning start ends; no motion: no further camera stream for 60 s
     assert!(
-        c.collect(Duration::from_secs(12)).await,
+        c.collect(Duration::from_secs(60)).await,
         "session kept while idle"
     );
     let starts = cam.stats().video_starts;
@@ -378,10 +386,12 @@ async fn test_native_hot_reload() {
         200
     );
 
-    // certificate: rejected, still serving
+    // certificate: the whole reload is refused, so nothing in it applies, here a
+    // permitted_users that would lock alice out
     let mut with_cert = with_users.clone();
     with_cert.certificate = Some("/nonexistent.pem".into());
-    let _ = r.reactor.update_config(with_cert).await;
+    with_cert.cameras[0].permitted_users = Some(vec!["bob".into()]);
+    assert!(r.reactor.update_config(with_cert).await.is_err());
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut c = Client::connect(r.port).await;
     assert_eq!(
@@ -406,6 +416,27 @@ async fn test_native_hot_reload() {
             .status,
         404
     );
+    // ... and re-added under the same name: served again, with its permitted users
+    let mut back = with_users.clone();
+    back.cameras[0].permitted_users = Some(vec!["alice".into()]);
+    r.reactor.update_config(back).await.unwrap();
+    let t = tokio::time::Instant::now();
+    loop {
+        let mut c = Client::connect(r.port).await;
+        let st = c
+            .request("DESCRIBE", &url, &[("Authorization", &basic)])
+            .await
+            .status;
+        if st == 200 {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "re-added camera: {}",
+            st
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// A8 (neolink part): connect/teardown cycles return the camera use count and the task
@@ -497,4 +528,54 @@ async fn test_native_main_and_sub_together() {
         s.video()
     );
     assert_eq!(cam.stats().video_starts, 2, "one camera stream per kind");
+    assert_eq!(cam.stats().logins, 1, "one wake");
+}
+
+/// A taken snapshot port (8555 is go2rtc's WebRTC default) is not fatal
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_snapshot_port_taken() {
+    let cam = fake().await;
+    let port = free_port();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let snap = taken.local_addr().unwrap().port();
+    let mut cfg = config(&cam, port, "native-snap", "", "", "");
+    cfg.snapshot_port = Some(snap);
+    let r = run(cfg).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut c = Client::connect(r.port).await;
+    let url = format!("rtsp://127.0.0.1:{}/native-snap/main", port);
+    assert_eq!(c.request("OPTIONS", &url, &[]).await.status, 200);
+    assert!(!r.task.is_finished(), "the RTSP server must keep running");
+    drop(taken);
+}
+
+/// R27: on shutdown a playing client gets BYE and the camera stream stops, before the
+/// reactor logs out
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_shutdown_sends_bye() {
+    let cam = fake().await;
+    let port = free_port();
+    let r = run(config(&cam, port, "native-bye", "", "", "")).await;
+    let url = format!("rtsp://127.0.0.1:{}/native-bye/main", port);
+    let mut c = Client::connect(r.port).await;
+    c.play(&url, &[]).await;
+    assert!(c.collect(Duration::from_secs(2)).await);
+    // What main.rs does on SIGTERM: drop the server future, then wait for it to end
+    r.task.abort();
+    shutdown().await;
+    let mut all = c.buf.clone();
+    let mut chunk = vec![0u8; 65536];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), c.s.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => all.extend_from_slice(&chunk[..n]),
+            _ => break,
+        }
+    }
+    assert!(
+        all.windows(2).any(|w| w == [0x81, 203]),
+        "no RTCP BYE before the close"
+    );
+    wait_stats(&cam, 5, |s| s.video_stops >= 1).await;
+    r.reactor.shutdown().await;
+    wait_stats(&cam, 5, |s| s.logouts >= 1).await;
 }

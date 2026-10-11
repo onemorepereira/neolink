@@ -62,6 +62,12 @@ pub trait StreamSource: Send + Sync + 'static {
     fn restart_for_demand(&self) -> bool {
         false
     }
+    /// Whether starting now costs no wake (the camera is connected already, e.g. for
+    /// another stream kind): learning starts are then not rate-limited (SPEC P18: one wake
+    /// teaches every stream kind)
+    fn wake_is_free(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------------------

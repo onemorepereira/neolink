@@ -187,6 +187,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
     };
+    // R27: the native RTSP server ends first (BYE, streams stopped), then the cameras
+    #[cfg(feature = "native-rtsp")]
+    rtsp_native::shutdown().await;
     neo_reactor.shutdown().await;
     // Exit now: dropping the runtime would wait for GStreamer's blocking threads
     let code = match result {

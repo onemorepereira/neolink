@@ -93,6 +93,11 @@ impl StreamSource for NativeSource {
     fn restart_for_demand(&self) -> bool {
         self.on_motion
     }
+
+    /// The camera is connected already (awake for another stream or task)
+    fn wake_is_free(&self) -> bool {
+        self.instance.camera().borrow().upgrade().is_some()
+    }
 }
 
 fn codec(v: &VideoType) -> VideoCodec {
@@ -146,6 +151,9 @@ async fn pump(
     adpcm_warned: Arc<AtomicBool>,
     name: String,
 ) {
+    // Only changes from now on count as a lost camera (the watch may still hold the
+    // connection that is being set up)
+    camera.borrow_and_update();
     let mut state = SourceState::Streaming;
     let mut had_media = false;
     if on_motion {
