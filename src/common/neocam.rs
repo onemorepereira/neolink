@@ -449,41 +449,9 @@ async fn wake_reads(
     name: &str,
     reported: &mut bool,
 ) -> AnyResult<()> {
-    use super::state::{unix_now, BatteryReading};
-
-    // The Argus answers 400 to the first battery read after a wake (SPEC §9);
-    // run_passive_task retries 400s
-    let battery = match instance
-        .run_passive_task(|cam| Box::pin(async move { Ok(cam.battery_info().await?) }))
-        .await
-    {
-        Ok(b) => Some(b),
-        Err(e) => {
-            log::debug!("{name}: no battery reading: {e:?}");
-            None
-        }
-    };
-    if let Some(b) = battery {
-        log::info!(
-            "{name}: battery {}% ({} mV, {} mA, {})",
-            b.battery_percent,
-            b.voltage,
-            b.current,
-            b.charge_status
-        );
-        state.update(|s| {
-            s.battery = Some(true);
-            s.last_battery = Some(BatteryReading {
-                percent: b.battery_percent,
-                voltage: b.voltage,
-                current: b.current,
-                temperature: b.temperature,
-                charge_status: b.charge_status.clone(),
-                adapter_status: b.adapter_status.clone(),
-                at: unix_now(),
-            });
-        })?;
-    }
+    // The Argus rejects battery reads (400) for a while after waking (SPEC §9), longer
+    // than run_passive_task's own retries: try first, then again after the other reads
+    let mut battery_done = read_battery(instance, state, name).await;
 
     if uid_tx.borrow().is_none() {
         let uid = instance
@@ -526,5 +494,58 @@ async fn wake_reads(
         Ok(jpeg) => state.save_snapshot(&jpeg)?,
         Err(e) => log::debug!("{name}: no snapshot this wake: {e:?}"),
     }
+
+    for _ in 0..2 {
+        if battery_done {
+            break;
+        }
+        sleep(Duration::from_secs(5)).await;
+        battery_done = read_battery(instance, state, name).await;
+    }
+    if !battery_done {
+        log::info!("{name}: no battery reading this wake");
+    }
     Ok(())
+}
+
+/// One battery read into the state file; false if the camera didn't answer
+async fn read_battery(instance: &NeoInstance, state: &StateFile, name: &str) -> bool {
+    use super::state::{unix_now, BatteryReading};
+    // Bounded, so a wake that ends meanwhile doesn't leave this waiting for the next one
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        instance.run_passive_task(|cam| Box::pin(async move { Ok(cam.battery_info().await?) })),
+    )
+    .await;
+    let b = match result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            log::debug!("{name}: battery read failed: {e:?}");
+            return false;
+        }
+        Err(_) => return false,
+    };
+    log::info!(
+        "{name}: battery {}% ({} mV, {} mA, {})",
+        b.battery_percent,
+        b.voltage,
+        b.current,
+        b.charge_status
+    );
+    let saved = state.update(|s| {
+        s.battery = Some(true);
+        s.last_battery = Some(BatteryReading {
+            percent: b.battery_percent,
+            voltage: b.voltage,
+            current: b.current,
+            temperature: b.temperature,
+            charge_status: b.charge_status.clone(),
+            adapter_status: b.adapter_status.clone(),
+            at: unix_now(),
+        });
+    });
+    if let Err(e) = saved {
+        log::warn!("{name}: could not save the battery reading: {e:?}");
+    }
+    true
 }

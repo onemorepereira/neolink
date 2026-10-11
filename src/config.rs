@@ -17,7 +17,7 @@ static RE_MAXENC_SRC: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^([nN]one|[Aa][Ee][Ss]|[Bb][Cc][Ee][Nn][Cc][Rr][Yy][Pp][Tt])$").unwrap()
 });
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Validate, Clone, PartialEq)]
 pub(crate) struct Config {
     #[validate(nested)]
     pub(crate) cameras: Vec<CameraConfig>,
@@ -55,7 +55,7 @@ pub(crate) struct Config {
     pub(crate) snapshot_port: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
 #[validate(schema(function = "validate_mqtt_server", skip_on_field_errors = true))]
 pub(crate) struct MqttServerConfig {
     #[serde(alias = "server")]
@@ -130,7 +130,7 @@ impl StreamConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Validate, Clone, PartialEq)]
 #[validate(schema(function = "validate_camera_config"))]
 pub(crate) struct CameraConfig {
     pub(crate) name: String,
@@ -265,7 +265,7 @@ const fn default_motion_hold_max_s() -> u64 {
     120
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
+#[derive(Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UserConfig {
     #[validate(custom(function = "validate_username"))]
     #[serde(alias = "username")]
@@ -576,5 +576,52 @@ fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), Validation
             "Either camera address or uid must be given",
         )),
         _ => Ok(()),
+    }
+}
+
+/// Debug output is the serialized form, which skips passwords and credentials
+/// (`skip_serializing`), so configs can be logged at any level (PLAN 1.6)
+macro_rules! redacted_debug {
+    ($($t:ty),*) => {$(
+        impl std::fmt::Debug for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match serde_json::to_string(self) {
+                    Ok(json) => write!(f, "{} {}", stringify!($t), json),
+                    Err(_) => write!(f, "{} {{ .. }}", stringify!($t)),
+                }
+            }
+        }
+    )*};
+}
+redacted_debug!(Config, MqttServerConfig, CameraConfig, UserConfig);
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn test_debug_has_no_secrets() {
+        let config: Config = toml::from_str(
+            r#"
+            [mqtt]
+            broker_addr = "127.0.0.1"
+            port = 1883
+            credentials = ["mqttuser", "mqttsecret"]
+            [[users]]
+            name = "alice"
+            pass = "usersecret"
+            [[cameras]]
+            name = "cam"
+            username = "admin"
+            password = "camsecret"
+            address = "127.0.0.1"
+            "#,
+        )
+        .unwrap();
+        let debug = format!("{:?} {:?} {:#?}", config, config.cameras[0], config.users);
+        for secret in ["mqttsecret", "usersecret", "camsecret"] {
+            assert!(!debug.contains(secret), "{} leaked in {}", secret, debug);
+        }
+        assert!(debug.contains("\"name\":\"cam\""));
     }
 }
