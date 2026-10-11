@@ -175,6 +175,28 @@ pub struct HubStats {
     pub guard_engaged: u64,
     pub pacer_underruns: u64,
     pub max_queued_bytes: usize,
+    /// N2: added latency (release lateness + processing) per frame, µs, log2 buckets:
+    /// bucket i counts latencies in [2^i, 2^(i+1))
+    pub added_latency_hist: [u64; 24],
+}
+
+impl HubStats {
+    /// Upper bound of the bucket holding the p-th percentile, µs
+    pub fn added_latency_pct(&self, p: f64) -> u64 {
+        let total: u64 = self.added_latency_hist.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let want = (total as f64 * p).ceil() as u64;
+        let mut acc = 0;
+        for (i, n) in self.added_latency_hist.iter().enumerate() {
+            acc += n;
+            if acc >= want {
+                return 1u64 << (i + 1);
+            }
+        }
+        1 << 24
+    }
 }
 
 struct Session {
@@ -209,12 +231,53 @@ impl Paced for Item {
     }
 }
 
-/// Start a Hub for `source`
+/// Start a supervised Hub for `source`
+///
+/// A panicking Hub is restarted with backoff (1 s doubling to 60 s); its sessions are
+/// closed. After 5 panics in 10 minutes it stops and every request gets `Gone`
+/// (DESIGN §4.7).
 pub fn spawn(config: HubConfig, source: Arc<dyn StreamSource>) -> HubHandle {
     let (tx, rx) = mpsc::channel(64);
-    let hub = Hub::new(config, source);
-    tokio::spawn(hub.run(rx));
+    tokio::spawn(supervise(config, source, rx));
     HubHandle { tx }
+}
+
+async fn supervise(config: HubConfig, source: Arc<dyn StreamSource>, mut rx: mpsc::Receiver<Cmd>) {
+    use futures::FutureExt;
+    let mut panics: Vec<Instant> = vec![];
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let hub = Hub::new(config.clone(), source.clone());
+        match std::panic::AssertUnwindSafe(hub.run(&mut rx))
+            .catch_unwind()
+            .await
+        {
+            Ok(()) => return,
+            Err(e) => {
+                let what = e
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                let now = Instant::now();
+                panics.retain(|t| now.duration_since(*t) < Duration::from_secs(600));
+                panics.push(now);
+                if panics.len() >= 5 {
+                    log::error!(
+                        "{}: hub panicked 5 times in 10 minutes ({what}); giving up on this stream",
+                        config.name
+                    );
+                    return;
+                }
+                log::error!(
+                    "{}: hub panicked ({what}); restarting in {backoff:?}",
+                    config.name
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
 }
 
 struct Hub {
@@ -309,7 +372,9 @@ impl Hub {
         self.sessions.values().filter(|s| s.playing).count()
     }
 
-    async fn run(mut self, mut cmds: mpsc::Receiver<Cmd>) {
+    async fn run(mut self, cmds: &mut mpsc::Receiver<Cmd>) {
+        let mut stats_tick = tokio::time::interval(Duration::from_secs(60));
+        stats_tick.tick().await;
         loop {
             let wake = self.next_wake();
             tokio::select! {
@@ -326,6 +391,7 @@ impl Hub {
                     }
                 },
                 _ = sleep_opt(wake) => {}
+                _ = stats_tick.tick() => self.log_stats(),
             }
             self.release();
             self.housekeeping().await;
@@ -476,6 +542,25 @@ impl Hub {
                 let _ = reply.send(st);
             }
         }
+    }
+
+    /// The stats line (DESIGN §4.8), logged at debug every 60 s
+    fn log_stats(&self) {
+        log::debug!(
+            "{}: clients={} playing={} source={} frames_out={} resyncs={} budget_drops={} drift_corrections={} guard_engaged={} pacer_underruns={} bridged={}s learning_starts={}",
+            self.cfg.name,
+            self.sessions.len(),
+            self.playing(),
+            self.source_rx.is_some(),
+            self.stats.frames_out,
+            self.stats.resyncs,
+            self.stats.dropped_by_budget,
+            self.clock.drift_corrections,
+            self.wire.stats.guard_engaged,
+            self.pacer.stats.underruns,
+            self.bridge.bridged_us / 1_000_000,
+            self.stats.learning_starts,
+        );
     }
 
     fn learning_allowed(&self) -> bool {
@@ -685,7 +770,11 @@ impl Hub {
 
     fn release(&mut self) {
         let now = self.now_us();
+        let due = self.pacer.next_due();
+        let started = std::time::Instant::now();
+        let mut released = 0u64;
         for item in self.pacer.pop_due(now) {
+            released += 1;
             let Some(codec) = self.codec else { continue };
             let wire = match item.track {
                 Track::Video => {
@@ -717,6 +806,14 @@ impl Hub {
                 self.audio_sent = true;
             }
             self.fan_out(frame);
+        }
+        if released > 0 {
+            // N2: lateness against the due time plus the work done here, per frame
+            let late = due.map_or(0, |d| now.saturating_sub(d));
+            let work = started.elapsed().as_micros() as u64 / released;
+            let us = (late + work).max(1);
+            let bucket = (63 - us.leading_zeros() as usize).min(23);
+            self.stats.added_latency_hist[bucket] += released;
         }
         // Bridge (only with someone watching)
         if self.cfg.use_splash && self.playing() > 0 {
@@ -938,6 +1035,8 @@ mod tests {
         );
         let st = h.stats().await.unwrap();
         assert_eq!(st.guard_engaged, 0, "{st:?}");
+        // N2 (virtual time: only processing counts): p99 well under 50 ms
+        assert!(st.added_latency_pct(0.99) <= 50_000, "{st:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1022,5 +1121,76 @@ mod tests {
             1,
             "one learning start per 10 min"
         );
+    }
+
+    /// A17 (clock part): the u32 wrap and a counter reset give a monotonic wire clock
+    /// with no jump over 1 s between consecutive video frames
+    #[tokio::test(start_paused = true)]
+    async fn test_a17_wrap_and_reset() {
+        // Drain for the fixture's length only: after it ends the bridge takes over
+        for (name, secs) in [("wrap_h265.bcm", 30), ("reset_h264.bcm", 20)] {
+            let (h, _source) = hub(name, false);
+            h.describe().await.unwrap();
+            let mut sub = h.subscribe(1).await.unwrap();
+            h.play(1).await;
+            let frames = drain(&mut sub, secs).await;
+            let video: Vec<u64> = frames
+                .iter()
+                .filter(|f| f.track == Track::Video)
+                .map(|f| f.wire_us)
+                .collect();
+            assert!(video.len() > 200, "{name}: {} video frames", video.len());
+            let (i, max_jump) = video
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .enumerate()
+                .max_by_key(|(_, j)| *j)
+                .unwrap();
+            assert!(
+                max_jump <= 1_000_000,
+                "{name}: wire jump {max_jump} µs after video frame {i} of {}",
+                video.len()
+            );
+        }
+    }
+
+    struct PanicSource(std::sync::atomic::AtomicU32);
+    impl crate::source::StreamSource for PanicSource {
+        fn start(
+            &self,
+            _: StartMode,
+            _: CancellationToken,
+        ) -> futures::future::BoxFuture<'static, crate::source::StartResult> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if n < 2 {
+                    panic!("boom {n}");
+                }
+                Err("no camera".to_string())
+            })
+        }
+        fn availability(&self) -> tokio::sync::watch::Receiver<crate::source::Availability> {
+            tokio::sync::watch::channel(Default::default()).1
+        }
+    }
+
+    /// A Hub that panics is restarted and keeps answering
+    #[tokio::test(start_paused = true)]
+    async fn test_supervisor_restarts_after_panic() {
+        let source = Arc::new(PanicSource(Default::default()));
+        let mut cfg = HubConfig::new("panic");
+        cfg.battery = false;
+        let h = spawn(cfg, source.clone());
+        for _ in 0..3 {
+            let r = h.describe().await;
+            assert!(
+                matches!(r, Err(DescribeError::NotReady) | Err(DescribeError::Gone)),
+                "{r:?}"
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        // After two panics the third start runs normally; the Hub is alive
+        assert!(h.stats().await.is_some());
+        assert!(source.0.load(std::sync::atomic::Ordering::SeqCst) >= 3);
     }
 }
