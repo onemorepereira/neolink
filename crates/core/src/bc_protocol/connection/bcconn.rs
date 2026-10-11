@@ -66,7 +66,11 @@ impl BcConnection {
                     while let Some(bc) = source.next().await {
                         sender.send(PollCommand::Bc(Box::new(bc))).await?;
                     }
-                    Result::Ok(())
+                    // The camera closed the connection. Stop the other tasks, which drops
+                    // every subscriber so pending requests fail now instead of hanging
+                    // until a ping timeout, and make join() return an error
+                    thread_cancel.cancel();
+                    Result::Err(Error::DroppedConnection)
                 } => v
             }
         });

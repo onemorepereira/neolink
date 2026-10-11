@@ -44,6 +44,9 @@ toml = "0.8.2"
 uuid = { version = "1.8.0", features = ["v4"] }
 validator = {version="0.18.1", features = ["derive"] }
 
+[dev-dependencies]
+neolink_core = { path = "crates/core", version = "0.6.3-rc.3", features = ["test-util"] }
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5"
 

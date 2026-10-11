@@ -5,6 +5,8 @@ mod neocam;
 #[cfg(feature = "pushnoti")]
 mod pushnoti;
 mod reactor;
+#[cfg(test)]
+mod tests;
 mod usecounter;
 
 pub(crate) use camthread::*;
