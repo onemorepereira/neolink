@@ -12,9 +12,12 @@ publish = false
 base64 = "0.22.0"
 bytes = "1.6.0"
 futures = "0.3.28"
+hmac = "0.12.1"
 tokio = { version = "1.39", features = ["rt", "macros", "sync", "time"] }
 tokio-util = "0.7.7"
 log = "0.4.17"
+md5 = "0.7.0"
+rand = "0.8.5"
 serde = { version = "1.0.160", features = ["derive"] }
 serde_json = "1.0.96"
 sha2 = "0.10.8"
