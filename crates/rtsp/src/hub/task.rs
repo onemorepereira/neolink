@@ -1395,6 +1395,57 @@ mod tests {
         );
     }
 
+    /// A21: a DESCRIBE every 10 s for 10 min against a cached battery mount starts the
+    /// camera 0 times
+    #[tokio::test(start_paused = true)]
+    async fn test_a21_health_probe_on_cached_mount() {
+        let dir = std::env::temp_dir().join(format!(
+            "neolink-a21-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = || Some(crate::hub::desc::DescCache::new(&dir, "argus", "main"));
+        // Learn once and persist the desc
+        {
+            let source = Arc::new(FixtureSource::new(
+                fixture("plain_h265.bcm"),
+                1.0,
+                Some(true),
+            ));
+            let mut cfg = HubConfig::new("learn");
+            cfg.cache = cache();
+            let h = spawn(cfg, source);
+            h.describe().await.unwrap();
+            // The cache write runs on a blocking thread, outside virtual time
+            for _ in 0..200 {
+                if cache().unwrap().load_desc().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                tokio::task::yield_now().await;
+            }
+            assert!(cache().unwrap().load_desc().is_some(), "desc persisted");
+        }
+        let source = Arc::new(FixtureSource::new(
+            fixture("plain_h265.bcm"),
+            1.0,
+            Some(true),
+        ));
+        let mut cfg = HubConfig::new("probe");
+        cfg.cache = cache();
+        let h = spawn(cfg, source.clone());
+        for _ in 0..60 {
+            let d = h.describe().await.unwrap();
+            assert_eq!(d.video.codec, crate::hub::desc::VideoCodecSer::H265);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+        assert_eq!(source.starts.lock().unwrap().len(), 0, "camera starts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A17 (clock part): the u32 wrap and a counter reset give a monotonic wire clock
     /// with no jump over 1 s between consecutive video frames
     #[tokio::test(start_paused = true)]

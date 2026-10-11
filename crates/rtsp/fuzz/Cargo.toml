@@ -32,3 +32,15 @@ name = "sps"
 path = "fuzz_targets/sps.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "rtsp_msg"
+path = "fuzz_targets/rtsp_msg.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rtsp_headers"
+path = "fuzz_targets/rtsp_headers.rs"
+test = false
+doc = false
