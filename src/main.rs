@@ -75,11 +75,11 @@ async fn main() -> Result<()> {
     let opt = Opt::parse();
 
     let conf_path = opt.config.context("Must supply --config file")?;
-    let config: Config = toml::from_str(
-        &fs::read_to_string(&conf_path)
-            .with_context(|| format!("Failed to read {:?}", conf_path))?,
-    )
-    .with_context(|| format!("Failed to parse the {:?} config file", conf_path))?;
+    let config_text = fs::read_to_string(&conf_path)
+        .with_context(|| format!("Failed to read {:?}", conf_path))?;
+    let config: Config = toml::from_str(&config_text)
+        .with_context(|| format!("Failed to parse the {:?} config file", conf_path))?;
+    config::warn_unknown_keys(&config_text, &conf_path.display().to_string());
 
     config
         .validate()

@@ -202,6 +202,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
             v = async {
                 while let Ok(msg) = thread_instance.recv().await {
                     if msg.topic == "config" {
+                        crate::config::warn_unknown_keys(&msg.message, "MQTT neolink/config");
                         let config: Result<Config> = toml::from_str(&msg.message).with_context(|| {
                             format!("Failed to parse the MQTT {:?} config file", msg.topic)
                         });
