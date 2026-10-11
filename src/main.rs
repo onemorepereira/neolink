@@ -87,68 +87,112 @@ async fn main() -> Result<()> {
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
 
-    match opt.cmd {
-        #[cfg(feature = "gstreamer")]
-        None => {
-            warn!(
-                "Deprecated command line option. Please use: `neolink rtsp --config={:?}`",
-                conf_path
-            );
-            rtsp::main(rtsp::Opt {}, neo_reactor.clone()).await?;
+    // Run the command until it ends or a signal arrives, then stop every camera cleanly so
+    // that it is logged out instead of dropped (PLAN 1.5)
+    let cmd = opt.cmd;
+    let run = async {
+        match cmd {
+            #[cfg(feature = "gstreamer")]
+            None => {
+                warn!(
+                    "Deprecated command line option. Please use: `neolink rtsp --config={:?}`",
+                    conf_path
+                );
+                rtsp::main(rtsp::Opt {}, neo_reactor.clone()).await?;
+            }
+            #[cfg(not(feature = "gstreamer"))]
+            None => {
+                // When gstreamer is disabled the default command is MQTT
+                warn!(
+                    "Deprecated command line option. Please use: `neolink mqtt --config={:?}`",
+                    conf_path
+                );
+                mqtt::main(mqtt::Opt {}, neo_reactor.clone()).await?;
+            }
+            #[cfg(feature = "gstreamer")]
+            Some(Command::Rtsp(opts)) => {
+                rtsp::main(opts, neo_reactor.clone()).await?;
+            }
+            Some(Command::StatusLight(opts)) => {
+                statusled::main(opts, neo_reactor.clone()).await?;
+            }
+            Some(Command::Reboot(opts)) => {
+                reboot::main(opts, neo_reactor.clone()).await?;
+            }
+            Some(Command::Pir(opts)) => {
+                pir::main(opts, neo_reactor.clone()).await?;
+            }
+            Some(Command::Ptz(opts)) => {
+                ptz::main(opts, neo_reactor.clone()).await?;
+            }
+            #[cfg(feature = "gstreamer")]
+            Some(Command::Talk(opts)) => {
+                talk::main(opts, neo_reactor.clone()).await?;
+            }
+            Some(Command::Mqtt(opts)) => {
+                mqtt::main(opts, neo_reactor.clone()).await?;
+            }
+            #[cfg(feature = "gstreamer")]
+            Some(Command::MqttRtsp(opts)) => {
+                tokio::select! {
+                    v = mqtt::main(opts, neo_reactor.clone()) => v,
+                    v = rtsp::main(rtsp::Opt {}, neo_reactor.clone()) => v,
+                }?;
+            }
+            #[cfg(feature = "gstreamer")]
+            Some(Command::Image(opts)) => {
+                image::main(opts, neo_reactor.clone()).await?;
+            }
+            Some(Command::Battery(opts)) => {
+                battery::main(opts, neo_reactor.clone()).await?;
+            }
+            Some(Command::Services(opts)) => {
+                services::main(opts, neo_reactor.clone()).await?;
+            }
+            Some(Command::Users(opts)) => {
+                users::main(opts, neo_reactor.clone()).await?;
+            }
         }
-        #[cfg(not(feature = "gstreamer"))]
-        None => {
-            // When gstreamer is disabled the default command is MQTT
-            warn!(
-                "Deprecated command line option. Please use: `neolink mqtt --config={:?}`",
-                conf_path
-            );
-            mqtt::main(mqtt::Opt {}, neo_reactor.clone()).await?;
+        AnyResult::Ok(())
+    };
+    let result = tokio::select! {
+        v = run => v,
+        sig = shutdown_signal() => {
+            info!("Received {sig}, shutting down");
+            Ok(())
         }
-        #[cfg(feature = "gstreamer")]
-        Some(Command::Rtsp(opts)) => {
-            rtsp::main(opts, neo_reactor.clone()).await?;
+    };
+    neo_reactor.shutdown().await;
+    // Exit now: dropping the runtime would wait for GStreamer's blocking threads
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error!("{e:?}");
+            1
         }
-        Some(Command::StatusLight(opts)) => {
-            statusled::main(opts, neo_reactor.clone()).await?;
-        }
-        Some(Command::Reboot(opts)) => {
-            reboot::main(opts, neo_reactor.clone()).await?;
-        }
-        Some(Command::Pir(opts)) => {
-            pir::main(opts, neo_reactor.clone()).await?;
-        }
-        Some(Command::Ptz(opts)) => {
-            ptz::main(opts, neo_reactor.clone()).await?;
-        }
-        #[cfg(feature = "gstreamer")]
-        Some(Command::Talk(opts)) => {
-            talk::main(opts, neo_reactor.clone()).await?;
-        }
-        Some(Command::Mqtt(opts)) => {
-            mqtt::main(opts, neo_reactor.clone()).await?;
-        }
-        #[cfg(feature = "gstreamer")]
-        Some(Command::MqttRtsp(opts)) => {
-            tokio::select! {
-                v = mqtt::main(opts, neo_reactor.clone()) => v,
-                v = rtsp::main(rtsp::Opt {}, neo_reactor.clone()) => v,
-            }?;
-        }
-        #[cfg(feature = "gstreamer")]
-        Some(Command::Image(opts)) => {
-            image::main(opts, neo_reactor.clone()).await?;
-        }
-        Some(Command::Battery(opts)) => {
-            battery::main(opts, neo_reactor.clone()).await?;
-        }
-        Some(Command::Services(opts)) => {
-            services::main(opts, neo_reactor.clone()).await?;
-        }
-        Some(Command::Users(opts)) => {
-            users::main(opts, neo_reactor.clone()).await?;
+    };
+    std::process::exit(code)
+}
+
+/// SIGTERM (podman/docker stop) or SIGINT (Ctrl-C)
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(mut term), Ok(mut int)) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = int.recv() => "SIGINT",
+            },
+            _ => std::future::pending().await,
         }
     }
-
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
 }

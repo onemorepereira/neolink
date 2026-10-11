@@ -565,6 +565,9 @@ impl Conn {
                         ..Default::default()
                     };
                     self.reply(meta, 200, Some(xml)).await?;
+                    // Like the camera: the JPEG follows after a moment, on a new msg_num
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let data_num = meta.msg_num.wrapping_add(1000);
                     let chunks: Vec<&[u8]> = jpeg.chunks(config.chunk_size.max(1)).collect();
                     for (i, chunk) in chunks.iter().enumerate() {
                         let last = i + 1 == chunks.len();
@@ -572,7 +575,7 @@ impl Conn {
                             BcMeta {
                                 msg_id: MSG_ID_SNAP,
                                 channel_id: 0,
-                                msg_num: meta.msg_num,
+                                msg_num: data_num,
                                 stream_type: 0,
                                 response_code: if last { 201 } else { 200 },
                                 class: 0x0000,

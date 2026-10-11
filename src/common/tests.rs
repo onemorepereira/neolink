@@ -74,6 +74,7 @@ async fn test_reconnects_after_drop() {
     let instance = neocam.subscribe().await.unwrap();
     wait_stats(&cam, 10, |s| s.logins >= 1).await;
     cam.drop_connections();
+    wait_stats(&cam, 5, |s| s.open_connections == 0).await;
     // The next task must be served by a new login
     let battery = tokio::time::timeout(
         Duration::from_secs(20),
@@ -254,4 +255,23 @@ async fn test_wake_fills_state_file() {
     assert_eq!(s.last_battery.as_ref().map(|b| b.percent), Some(80));
     assert_eq!(s.uid.as_deref(), Some("FAKEUID0000000001"));
     assert_eq!(s.supported_streams, ["mainStream", "subStream"]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while state.snapshot().is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "no snapshot: {:?}", state.load());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(state.snapshot().unwrap().0, b"\xff\xd8fake jpeg\xff\xd9");
+}
+
+/// PLAN 1.5: shutting a connected camera down logs it out, quickly
+#[tokio::test]
+async fn test_shutdown_logs_out() {
+    let cam = FakeCamera::start(FakeCameraConfig::default()).await.unwrap();
+    let mut neocam = new_neocam(config_for(&cam, "idle_disconnect = false")).await;
+    wait_stats(&cam, 10, |s| s.logins == 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let t = tokio::time::Instant::now();
+    neocam.shutdown().await;
+    assert!(t.elapsed() < Duration::from_secs(3), "shutdown took {:?}", t.elapsed());
+    wait_stats(&cam, 2, |s| s.logouts == 1 && s.open_connections == 0).await;
 }

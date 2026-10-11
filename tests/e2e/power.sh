@@ -9,7 +9,8 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
-W=$(mktemp -d)
+W=${E2E_WORK:-$(mktemp -d)}
+mkdir -p "$W"
 export NEOLINK_STATE_DIR=$W/state
 FAILS=0
 PIDS=""
@@ -107,10 +108,19 @@ ATTEMPTS=$(stat connections)
 sleep 10
 check "A28 no retries after the deadline" '[ "$(stat connections)" = "$ATTEMPTS" ]'
 
-# --- shutdown
+# --- shutdown while streaming: logs out, exits within 5 s (PLAN 1.5, N9)
+kill -USR2 "$(pgrep -f 'xtask fakecam')"   # reachable again
+sleep 1
+LOGINS=$(stat logins); LOGOUTS=$(stat logouts)
+timeout 60 ffmpeg -v error -nostdin -rtsp_transport tcp -i rtsp://127.0.0.1:18554/fake/main -t 30 -f null - > /dev/null 2>&1 &
+i=0; while [ "$(stat logins)" = "$LOGINS" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+sleep 2
 kill -TERM "$NEOLINK"
-i=0; while kill -0 "$NEOLINK" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
-check "N9 neolink exits within 10 s of SIGTERM" '! kill -0 "$NEOLINK" 2>/dev/null'
+i=0; while kill -0 "$NEOLINK" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+check "N9 neolink exits within 5 s of SIGTERM" '! kill -0 "$NEOLINK" 2>/dev/null'
+sleep 0.5
+check "1.5 SIGTERM logs the camera out" '[ "$(stat logouts)" -gt "$LOGOUTS" ]'
+check "1.14 no Thread panicked from the CLI" '! grep -q "Thread panicked" "$W/battery.err"'
 
 echo "logs in $W"
 [ $FAILS = 0 ] && echo "ALL PASSED" || echo "$FAILS FAILED"

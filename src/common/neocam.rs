@@ -412,6 +412,20 @@ impl NeoCam {
         self.ledger.clone()
     }
 
+    /// Stop every task, logging the camera out if it is connected (PLAN 1.5)
+    pub(crate) async fn shutdown(&mut self) {
+        self.cancel.cancel();
+        let set = &mut self.set;
+        let joined = tokio::time::timeout(Duration::from_secs(5), async {
+            while set.join_next().await.is_some() {}
+        })
+        .await;
+        if joined.is_err() {
+            log::warn!("Camera tasks did not stop within 5 s");
+            self.set.abort_all();
+        }
+    }
+
     /// Only a changed config is pushed, so re-publishing the same config does not
     /// reconnect anything (SPEC P14)
     pub(crate) async fn update_config(&self, config: CameraConfig) -> Result<()> {

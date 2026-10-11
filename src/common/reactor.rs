@@ -25,6 +25,7 @@ use crate::{config::Config, AnyResult, Result};
 #[allow(clippy::large_enum_variant)]
 enum NeoReactorCommand {
     HangUp,
+    Shutdown(OneshotSender<()>),
     Config(OneshotSender<WatchReceiver<Config>>),
     UpdateConfig(Config, OneshotSender<Result<()>>),
     Get(String, OneshotSender<Result<Option<NeoInstance>>>),
@@ -67,6 +68,17 @@ impl NeoReactor {
                             NeoReactorCommand::HangUp =>  {
                                 instances.clear();
                                 cancel2.cancel();
+                                return Result::<(), anyhow::Error>::Ok(());
+                            }
+                            NeoReactorCommand::Shutdown(reply) => {
+                                // Log every camera out before the runtime goes away
+                                let cams = futures::future::join_all(
+                                    instances.values_mut().map(|cam| cam.shutdown()),
+                                );
+                                cams.await;
+                                instances.clear();
+                                cancel2.cancel();
+                                let _ = reply.send(());
                                 return Result::<(), anyhow::Error>::Ok(());
                             }
                             NeoReactorCommand::Config(reply) =>  {
@@ -176,6 +188,19 @@ impl NeoReactor {
             .await?;
 
         Ok(sender_rx.await?)
+    }
+
+    /// Stop every camera cleanly (logout, close), bounded to 6 s
+    pub(crate) async fn shutdown(&self) {
+        let (sender_tx, sender_rx) = oneshot();
+        if self
+            .commander
+            .send(NeoReactorCommand::Shutdown(sender_tx))
+            .await
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(6), sender_rx).await;
+        }
     }
 
     pub(crate) async fn update_config(&self, new_config: Config) -> Result<()> {
