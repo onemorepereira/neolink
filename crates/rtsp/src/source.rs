@@ -139,6 +139,8 @@ pub struct FixtureSource {
     pub start_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// What `restart_for_demand` answers
     pub restart_for_demand: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Added to every camera timestamp (wrapping): e.g. start 5 min before the u32 wrap
+    pub cam_offset: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl FixtureSource {
@@ -159,6 +161,7 @@ impl FixtureSource {
             stalled: Default::default(),
             start_delay_ms: Default::default(),
             restart_for_demand: Default::default(),
+            cam_offset: Default::default(),
         }
     }
 }
@@ -182,6 +185,7 @@ impl StreamSource for FixtureSource {
         }
         let end_at_eof = self.end_at_eof.load(SeqCst);
         let looping = self.looping.load(SeqCst);
+        let cam_offset = self.cam_offset.load(SeqCst);
         let stalled = self.stalled.clone();
         let delay = std::time::Duration::from_millis(self.start_delay_ms.load(SeqCst));
         Box::pin(async move {
@@ -230,7 +234,9 @@ impl StreamSource for FixtureSource {
                         }
                         let mut unit = u.unit.clone();
                         if let SourceUnit::Video { cam_us, .. } = &mut unit {
-                            *cam_us = cam_us.wrapping_add((lap * cam_period) as u32);
+                            *cam_us = cam_us
+                                .wrapping_add((lap * cam_period) as u32)
+                                .wrapping_add(cam_offset);
                         }
                         if lap > 0 && matches!(unit, SourceUnit::Restarted) {
                             continue;
