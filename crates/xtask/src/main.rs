@@ -3,7 +3,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use xtask::{fakecam, golden, mkfixture, rtsp_serve};
+use xtask::{avsync, fakecam, golden, mkfixture, rtsp_serve};
 
 #[derive(Parser)]
 struct Cli {
@@ -17,6 +17,8 @@ enum Cmd {
     Mkfixture(mkfixture::Opts),
     /// Run the scripted fake camera as a process (end-to-end tests)
     Fakecam(fakecam::Opts),
+    /// A/V sync of a recording of the flash/beep fixtures (A16)
+    Avsync(avsync::Opts),
     /// The native RTSP server on fixture sources
     RtspServe(rtsp_serve::Opts),
     /// Golden RTSP transcripts
@@ -68,6 +70,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Mkfixture(opts) => mkfixture::run(opts),
         Cmd::Fakecam(opts) => fakecam::run(opts),
         Cmd::RtspServe(opts) => rtsp_serve::run(opts),
+        Cmd::Avsync(opts) => avsync::run(opts),
         Cmd::Golden(GoldenCmd::Record {
             listen,
             upstream,

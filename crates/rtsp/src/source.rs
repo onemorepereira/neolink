@@ -122,6 +122,8 @@ pub struct FixtureSource {
     pub looping: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// While set, nothing is sent and the replay clock stands still (a stalled camera)
     pub stalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Simulated wake time: each start takes this long, in ms, before media can flow
+    pub start_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FixtureSource {
@@ -140,6 +142,7 @@ impl FixtureSource {
             end_at_eof: Default::default(),
             looping: Default::default(),
             stalled: Default::default(),
+            start_delay_ms: Default::default(),
         }
     }
 }
@@ -164,9 +167,14 @@ impl StreamSource for FixtureSource {
         let end_at_eof = self.end_at_eof.load(SeqCst);
         let looping = self.looping.load(SeqCst);
         let stalled = self.stalled.clone();
+        let delay = std::time::Duration::from_millis(self.start_delay_ms.load(SeqCst));
         Box::pin(async move {
             if fail {
                 return Err("fixture: start failed".to_string());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("fixture: cancelled while waking".into()),
+                _ = tokio::time::sleep(delay) => {}
             }
             let (tx, rx) = mpsc::channel(256);
             running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

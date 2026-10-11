@@ -58,6 +58,10 @@ pub struct Setup {
     pub permitted: Option<Vec<String>>,
     pub cfg: ServerConfig,
     pub hub: fn(&mut HubConfig),
+    /// Persist descs here (`DescCache`)
+    pub state_dir: Option<std::path::PathBuf>,
+    /// Simulated camera wake time
+    pub wake: Duration,
 }
 
 impl Default for Setup {
@@ -70,8 +74,24 @@ impl Default for Setup {
             permitted: None,
             cfg: ServerConfig::default(),
             hub: |_| {},
+            state_dir: None,
+            wake: Duration::ZERO,
         }
     }
+}
+
+/// A fresh directory under the system temp dir
+pub fn temp_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "neolink-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
 }
 
 pub fn alice_bob() -> Vec<User> {
@@ -102,8 +122,16 @@ pub async fn start_with(setup: Setup) -> Harness {
     let mut handles = vec![];
     for (kind, file) in [(StreamKind::Main, setup.main), (StreamKind::Sub, setup.sub)] {
         let source = Arc::new(FixtureSource::new(fixture(file), 1.0, Some(false)));
+        source.start_delay_ms.store(
+            setup.wake.as_millis() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let mut hc = HubConfig::new(kind.name());
         hc.battery = false;
+        hc.cache = setup
+            .state_dir
+            .as_ref()
+            .map(|d| neolink_rtsp::hub::desc::DescCache::new(d, "argus", kind.name()));
         (setup.hub)(&mut hc);
         let h = spawn(hc, source.clone());
         hubs.insert(

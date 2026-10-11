@@ -411,3 +411,57 @@ async fn test_a20_security() {
         .await;
     assert_eq!(r.status, 200);
 }
+
+/// Time from sending DESCRIBE to the first video RTP packet of a fresh client
+async fn describe_to_first_video(h: &Harness) -> Duration {
+    let base = format!("rtsp://{}/argus/main", h.addr);
+    let mut c = Client::connect(h.addr).await;
+    let t = Instant::now();
+    c.play(&base, None).await;
+    while !c.packets.iter().any(|(ch, _)| *ch == 0) {
+        assert!(c.fill().await, "no media");
+        while c.take_packet() {}
+    }
+    let i = c.packets.iter().position(|(ch, _)| *ch == 0).unwrap();
+    c.arrivals[i].duration_since(t)
+}
+
+/// N1: DESCRIBE → first video RTP ≤ 2 s with the camera streaming, and ≤ 2 s plus the
+/// wake time with it asleep (desc from the cache; 3 s simulated wake)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_n1_time_to_first_video() {
+    let dir = temp_dir("n1");
+    // Streaming: another client keeps the camera up
+    {
+        let h = start_with(Setup {
+            state_dir: Some(dir.clone()),
+            ..Default::default()
+        })
+        .await;
+        let mut keeper = Client::connect(h.addr).await;
+        keeper
+            .play(&format!("rtsp://{}/argus/main", h.addr), None)
+            .await;
+        keeper.collect(Duration::from_secs(3)).await;
+        let d = describe_to_first_video(&h).await;
+        eprintln!("N1 streaming: {d:?}");
+        assert!(d <= Duration::from_secs(2), "streaming: {d:?}");
+    }
+    // Asleep: the desc comes from the cache; PLAY wakes the camera
+    let wake = Duration::from_secs(3);
+    let h = start_with(Setup {
+        state_dir: Some(dir.clone()),
+        wake,
+        ..Default::default()
+    })
+    .await;
+    let d = describe_to_first_video(&h).await;
+    eprintln!("N1 asleep (wake {wake:?}): {d:?}");
+    assert!(d <= Duration::from_secs(2) + wake, "asleep: {d:?}");
+    assert_eq!(
+        h.sources[0].starts.lock().unwrap().as_slice(),
+        &[neolink_rtsp::source::StartMode::Demand],
+        "one demand start, no learning start"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
