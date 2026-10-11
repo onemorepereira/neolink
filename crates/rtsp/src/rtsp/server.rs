@@ -10,7 +10,7 @@ use crate::hub::desc::StreamDesc;
 use crate::hub::task::{DescribeError, Frame, HubHandle, Subscription};
 use crate::hub::wire::Track;
 use bytes::{BufMut, Bytes, BytesMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::IoSlice;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -33,6 +33,11 @@ pub trait Provider: Send + Sync + 'static {
 pub struct ServerConfig {
     pub max_connections: usize,
     pub max_unauthenticated_per_ip: usize,
+    /// Below max_connections, so unauthenticated clients can't take every slot
+    pub max_unauthenticated_total: usize,
+    /// With users configured, a connection must authenticate within this, unless playing
+    /// an anonymous mount
+    pub unauthenticated_lifetime: Duration,
     pub first_request_timeout: Duration,
     pub idle_timeout: Duration,
     pub write_stall_timeout: Duration,
@@ -51,6 +56,8 @@ impl Default for ServerConfig {
         Self {
             max_connections: 128,
             max_unauthenticated_per_ip: 64,
+            max_unauthenticated_total: 64,
+            unauthenticated_lifetime: Duration::from_secs(30),
             first_request_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(60),
             write_stall_timeout: Duration::from_secs(10),
@@ -71,8 +78,10 @@ pub struct Server {
     pub auth: Auth,
     pub provider: Arc<dyn Provider>,
     connections: AtomicUsize,
+    /// Keyed by `ip_key`, as is `failed_auth`
     unauth_per_ip: Mutex<HashMap<IpAddr, usize>>,
-    failed_auth: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    unauth_total: AtomicUsize,
+    failed_auth: Mutex<HashMap<IpAddr, FailedAuth>>,
     next_session: AtomicU64,
     /// Fixed at creation: NTP = ntp_epoch + wire time (DESIGN §5.3)
     ntp_epoch_us: u64,
@@ -101,6 +110,7 @@ impl Server {
             provider,
             connections: AtomicUsize::new(0),
             unauth_per_ip: Mutex::new(HashMap::new()),
+            unauth_total: AtomicUsize::new(0),
             failed_auth: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(rand::random::<u32>() as u64),
             ntp_epoch_us: unix_us + NTP_UNIX_OFFSET * 1_000_000,
@@ -128,32 +138,65 @@ impl Server {
 
     fn unauth_inc(&self, ip: IpAddr) -> bool {
         let mut m = self.unauth_per_ip.lock().unwrap();
-        let n = m.entry(ip).or_default();
+        if self.unauth_total.load(Ordering::SeqCst) >= self.config.max_unauthenticated_total {
+            return false;
+        }
+        let n = m.entry(ip_key(ip)).or_default();
         if *n >= self.config.max_unauthenticated_per_ip {
             return false;
         }
         *n += 1;
+        self.unauth_total.fetch_add(1, Ordering::SeqCst);
         true
     }
 
     fn unauth_dec(&self, ip: IpAddr) {
         let mut m = self.unauth_per_ip.lock().unwrap();
-        if let Some(n) = m.get_mut(&ip) {
+        let key = ip_key(ip);
+        if let Some(n) = m.get_mut(&key) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                m.remove(&ip);
+                m.remove(&key);
             }
+            self.unauth_total.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
-    /// Failed-auth limiting: true when this IP should be slowed down
-    fn note_failed_auth(&self, ip: IpAddr) -> bool {
+    /// Failed-auth limiting per IP (per /64 for IPv6), across all its connections: past
+    /// `failed_auth_per_minute`, each failure waits for its own 1 s slot, so parallel
+    /// connections don't multiply the rate. Returns when this failure may be answered.
+    fn note_failed_auth(&self, ip: IpAddr) -> Option<Instant> {
         let mut m = self.failed_auth.lock().unwrap();
-        let v = m.entry(ip).or_default();
         let now = Instant::now();
-        v.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
-        v.push(now);
-        v.len() > self.config.failed_auth_per_minute
+        let minute = Duration::from_secs(60);
+        // Bounded: forget addresses with nothing recent
+        if m.len() > 1024 {
+            m.retain(|_, f| {
+                f.next_slot > now
+                    || f.times
+                        .back()
+                        .is_some_and(|t| now.duration_since(*t) < minute)
+            });
+        }
+        let f = m.entry(ip_key(ip)).or_insert_with(|| FailedAuth {
+            times: VecDeque::new(),
+            next_slot: now,
+        });
+        while f
+            .times
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= minute)
+        {
+            f.times.pop_front();
+        }
+        f.times.push_back(now);
+        if f.times.len() > self.config.failed_auth_per_minute {
+            f.times.pop_front(); // the list never needs more than the threshold
+            let slot = f.next_slot.max(now) + Duration::from_secs(1);
+            f.next_slot = slot;
+            return Some(slot);
+        }
+        None
     }
 
     async fn connection(
@@ -179,14 +222,20 @@ impl Server {
         let (mut read, write) = stream.into_split();
         let (ctl_tx, ctl_rx) = mpsc::channel::<WriterCmd>(64);
         let writer_cancel = cancel.child_token();
-        let writer = tokio::spawn(writer(
-            write,
-            ctl_rx,
-            writer_cancel.clone(),
-            self.config.write_stall_timeout,
-            self.config.rtcp_sr,
-            self.ntp_epoch_us,
-        ));
+        // A writer that ends (stall, error) ends the connection
+        let writer_done = CancellationToken::new();
+        let writer = tokio::spawn({
+            let (done, cancel) = (writer_done.clone(), writer_cancel.clone());
+            let (stall, sr, epoch) = (
+                self.config.write_stall_timeout,
+                self.config.rtcp_sr,
+                self.ntp_epoch_us,
+            );
+            async move {
+                writer(write, ctl_rx, cancel, stall, sr, epoch).await;
+                done.cancel();
+            }
+        });
         let mut conn = Conn {
             server: self.clone(),
             ip,
@@ -217,8 +266,14 @@ impl Server {
             if let Some(t) = partial_since {
                 idle_deadline = idle_deadline.min(t + self.config.first_request_timeout);
             }
+            // With users configured, authenticate within a bound (playing an anonymous
+            // mount is exempt): unauthenticated clients can't hold slots forever
+            if !conn.authenticated && !conn.playing() && self.auth.have_users() {
+                idle_deadline = idle_deadline.min(connected + self.config.unauthenticated_lifetime);
+            }
             let n = tokio::select! {
                 _ = cancel.cancelled() => break,
+                _ = writer_done.cancelled() => break,
                 _ = tokio::time::sleep_until(idle_deadline) => break,
                 _ = conn.session_closed() => break,
                 r = read.read(&mut chunk) => match r {
@@ -231,9 +286,12 @@ impl Server {
             loop {
                 match parse(&mut buf) {
                     Ok(None) => break,
-                    Ok(Some(Parsed::Interleaved { .. })) => {
-                        // Client RTCP (receiver reports): liveness only
-                        last_activity = Instant::now();
+                    Ok(Some(Parsed::Interleaved { channel, .. })) => {
+                        // Client RTCP on one of the session's RTCP channels is liveness;
+                        // anything else is dropped (R23)
+                        if conn.is_rtcp_channel(channel) {
+                            last_activity = Instant::now();
+                        }
                     }
                     Ok(Some(Parsed::Request(req))) => {
                         seen_request = true;
@@ -284,6 +342,26 @@ type Routed = (
     Option<String>,
 );
 
+struct FailedAuth {
+    times: VecDeque<Instant>,
+    next_slot: Instant,
+}
+
+/// The key for per-address limits: IPv4 (also when IPv4-mapped), or the IPv6 /64, which is
+/// what one host or home network usually gets
+fn ip_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+    }
+}
+
 struct SessionState {
     id: String,
     num: u64,
@@ -303,6 +381,9 @@ struct TrackState {
     seq: u16,
     ts_offset: u32,
     clock: u32,
+    /// SR counts: cumulative per SSRC, also across PAUSE/PLAY (RFC 3550 §6.4.1)
+    packets: u32,
+    octets: u32,
 }
 
 struct Conn {
@@ -344,6 +425,12 @@ impl Conn {
         self.session.as_ref().is_some_and(|s| s.playing)
     }
 
+    fn is_rtcp_channel(&self, channel: u8) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.tracks.values().any(|t| t.channels.1 == channel))
+    }
+
     async fn session_closed(&self) {
         match &self.session {
             Some(s) => s.closed.cancelled().await,
@@ -381,13 +468,24 @@ impl Conn {
     /// Authorize a request for a mount; Err is the response to send
     async fn authorize(&mut self, req: &Request, camera: &str) -> Result<Option<String>, Response> {
         let allowed = self.server.provider.allowed(camera);
-        match self
-            .server
-            .auth
-            .check(&allowed, &req.method, req.header("Authorization"), self.ip)
-        {
+        self.authorize_with(req, allowed).await
+    }
+
+    async fn authorize_with(
+        &mut self,
+        req: &Request,
+        allowed: Allowed,
+    ) -> Result<Option<String>, Response> {
+        match self.server.auth.check(
+            &allowed,
+            &req.method,
+            &req.uri,
+            req.header("Authorization"),
+            self.ip,
+        ) {
             Decision::Ok(user) => {
-                if !self.authenticated {
+                // Only real credentials lift the per-IP limit; anonymous access doesn't
+                if user.is_some() && !self.authenticated {
                     self.authenticated = true;
                     self.server.unauth_dec(self.ip);
                 }
@@ -403,8 +501,8 @@ impl Conn {
             }
             Decision::Failed(c) => {
                 log::info!("rtsp: auth failure from {}", self.ip);
-                if self.server.note_failed_auth(self.ip) {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Some(slot) = self.server.note_failed_auth(self.ip) {
+                    tokio::time::sleep_until(slot).await;
                 }
                 let mut r = Response::new(401);
                 for v in c {
@@ -475,6 +573,14 @@ impl Conn {
         }
     }
 
+    /// PLAY and PAUSE on an existing session must name it
+    fn session_required(&self, req: &Request) -> Result<(), Response> {
+        if self.session.is_some() && req.header("Session").is_none() {
+            return Err(Response::new(454));
+        }
+        self.session_header_ok(req)
+    }
+
     /// A Session header, if present, must name this connection's session (R23)
     fn session_header_ok(&self, req: &Request) -> Result<(), Response> {
         match (req.header("Session").map(session_id), &self.session) {
@@ -500,6 +606,11 @@ impl Conn {
     /// The mount, its Hub and the authorized user (None: anonymous)
     async fn route(&mut self, req: &Request) -> Result<Routed, Response> {
         let Some((target, path)) = self.server.routes.lookup(&req.uri) else {
+            // With users configured, an unauthenticated client must not learn which mounts
+            // exist: check the credentials (any user) before answering 404
+            if self.server.auth.have_users() {
+                self.authorize_with(req, Allowed::Everyone).await?;
+            }
             return Err(Response::new(404));
         };
         let user = self.authorize(req, &target.camera).await?;
@@ -542,11 +653,27 @@ impl Conn {
         if self.session.as_ref().is_some_and(|s| s.target != target) {
             return Err(Response::new(459));
         }
-        if self.session.is_none() {
-            let desc = match hub.describe().await {
+        // The writer's tracks are fixed at PLAY
+        if self.playing() {
+            return Err(Response::new(455));
+        }
+        let desc = match &self.session {
+            Some(s) => s.desc.clone(),
+            None => match hub.describe().await {
                 Ok(d) => d,
                 Err(_) => return Err(Response::new(503).header("Retry-After", "10")),
-            };
+            },
+        };
+        // Check the track before creating anything
+        let clock = match track {
+            0 => 90_000,
+            1 => match &desc.audio {
+                Some(a) => a.sample_rate,
+                None => return Err(Response::new(404)),
+            },
+            _ => return Err(Response::new(404)),
+        };
+        if self.session.is_none() {
             let num = self.server.next_session.fetch_add(1, Ordering::Relaxed);
             let id = format!("{:016x}", rand::random::<u64>());
             self.session = Some(SessionState {
@@ -562,14 +689,6 @@ impl Conn {
             });
         }
         let s = self.session.as_mut().unwrap();
-        let clock = match track {
-            0 => 90_000,
-            1 => match &s.desc.audio {
-                Some(a) => a.sample_rate,
-                None => return Err(Response::new(404)),
-            },
-            _ => return Err(Response::new(404)),
-        };
         // Unique channel pairs per connection
         let used: Vec<u8> = s
             .tracks
@@ -588,6 +707,8 @@ impl Conn {
             seq: rand::random(),
             ts_offset: rand::random(),
             clock,
+            packets: 0,
+            octets: 0,
         };
         s.tracks.insert(track, ts);
         Ok(Response::new(200)
@@ -603,7 +724,7 @@ impl Conn {
         req: &Request,
         cseq: Option<&str>,
     ) -> Result<Option<Response>, Response> {
-        self.session_header_ok(req)?;
+        self.session_required(req)?;
         let wait = self.server.config.play_wait;
         let Some(s) = self.session.as_mut() else {
             return Err(Response::new(455));
@@ -611,18 +732,26 @@ impl Conn {
         if s.playing {
             return Ok(Some(Response::new(200).header("Session", s.id.clone())));
         }
-        // The stream changed since this client's DESCRIBE: make it describe again (F-cc 29)
+        if s.tracks.is_empty() {
+            return Err(Response::new(455));
+        }
+        // The stream changed since this session's SETUP (F-cc 29): the session is over; the
+        // client starts again from DESCRIBE
         let mount = super::route::normalise(&req.uri).mount;
-        if self.described.get(&mount).is_some_and(|g| *g != s.desc.gen) {
-            return Err(Response::new(503).header("Retry-After", "0"));
-        }
-        let mut sub = match s.hub.subscribe(s.num).await {
-            Ok(sub) => sub,
-            Err(_) => return Err(Response::new(503).header("Retry-After", "10")),
+        let stale = self.described.get(&mount).is_some_and(|g| *g != s.desc.gen);
+        let sub = if stale {
+            None
+        } else {
+            match s.hub.subscribe(s.num).await {
+                Ok(sub) => Some(sub),
+                Err(_) => return Err(Response::new(503).header("Retry-After", "10")),
+            }
         };
-        if sub.desc.gen != s.desc.gen {
-            return Err(Response::new(503).header("Retry-After", "0"));
-        }
+        let Some(mut sub) = sub.filter(|sub| sub.desc.gen == s.desc.gen) else {
+            self.teardown().await;
+            return Err(Response::new(454));
+        };
+        let s = self.session.as_mut().unwrap();
         s.closed = sub.closed.clone();
         s.hub.play(s.num).await;
         // Hold the reply until the first frame (for RTP-Info) or play_wait
@@ -678,7 +807,7 @@ impl Conn {
         req: &Request,
         cseq: Option<&str>,
     ) -> Result<Option<Response>, Response> {
-        self.session_header_ok(req)?;
+        self.session_required(req)?;
         let Some(s) = self.session.as_mut() else {
             return Err(Response::new(455));
         };
@@ -749,8 +878,6 @@ fn rtp_ts(wire_us: u64, t: TrackState) -> u32 {
 
 struct WriterTrack {
     state: TrackState,
-    packets: u32,
-    octets: u32,
     last_wire: u64,
 }
 
@@ -800,8 +927,6 @@ async fn writer(
                             k,
                             WriterTrack {
                                 state,
-                                packets: 0,
-                                octets: 0,
                                 last_wire: 0,
                             },
                         )
@@ -924,8 +1049,8 @@ async fn send_frame(
         h[8..12].copy_from_slice(&ts.to_be_bytes());
         h[12..16].copy_from_slice(&t.state.ssrc.to_be_bytes());
         t.state.seq = t.state.seq.wrapping_add(1);
-        t.packets = t.packets.wrapping_add(1);
-        t.octets = t.octets.wrapping_add(c.len() as u32);
+        t.state.packets = t.state.packets.wrapping_add(1);
+        t.state.octets = t.state.octets.wrapping_add(c.len() as u32);
         heads.push(h);
     }
     // Chunks of packets up to ~64 KiB
@@ -974,7 +1099,7 @@ async fn send_sr(
 ) -> Result<(), ()> {
     let mut out = BytesMut::new();
     // An SR maps a wire time the client has seen media for
-    for t in tracks.values().filter(|t| t.packets > 0) {
+    for t in tracks.values().filter(|t| t.state.packets > 0) {
         let ntp_us = ntp_epoch_us + wire_now;
         let secs = ntp_us / 1_000_000;
         let frac = ((ntp_us % 1_000_000) << 32) / 1_000_000;
@@ -986,8 +1111,8 @@ async fn send_sr(
         p.put_u32(secs as u32);
         p.put_u32(frac as u32);
         p.put_u32(rtp_ts(wire_now, t.state));
-        p.put_u32(t.packets);
-        p.put_u32(t.octets);
+        p.put_u32(t.state.packets);
+        p.put_u32(t.state.octets);
         interleave(&mut out, t.state.channels.1, &p);
     }
     timed(stall, w.write_all(&out)).await
@@ -1039,6 +1164,8 @@ mod tests {
             seq: 0,
             ts_offset: u32::MAX - 100,
             clock: 16000,
+            packets: 0,
+            octets: 0,
         };
         let a = rtp_ts(10_000_000, t);
         let b = rtp_ts(10_064_000, t);

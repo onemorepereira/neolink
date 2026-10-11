@@ -55,7 +55,13 @@ async fn test_a7_staggered_joins_one_start_per_kind() {
                 let mut c = Client::connect(addr).await;
                 let base = format!("rtsp://{addr}/argus/{path}");
                 c.play(&base, None).await;
-                c.collect(Duration::from_secs(2)).await;
+                // Until media flows (bounded), not a fixed window: CI machines are loaded
+                let t = Instant::now();
+                while t.elapsed() < Duration::from_secs(6)
+                    && (c.packets.len() <= 10 || !c.packets.iter().any(|(ch, _)| *ch == 0))
+                {
+                    c.collect(Duration::from_millis(250)).await;
+                }
                 let h265 = path == "main";
                 (i, path, first_video_is_irap(&c, h265), c.packets.len())
             }));
@@ -143,6 +149,9 @@ async fn test_a9_stuck_client() {
         cfg: ServerConfig {
             write_stall_timeout: Duration::from_secs(3),
             send_buffer: Some(16 * 1024),
+            // The stuck and the healthy client: a third gets in only once the stuck
+            // connection is really gone
+            max_connections: 2,
             ..Default::default()
         },
         hub: |c| c.latency_us = 500_000,
@@ -184,10 +193,28 @@ async fn test_a9_stuck_client() {
         "inter-frame p99 deviation {:.1} ms",
         p99 * 1000.0
     );
-    // The stuck client was dropped (it never read: its socket sees EOF/reset eventually)
     let st = h.hubs[0].stats().await.unwrap();
     assert_eq!(st.sessions, 1, "the stuck session was dropped: {st:?}");
-    drop(stuck);
+    // ... and its connection closed, not just its session (review #1)
+    assert!(
+        stuck.until_eof(Duration::from_secs(10)).await,
+        "the stuck connection is still open"
+    );
+    let t = Instant::now();
+    loop {
+        let mut third = Client::connect(h.addr).await;
+        third.cseq += 1;
+        let req = format!("OPTIONS {base} RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+        third.s.write_all(req.as_bytes()).await.unwrap();
+        if third.response().await.is_some_and(|r| r.status == 200) {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "the stuck connection still holds its slot"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// A11: a 60 s camera outage mid-stream: the session survives, live media resumes from an
@@ -481,4 +508,169 @@ async fn test_n1_time_to_first_video() {
         "one demand start, no learning start"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review: SETUP checks the track before creating a session; PLAY/PAUSE must name the
+/// session; no SETUP while playing; PLAY needs a track
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_state_rules() {
+    let h = start_with(Setup::default()).await;
+    let base = format!("rtsp://{}/argus/main", h.addr);
+    let mut c = Client::connect(h.addr).await;
+    let tcp = ("Transport", "RTP/AVP/TCP;unicast;interleaved=0-1");
+    let r = c
+        .request("SETUP", &format!("{base}/stream=5"), &[tcp])
+        .await;
+    assert_eq!(r.status, 404);
+    assert!(r.header("Session").is_none());
+    assert_eq!(
+        c.request("PLAY", &base, &[]).await.status,
+        455,
+        "no session"
+    );
+    assert_eq!(h.hubs[0].stats().await.unwrap().playing, 0);
+    let r = c
+        .request("SETUP", &format!("{base}/stream=0"), &[tcp])
+        .await;
+    assert_eq!(r.status, 200);
+    let session = r
+        .header("Session")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        c.request("PLAY", &base, &[]).await.status,
+        454,
+        "PLAY must name it"
+    );
+    let r = c.request("PLAY", &base, &[("Session", &session)]).await;
+    assert_eq!(r.status, 200);
+    let audio = ("Transport", "RTP/AVP/TCP;unicast;interleaved=2-3");
+    let r = c
+        .request(
+            "SETUP",
+            &format!("{base}/stream=1"),
+            &[audio, ("Session", &session)],
+        )
+        .await;
+    assert_eq!(r.status, 455, "SETUP while playing");
+    assert_eq!(
+        c.request("PAUSE", &base, &[]).await.status,
+        454,
+        "PAUSE must name it"
+    );
+}
+
+/// Review #2: the stream changes while the session is paused; the next PLAY ends the
+/// session (454) instead of answering 503 forever, and a fresh session plays
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stream_change_while_paused() {
+    let h = start_with(Setup {
+        main: "reschange_h264.bcm",
+        ..Default::default()
+    })
+    .await;
+    let base = format!("rtsp://{}/argus/main", h.addr);
+    let mut c = Client::connect(h.addr).await;
+    let (session, _) = c.play(&base, None).await;
+    let r = c.request("PAUSE", &base, &[("Session", &session)]).await;
+    assert_eq!(r.status, 200);
+    // Another client keeps the camera up while the resolution changes (mid-fixture)
+    let mut keeper = Client::connect(h.addr).await;
+    keeper.play(&base, None).await;
+    keeper.until_eof(Duration::from_secs(25)).await;
+    let r = c.request("PLAY", &base, &[("Session", &session)]).await;
+    assert_eq!(r.status, 454, "{r:?}");
+    let mut fresh = Client::connect(h.addr).await;
+    fresh.play(&base, None).await;
+    fresh.collect(Duration::from_secs(1)).await;
+    assert!(fresh.packets.iter().any(|(ch, _)| *ch == 0));
+}
+
+/// Security review: unauthenticated connections are bounded in time and junk interleaved
+/// data doesn't keep them alive; failed auths are paced per IP across connections; an
+/// unknown mount doesn't answer 404 before credentials
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_unauthenticated_bounds() {
+    let h = start_with(Setup {
+        users: alice_bob(),
+        cfg: ServerConfig {
+            idle_timeout: Duration::from_secs(1),
+            unauthenticated_lifetime: Duration::from_secs(3),
+            failed_auth_per_minute: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let base = format!("rtsp://{}/argus/main", h.addr);
+    // OPTIONS then `$` frames on a channel nobody set up: closed at the idle timeout
+    let mut c = Client::connect(h.addr).await;
+    assert_eq!(c.request("OPTIONS", &base, &[]).await.status, 200);
+    let t = Instant::now();
+    let mut closed = false;
+    for _ in 0..30 {
+        if c.s.write_all(b"$\x05\x00\x00").await.is_err() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        closed || c.until_eof(Duration::from_millis(100)).await,
+        "junk kept it open"
+    );
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    // OPTIONS every 500 ms (activity), never authenticating: closed at the lifetime
+    let mut c = Client::connect(h.addr).await;
+    let t = Instant::now();
+    let mut open_for = Duration::ZERO;
+    for _ in 0..20 {
+        c.cseq += 1;
+        let req = format!("OPTIONS {base} RTSP/1.0\r\nCSeq: {}\r\n\r\n", c.cseq);
+        if c.s.write_all(req.as_bytes()).await.is_err() || c.response().await.is_none() {
+            break;
+        }
+        open_for = t.elapsed();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        open_for >= Duration::from_secs(2) && open_for < Duration::from_secs(5),
+        "unauthenticated connection open for {open_for:?}"
+    );
+    // Unknown mount: 401 without credentials, 404 with valid ones
+    let mut c = Client::connect(h.addr).await;
+    let nope = format!("rtsp://{}/nope/main", h.addr);
+    assert_eq!(c.request("DESCRIBE", &nope, &[]).await.status, 401);
+    let alice = basic("alice", "alicepw");
+    assert_eq!(
+        c.request("DESCRIBE", &nope, &[("Authorization", &alice)])
+            .await
+            .status,
+        404
+    );
+    // 10 wrong passwords over 10 parallel connections: past the 4 allowed per minute,
+    // each waits for its own 1 s slot
+    let t = Instant::now();
+    let mut tasks = vec![];
+    for _ in 0..10 {
+        let (addr, base) = (h.addr, base.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut c = Client::connect(addr).await;
+            let wrong = basic("alice", "wrong");
+            c.request("DESCRIBE", &base, &[("Authorization", &wrong)])
+                .await
+                .status
+        }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), 401);
+    }
+    assert!(
+        t.elapsed() >= Duration::from_secs(6),
+        "10 failures in {:?}: not paced per IP",
+        t.elapsed()
+    );
 }

@@ -46,10 +46,15 @@ pub fn choose_transport(header: &str) -> Result<TcpTransport, TransportError> {
                     }
                 }
                 "interleaved" => {
+                    // An RTP/RTCP pair: n, n+1 with n even (R23: no duplicates)
                     let mut ch = v.split('-').map(|c| c.trim().parse::<u8>());
-                    interleaved = match (ch.next(), ch.next()) {
-                        (Some(Ok(a)), Some(Ok(b))) => Some((a, b)),
-                        (Some(Ok(a)), None) => Some((a, a.saturating_add(1))),
+                    interleaved = match (ch.next(), ch.next(), ch.next()) {
+                        (Some(Ok(a)), Some(Ok(b)), None)
+                            if a % 2 == 0 && b == a.wrapping_add(1) =>
+                        {
+                            Some((a, b))
+                        }
+                        (Some(Ok(a)), None, None) if a % 2 == 0 && a < 255 => Some((a, a + 1)),
                         _ => return Err(TransportError::Malformed),
                     };
                 }
@@ -201,6 +206,19 @@ mod tests {
             Err(TransportError::Malformed)
         );
         assert_eq!(choose_transport(""), Err(TransportError::Malformed));
+        for bad in ["5-5", "0-200", "255", "1-2", "0-1-2"] {
+            assert_eq!(
+                choose_transport(&format!("RTP/AVP/TCP;interleaved={bad}")),
+                Err(TransportError::Malformed),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            choose_transport("RTP/AVP/TCP;interleaved=4"),
+            Ok(TcpTransport {
+                interleaved: Some((4, 5))
+            })
+        );
         assert_eq!(
             transport_reply((0, 1), 0x1a2b),
             "RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=00001A2B;mode=\"PLAY\""

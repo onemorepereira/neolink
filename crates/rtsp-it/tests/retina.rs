@@ -94,6 +94,8 @@ struct Received {
     /// (stream index, NTP timestamp, extended RTP timestamp, clock rate)
     srs: Vec<(usize, u64, i64, u32)>,
     video_stream: usize,
+    /// (stream, extended RTP timestamp, arrival) per frame
+    arrivals: Vec<(usize, i64, std::time::Instant)>,
 }
 
 /// Play argus/main with retina over TCP for `secs`; frames byte-exact (Annex B, no inserted
@@ -153,12 +155,22 @@ async fn play(
             None => break,
             Some(Err(e)) => panic!("retina: {e}"),
             Some(Ok(CodecItem::VideoFrame(f))) => {
+                out.arrivals.push((
+                    f.stream_id(),
+                    f.timestamp().timestamp(),
+                    std::time::Instant::now(),
+                ));
                 let ts = f.timestamp().elapsed();
                 let rap = f.is_random_access_point();
                 out.video
                     .push((ts, rap, split_nals(&Bytes::from(f.into_data()))));
             }
             Some(Ok(CodecItem::AudioFrame(f))) => {
+                out.arrivals.push((
+                    f.stream_id(),
+                    f.timestamp().timestamp(),
+                    std::time::Instant::now(),
+                ));
                 out.audio
                     .push((f.timestamp().elapsed(), Bytes::copy_from_slice(f.data())));
             }
@@ -334,12 +346,28 @@ async fn test_a22_sr_mapping_identical_across_tracks() {
             assert!((dn - dr).abs() < 0.001, "{name}: NTP {dn} s vs RTP {dr} s");
         }
     }
-    // Both tracks' SRs at one emission share the NTP time
-    for a in &audio {
-        assert!(
-            video.iter().any(|v| v.1 == a.1),
-            "audio SR NTP {} has no video SR at the same instant",
-            a.1
-        );
-    }
+    // Both tracks map onto one wall clock: through each track's SR, a frame's NTP time
+    // minus its arrival time is the same constant for audio and video
+    let base = got.arrivals[0].2;
+    let offset_median = |stream: usize, sr: &(usize, u64, i64, u32)| -> f64 {
+        let mut offs: Vec<f64> = got
+            .arrivals
+            .iter()
+            .filter(|a| a.0 == stream)
+            .map(|a| {
+                let ntp = ntp_s(sr.1) + (a.1 - sr.2) as f64 / sr.3 as f64;
+                ntp - a.2.duration_since(base).as_secs_f64()
+            })
+            .collect();
+        offs.sort_by(|a, b| a.total_cmp(b));
+        offs[offs.len() / 2]
+    };
+    let a_stream = audio[0].0;
+    let dv = offset_median(v, video[0]);
+    let da = offset_median(a_stream, audio[0]);
+    assert!(
+        (dv - da).abs() < 0.05,
+        "video and audio map to wall time {:.1} ms apart",
+        (dv - da) * 1000.0
+    );
 }

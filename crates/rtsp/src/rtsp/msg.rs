@@ -101,6 +101,14 @@ pub fn parse(buf: &mut BytesMut) -> Result<Option<Parsed>, ParseError> {
         return Err(ParseError::HeadTooLarge);
     }
     let head = std::str::from_utf8(&buf[..end]).map_err(|_| ParseError::Malformed)?;
+    // A bare CR or LF, or any other control character, could split a value we echo
+    // (CSeq, the URI in Content-Base) into extra response lines
+    if head
+        .split("\r\n")
+        .any(|l| l.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f))
+    {
+        return Err(ParseError::Malformed);
+    }
     let mut lines = head.split("\r\n");
     let mut first = lines
         .next()
@@ -308,6 +316,19 @@ mod tests {
         assert_eq!(
             e(b"ANNOUNCE * RTSP/1.0\r\nContent-Length: 99999\r\n\r\n"),
             Err(ParseError::BodyTooLarge)
+        );
+        // Bare LF or CR, or control characters, inside the head
+        assert_eq!(
+            e(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\nX-Injected: yes\r\n\r\n"),
+            Err(ParseError::Malformed)
+        );
+        assert_eq!(
+            e(b"OPTIONS *\r RTSP/1.0\r\n\r\n"),
+            Err(ParseError::Malformed)
+        );
+        assert_eq!(
+            e(b"OPTIONS * RTSP/1.0\r\nX: a\x00b\r\n\r\n"),
+            Err(ParseError::Malformed)
         );
         let big = vec![b'A'; MAX_HEAD + 10];
         assert_eq!(e(&big), Err(ParseError::HeadTooLarge));

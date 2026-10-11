@@ -1,9 +1,13 @@
 //! Authentication (SPEC R6, DESIGN §6.5)
 //!
 //! Basic and Digest (RFC 2617 qop=auth, and RFC 2069 without qop). The Digest nonce is
-//! `b64(ts ‖ HMAC-SHA256(key, ts ‖ client_ip)[..16])`: bound to the client IP (clients
-//! reconnect after a 401), valid 5 minutes, then `stale=true`. `nc` must increase per
-//! nonce (LRU of 4096 nonces). Credential checks are constant time.
+//! `b64(ts ‖ salt ‖ HMAC-SHA256(key, ts ‖ salt ‖ client_ip)[..16])` with 8 random salt
+//! bytes (so two clients behind one IP never share a nonce): bound to the client IP
+//! (clients reconnect after a 401), valid 5 minutes, then `stale=true`. `nc` must increase
+//! per nonce (LRU of 4096 nonces). The digest's `uri` must name the requested mount.
+//! Without qop (RFC 2069, live555) a response can be replayed by the same IP for the same
+//! mount within the nonce's 5 minutes; that is the protocol's limit. Credential checks are
+//! constant time, also for unknown user names.
 //!
 //! The allowed set per mount follows today's GStreamer rules: `anyone` = every user,
 //! `anonymous` = no credentials needed, a list = those users, absent with users =
@@ -18,6 +22,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 
 use super::headers::{authorization, Authorization};
+use super::route::normalise;
 
 pub const REALM: &str = "neolink";
 const NONCE_TTL_S: u64 = 300;
@@ -132,9 +137,10 @@ impl Auth {
         !self.users.is_empty()
     }
 
-    fn mac(&self, ts: u64, ip: IpAddr) -> [u8; 16] {
+    fn mac(&self, ts: u64, salt: &[u8], ip: IpAddr) -> [u8; 16] {
         let mut m = Hmac::<Sha256>::new_from_slice(&self.key).expect("any key length");
         m.update(&ts.to_be_bytes());
+        m.update(salt);
         m.update(ip.to_string().as_bytes());
         let out = m.finalize().into_bytes();
         let mut r = [0u8; 16];
@@ -143,19 +149,21 @@ impl Auth {
     }
 
     pub fn nonce_at(&self, ts: u64, ip: IpAddr) -> String {
+        let salt: [u8; 8] = rand::random();
         let mut raw = ts.to_be_bytes().to_vec();
-        raw.extend_from_slice(&self.mac(ts, ip));
+        raw.extend_from_slice(&salt);
+        raw.extend_from_slice(&self.mac(ts, &salt, ip));
         B64.encode(raw)
     }
 
     /// `Ok(true)` valid and fresh, `Ok(false)` valid but stale, `Err` not ours/not this IP
     fn check_nonce(&self, nonce: &str, ip: IpAddr, now: u64) -> Result<bool, ()> {
         let raw = B64.decode(nonce).map_err(|_| ())?;
-        if raw.len() != 24 {
+        if raw.len() != 32 {
             return Err(());
         }
         let ts = u64::from_be_bytes(raw[..8].try_into().unwrap());
-        if !ct_eq(&raw[8..], &self.mac(ts, ip)) {
+        if !ct_eq(&raw[16..], &self.mac(ts, &raw[8..16], ip)) {
             return Err(());
         }
         Ok(now.saturating_sub(ts) <= NONCE_TTL_S && ts <= now + 5)
@@ -188,20 +196,23 @@ impl Auth {
     }
 
     /// Decide on a request
+    /// `uri` is the request URI: a Digest response must be for the same mount
     pub fn check(
         &self,
         allowed: &Allowed,
         method: &str,
+        uri: &str,
         authorization_header: Option<&str>,
         ip: IpAddr,
     ) -> Decision {
-        self.check_at(allowed, method, authorization_header, ip, now_s())
+        self.check_at(allowed, method, uri, authorization_header, ip, now_s())
     }
 
     pub fn check_at(
         &self,
         allowed: &Allowed,
         method: &str,
+        uri: &str,
         header: Option<&str>,
         ip: IpAddr,
         now: u64,
@@ -218,7 +229,7 @@ impl Auth {
                 .filter(|u| ct_eq(u.pass.as_deref().unwrap_or("").as_bytes(), pass.as_bytes()))
                 .map(|u| u.name.clone()),
             Some(Authorization::Digest(p)) if self.schemes != Schemes::Basic => {
-                match self.digest(&p, method, ip, now) {
+                match self.digest(&p, method, uri, ip, now) {
                     Ok(name) => Some(name),
                     Err(DigestError::Stale) => {
                         return Decision::Challenge(self.challenges(ip, true, now))
@@ -240,6 +251,7 @@ impl Auth {
         &self,
         p: &HashMap<String, String>,
         method: &str,
+        request_uri: &str,
         ip: IpAddr,
         now: u64,
     ) -> Result<String, DigestError> {
@@ -253,15 +265,20 @@ impl Auth {
         if p.get("realm").is_some_and(|r| r != REALM) {
             return Err(DigestError::Bad);
         }
+        // The response must be for this mount, not one captured for another
+        if uri != request_uri && normalise(uri).mount != normalise(request_uri).mount {
+            return Err(DigestError::Bad);
+        }
         let fresh = self
             .check_nonce(nonce, ip, now)
             .map_err(|_| DigestError::Bad)?;
-        let user = self.user(name).ok_or(DigestError::Bad)?;
-        let ha1 = md5_hex(&format!(
-            "{}:{REALM}:{}",
-            user.name,
-            user.pass.as_deref().unwrap_or("")
-        ));
+        // An unknown name costs the same hashing as a known one
+        let found = self.user(name);
+        let (uname, upass) = match found {
+            Some(u) => (u.name.as_str(), u.pass.as_deref().unwrap_or("")),
+            None => ("\u{0}unknown", "\u{0}"),
+        };
+        let ha1 = md5_hex(&format!("{uname}:{REALM}:{upass}"));
         let ha2 = md5_hex(&format!("{method}:{uri}"));
         let expected = match p.get("qop").map(|s| s.as_str()) {
             Some("auth") => {
@@ -271,12 +288,14 @@ impl Auth {
             None => md5_hex(&format!("{ha1}:{nonce}:{ha2}")),
             Some(_) => return Err(DigestError::Bad),
         };
-        if !ct_eq(
+        let matches = ct_eq(
             expected.as_bytes(),
             response.to_ascii_lowercase().as_bytes(),
-        ) {
-            return Err(DigestError::Bad);
-        }
+        );
+        let user = match found {
+            Some(u) if matches => u,
+            _ => return Err(DigestError::Bad),
+        };
         if !fresh {
             return Err(DigestError::Stale);
         }
@@ -375,7 +394,14 @@ mod tests {
         let a = auth();
         let only_alice = Allowed::from_config(Some(&["alice".into()]), true);
         // No credentials: 401 with Digest then Basic
-        match a.check_at(&only_alice, "DESCRIBE", None, IP, 1000) {
+        match a.check_at(
+            &only_alice,
+            "DESCRIBE",
+            "rtsp://h/argus/main",
+            None,
+            IP,
+            1000,
+        ) {
             Decision::Challenge(c) => {
                 assert!(c[0].starts_with("Digest realm=\"neolink\", nonce="));
                 assert_eq!(c[1], "Basic realm=\"neolink\"");
@@ -386,6 +412,7 @@ mod tests {
             a.check_at(
                 &only_alice,
                 "DESCRIBE",
+                "rtsp://h/argus/main",
                 Some(&basic("alice:wrong")),
                 IP,
                 1000
@@ -393,17 +420,32 @@ mod tests {
             Decision::Failed(_)
         ));
         assert!(matches!(
-            a.check_at(&only_alice, "DESCRIBE", Some(&basic("mallory:x")), IP, 1000),
+            a.check_at(
+                &only_alice,
+                "DESCRIBE",
+                "rtsp://h/argus/main",
+                Some(&basic("mallory:x")),
+                IP,
+                1000
+            ),
             Decision::Failed(_)
         ));
         assert_eq!(
-            a.check_at(&only_alice, "DESCRIBE", Some(&basic("bob:bobpw")), IP, 1000),
+            a.check_at(
+                &only_alice,
+                "DESCRIBE",
+                "rtsp://h/argus/main",
+                Some(&basic("bob:bobpw")),
+                IP,
+                1000
+            ),
             Decision::NotFound
         );
         assert_eq!(
             a.check_at(
                 &only_alice,
                 "DESCRIBE",
+                "rtsp://h/argus/main",
                 Some(&basic("alice:alicepw")),
                 IP,
                 1000
@@ -413,23 +455,37 @@ mod tests {
         // No users configured at all: anonymous
         let open = Allowed::from_config(None, false);
         assert_eq!(
-            a.check_at(&open, "DESCRIBE", None, IP, 1000),
+            a.check_at(&open, "DESCRIBE", "rtsp://h/argus/main", None, IP, 1000),
             Decision::Ok(None)
         );
         // A user without a password only matches the empty password
         let all = Allowed::from_config(Some(&["anyone".into()]), true);
         assert_eq!(
-            a.check_at(&all, "DESCRIBE", Some(&basic("nopass:")), IP, 1000),
+            a.check_at(
+                &all,
+                "DESCRIBE",
+                "rtsp://h/argus/main",
+                Some(&basic("nopass:")),
+                IP,
+                1000
+            ),
             Decision::Ok(Some("nopass".into()))
         );
         assert!(matches!(
-            a.check_at(&all, "DESCRIBE", Some(&basic("nopass:x")), IP, 1000),
+            a.check_at(
+                &all,
+                "DESCRIBE",
+                "rtsp://h/argus/main",
+                Some(&basic("nopass:x")),
+                IP,
+                1000
+            ),
             Decision::Failed(_)
         ));
         // anonymous in the list: no challenge
         let anon = Allowed::from_config(Some(&["anonymous".into(), "alice".into()]), true);
         assert_eq!(
-            a.check_at(&anon, "DESCRIBE", None, IP, 1000),
+            a.check_at(&anon, "DESCRIBE", "rtsp://h/argus/main", None, IP, 1000),
             Decision::Ok(None)
         );
     }
@@ -439,7 +495,8 @@ mod tests {
         let a = auth();
         let all = Allowed::Everyone;
         let nonce = a.nonce_at(1000, IP);
-        let ok = |h: &str, now| a.check_at(&all, "DESCRIBE", Some(h), IP, now);
+        let ok =
+            |h: &str, now| a.check_at(&all, "DESCRIBE", "rtsp://h/argus/main", Some(h), IP, now);
         // qop=auth, then a replayed nc is refused, a higher one accepted
         let h1 = digest_header(&a, "alice", "alicepw", &nonce, Some(1));
         assert_eq!(ok(&h1, 1001), Decision::Ok(Some("alice".into())));
@@ -472,6 +529,7 @@ mod tests {
             a.check_at(
                 &all,
                 "DESCRIBE",
+                "rtsp://h/argus/main",
                 Some(&digest_header(&a, "bob", "bobpw", &nonce, None)),
                 other,
                 1004
@@ -488,6 +546,28 @@ mod tests {
         ));
     }
 
+    /// Security review #3, #4: a Digest response only works for the mount it names, and two
+    /// clients behind one IP get different nonces in the same second
+    #[test]
+    fn test_digest_uri_binding_and_salted_nonce() {
+        let a = auth();
+        let all = Allowed::Everyone;
+        assert_ne!(a.nonce_at(1000, IP), a.nonce_at(1000, IP));
+        let nonce = a.nonce_at(1000, IP);
+        let h = digest_header(&a, "bob", "bobpw", &nonce, None);
+        let at = |uri: &str| a.check_at(&all, "DESCRIBE", uri, Some(&h), IP, 1001);
+        assert_eq!(at("rtsp://h/argus/main"), Decision::Ok(Some("bob".into())));
+        // Same mount, other spelling or a track URI: fine
+        assert_eq!(at("rtsp://h/argus/main/"), Decision::Ok(Some("bob".into())));
+        assert_eq!(
+            at("rtsp://h/argus/main/stream=1"),
+            Decision::Ok(Some("bob".into()))
+        );
+        // Another mount: refused
+        assert!(matches!(at("rtsp://h/argus/sub"), Decision::Failed(_)));
+        assert!(matches!(at("rtsp://h/other/main"), Decision::Failed(_)));
+    }
+
     #[test]
     fn test_schemes_filter() {
         let a = Auth::new(
@@ -497,12 +577,26 @@ mod tests {
             }],
             Schemes::Digest,
         );
-        match a.check_at(&Allowed::Everyone, "DESCRIBE", None, IP, 0) {
+        match a.check_at(
+            &Allowed::Everyone,
+            "DESCRIBE",
+            "rtsp://h/argus/main",
+            None,
+            IP,
+            0,
+        ) {
             Decision::Challenge(c) => assert_eq!(c.len(), 1),
             d => panic!("{d:?}"),
         }
         assert!(matches!(
-            a.check_at(&Allowed::Everyone, "DESCRIBE", Some(&basic("u:p")), IP, 0),
+            a.check_at(
+                &Allowed::Everyone,
+                "DESCRIBE",
+                "rtsp://h/argus/main",
+                Some(&basic("u:p")),
+                IP,
+                0
+            ),
             Decision::Failed(_)
         ));
     }

@@ -28,6 +28,6 @@ fuzz_target!(|data: &[u8]| {
     });
     let ip = "127.0.0.1".parse().unwrap();
     for allowed in [Allowed::Everyone, Allowed::Users(vec!["alice".into()])] {
-        let _ = auth.check(&allowed, "DESCRIBE", Some(s), ip);
+        let _ = auth.check(&allowed, "DESCRIBE", s, Some(s), ip);
     }
 });
