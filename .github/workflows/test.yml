@@ -45,6 +45,8 @@ jobs:
           cargo xtask mkfixture --standard --out fixtures/synth --check /tmp/SHA256SUMS
       - name: cargo test
         run: cargo test --workspace
+      - name: retina client tests (A6, A17, A22; own lockfile, newest retina)
+        run: cargo test --locked --manifest-path crates/rtsp-it/Cargo.toml
       - name: Golden structural diff, native server vs GStreamer (A19)
         run: |
           cargo build --release -p xtask
