@@ -3842,6 +3842,7 @@ dependencies = [
  "anyhow",
  "clap",
  "neolink_core",
+ "regex",
  "sha2",
 ]
 

@@ -11,4 +11,5 @@ publish = false
 anyhow = "1.0.70"
 clap = { version = "4.2.2", features = ["derive"] }
 neolink_core = { path = "../core" }
+regex = "1.7.3"
 sha2 = "0.10.8"
