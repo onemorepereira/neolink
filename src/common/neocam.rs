@@ -50,6 +50,7 @@ pub(crate) struct NeoCam {
     camera_watch: WatchReceiver<Weak<BcCamera>>,
     set: JoinSet<AnyResult<()>>,
     ledger: Arc<std::sync::Mutex<WakeLedger>>,
+    users: WatchReceiver<u32>,
     state: StateFile,
     _lock: Option<LockGuard>,
 }
@@ -92,6 +93,7 @@ impl NeoCam {
             camera_watch: camera_watch_rx.clone(),
             set,
             ledger: Default::default(),
+            users: users_watch.clone(),
             state,
             _lock: lock,
         };
@@ -398,6 +400,12 @@ impl NeoCam {
             self.commander.clone(),
             self.cancel.clone(),
         )
+    }
+
+    /// Active permits right now (PLAN 1.10)
+    #[allow(dead_code)]
+    pub(crate) fn use_count(&self) -> u32 {
+        *self.users.borrow()
     }
 
     /// The camera's state file (SPEC P15)

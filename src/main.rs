@@ -156,6 +156,26 @@ async fn main() -> Result<()> {
         }
         AnyResult::Ok(())
     };
+    #[cfg(all(unix, feature = "debug-stats"))]
+    {
+        // SIGUSR1 logs task and permit counts (PLAN 1.10)
+        let reactor = neo_reactor.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
+                return;
+            };
+            while usr1.recv().await.is_some() {
+                let tasks = tokio::runtime::Handle::current()
+                    .metrics()
+                    .num_alive_tasks();
+                info!("stats: tasks={tasks}");
+                for line in reactor.stats().await {
+                    info!("stats: {line}");
+                }
+            }
+        });
+    }
     let result = tokio::select! {
         v = run => v,
         sig = shutdown_signal() => {

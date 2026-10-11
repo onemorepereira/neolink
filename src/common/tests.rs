@@ -370,3 +370,55 @@ async fn test_on_motion_stream_drop_stops_tasks() {
         .num_alive_tasks();
     assert!(after <= before, "tasks leaked: {} -> {}", before, after);
 }
+
+/// Gate 1: 100 connect/teardown cycles; after each, no permits and the task count is
+/// back to its baseline
+#[tokio::test]
+async fn test_100_cycles_return_to_baseline() {
+    let cam = FakeCamera::start(FakeCameraConfig {
+        snapshot: None,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let neocam = new_neocam(config_for(&cam, "idle_grace_s = 0")).await;
+    let instance = neocam.subscribe().await.unwrap();
+    let alive = || {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    };
+    let mut baseline = None;
+    for cycle in 1..=100u32 {
+        instance
+            .run_task(|cam| Box::pin(async move { Ok(cam.get_linktype().await?) }))
+            .await
+            .unwrap();
+        wait_stats(&cam, 10, |s| s.open_connections == 0 && s.logouts == cycle).await;
+        assert_eq!(neocam.use_count(), 0, "cycle {}: permits left", cycle);
+        // Let the wake's passive reads and the connection tasks finish
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let n = alive();
+            match baseline {
+                None if cycle == 2 => {
+                    baseline = Some(n);
+                    break;
+                }
+                Some(b) if n <= b => break,
+                None => break,
+                Some(b) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "cycle {}: {} tasks, baseline {}",
+                        cycle,
+                        n,
+                        b
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    assert_eq!(cam.stats().logins, 100);
+}

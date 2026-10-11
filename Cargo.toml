@@ -64,6 +64,8 @@ gstreamer = [
   "dep:byte-slice-cast",
   "dep:crossbeam-channel"
 ]
+# Log task and permit counts on SIGUSR1 (for leak checks on hardware)
+debug-stats = []
 pushnoti = [
   "dep:fcm-push-listener",
   "dep:dirs",

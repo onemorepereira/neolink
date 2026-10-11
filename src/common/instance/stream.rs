@@ -103,6 +103,19 @@ impl NeoInstance {
             };
             log::debug!("Camera finished streaming: {res:?}");
         });
-        Ok(StreamRx::new(media_rx, cancel, vec![task.abort_handle()]))
+        // SPEC P8: say so once if a battery camera streams for 30 min straight
+        let warn = config.sleeps().then(|| {
+            let name = config.name.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+                log::warn!(
+                    "{name} has streamed continuously for 30 min; battery cameras are not designed for continuous recording"
+                );
+            })
+            .abort_handle()
+        });
+        let mut tasks = vec![task.abort_handle()];
+        tasks.extend(warn);
+        Ok(StreamRx::new(media_rx, cancel, tasks))
     }
 }
