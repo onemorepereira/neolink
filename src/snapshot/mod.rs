@@ -28,7 +28,10 @@ use crate::config::{CameraConfig, Config};
 const PLACEHOLDER: &[u8] = include_bytes!("placeholder.jpg");
 const MAX_REQUEST: usize = 8 * 1024;
 const MAX_CONNECTIONS: usize = 32;
+/// For reading the request headers (slowloris)
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// For the whole request: a `?fresh=1` wakes the camera over UDP, which can take 15 s+
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(75);
 const FRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The port to serve on, `None` when disabled
@@ -65,12 +68,18 @@ pub(crate) async fn serve(reactor: NeoReactor, cancel: CancellationToken) -> Res
             },
         };
         let Ok(permit) = limit.clone().try_acquire_owned() else {
-            continue; // Over the limit: drop the connection
+            // Over the limit: say so instead of silently dropping
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let r = Response::text("503 Service Unavailable", "too many connections\n");
+                let _ = tokio::time::timeout(Duration::from_secs(2), write(&mut stream, r)).await;
+            });
+            continue;
         };
         let (reactor, fresh_at) = (reactor.clone(), fresh_at.clone());
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = tokio::time::timeout(REQUEST_TIMEOUT, handle(stream, reactor, fresh_at)).await;
+            let _ = tokio::time::timeout(RESPONSE_TIMEOUT, handle(stream, reactor, fresh_at)).await;
         });
     }
 }
@@ -79,6 +88,8 @@ struct Response {
     status: &'static str,
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
+    /// HEAD: send the headers (with the body's length) but not the body
+    head_only: bool,
 }
 
 impl Response {
@@ -87,6 +98,7 @@ impl Response {
             status,
             headers: vec![("Content-Type", "text/plain".to_string())],
             body: body.as_bytes().to_vec(),
+            head_only: false,
         }
     }
 }
@@ -98,21 +110,31 @@ async fn handle(
 ) -> Result<()> {
     let mut buf = vec![];
     let mut chunk = [0u8; 1024];
-    let head = loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(());
+    let read = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                return Ok(Some(String::from_utf8_lossy(&buf[..end]).to_string()));
+            }
+            if buf.len() > MAX_REQUEST {
+                return Err(anyhow::anyhow!("request too large"));
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break String::from_utf8_lossy(&buf[..end]).to_string();
-        }
-        if buf.len() > MAX_REQUEST {
+    })
+    .await;
+    let head = match read {
+        Ok(Ok(Some(head))) => head,
+        Ok(Ok(None)) | Err(_) => return Ok(()),
+        Ok(Err(_)) => {
             return write(
                 &mut stream,
                 Response::text("431 Request Header Fields Too Large", ""),
             )
-            .await;
+            .await
         }
     };
     let config = reactor.config().await?.borrow().clone();
@@ -131,7 +153,9 @@ async fn write(stream: &mut TcpStream, r: Response) -> Result<()> {
     }
     out.push_str("\r\n");
     stream.write_all(out.as_bytes()).await?;
-    stream.write_all(&r.body).await?;
+    if !r.head_only {
+        stream.write_all(&r.body).await?;
+    }
     Ok(())
 }
 
@@ -148,29 +172,35 @@ async fn respond(
         return Response::text("405 Method Not Allowed", "GET only\n");
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let Some(name) = path
-        .strip_prefix('/')
-        .and_then(|p| p.strip_suffix("/snapshot.jpg"))
-    else {
-        return Response::text("404 Not Found", "use /<camera>/snapshot.jpg\n");
-    };
-    let Some(camera) = config.cameras.iter().find(|c| c.name == name && c.enabled) else {
-        return Response::text("404 Not Found", "no such camera\n");
-    };
     let authorization = lines
         .filter_map(|l| l.split_once(':'))
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
         .map(|(_, v)| v.trim().to_string());
-    match authorize(config, camera, authorization.as_deref()) {
-        Auth::Ok => {}
-        Auth::Unauthorized => {
+    // Authenticate before looking at the path, so camera names can't be probed
+    let user = match authenticate(config, authorization.as_deref()) {
+        Ok(user) => user,
+        Err(()) => {
             let mut r = Response::text("401 Unauthorized", "");
             r.headers
                 .push(("WWW-Authenticate", "Basic realm=\"neolink\"".to_string()));
             return r;
         }
-        Auth::Forbidden => return Response::text("404 Not Found", "no such camera\n"),
-    }
+    };
+    let Some(name) = path
+        .strip_prefix('/')
+        .and_then(|p| p.strip_suffix("/snapshot.jpg"))
+        .map(percent_decode)
+    else {
+        return Response::text("404 Not Found", "use /<camera>/snapshot.jpg\n");
+    };
+    let name = name.as_str();
+    let Some(camera) = config
+        .cameras
+        .iter()
+        .find(|c| c.name == name && c.enabled && permitted(c, user.as_deref()))
+    else {
+        return Response::text("404 Not Found", "no such camera\n");
+    };
 
     let state = StateFile::for_camera(camera);
     if query.split('&').any(|kv| kv == "fresh=1") {
@@ -207,7 +237,8 @@ async fn respond(
             ("Last-Modified", http_date(at)),
             ("Cache-Control", "no-cache".to_string()),
         ],
-        body: if method == "HEAD" { vec![] } else { body },
+        body,
+        head_only: method == "HEAD",
     }
 }
 
@@ -221,38 +252,63 @@ async fn take_fresh(reactor: &NeoReactor, name: &str, state: &StateFile) -> Resu
     state.save_snapshot(&jpeg)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Auth {
-    Ok,
-    Unauthorized,
-    Forbidden,
-}
-
-fn authorize(config: &Config, camera: &CameraConfig, authorization: Option<&str>) -> Auth {
+/// The authenticated user: `Ok(None)` when no users are configured (anyone may fetch)
+fn authenticate(config: &Config, authorization: Option<&str>) -> Result<Option<String>, ()> {
     if config.users.is_empty() {
-        return Auth::Ok;
+        return Ok(None);
     }
-    let user = authorization
+    let decoded = authorization
         .and_then(|a| a.strip_prefix("Basic "))
         .and_then(|b| BASE64.decode(b.trim()).ok())
         .and_then(|b| String::from_utf8(b).ok())
-        .and_then(|s| {
-            let (name, pass) = s.split_once(':')?;
-            config
-                .users
-                .iter()
-                .find(|u| u.name == name && u.pass.as_deref() == Some(pass))
-                .map(|u| u.name.clone())
-        });
-    let Some(user) = user else {
-        return Auth::Unauthorized;
-    };
-    match &camera.permitted_users {
-        Some(permitted) if !permitted.iter().any(|p| p == &user || p == "anyone") => {
-            Auth::Forbidden
+        .ok_or(())?;
+    let (name, pass) = decoded.split_once(':').ok_or(())?;
+    // Check every user's password in constant time so timing reveals neither
+    let mut found = None;
+    for u in &config.users {
+        let pass_ok = constant_time_eq(u.pass.as_deref().unwrap_or("").as_bytes(), pass.as_bytes())
+            && u.pass.is_some();
+        if pass_ok && u.name == name {
+            found = Some(u.name.clone());
         }
-        _ => Auth::Ok,
     }
+    found.map(Some).ok_or(())
+}
+
+/// The RTSP rule: no `permitted_users` means every user; "anyone" means every user
+fn permitted(camera: &CameraConfig, user: Option<&str>) -> bool {
+    match (&camera.permitted_users, user) {
+        (_, None) => true,
+        (None, Some(_)) => true,
+        (Some(list), Some(user)) => list.iter().any(|p| p == user || p == "anyone"),
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8 | ((a.len() ^ b.len()) >> 8) as u8;
+    for i in 0..a.len().max(b.len()) {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0xff);
+    }
+    diff == 0
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// RFC 7231 IMF-fixdate
@@ -304,34 +360,37 @@ mod tests {
     }
 
     #[test]
-    fn test_authorize() {
+    fn test_authenticate_and_permitted() {
         let open = config("");
-        assert_eq!(authorize(&open, &open.cameras[0], None), Auth::Ok);
+        assert_eq!(authenticate(&open, None), Ok(None));
+        assert!(permitted(&open.cameras[0], None));
 
         let mut users = config(
             "[[users]]\nname = \"alice\"\npass = \"alicepw\"\n[[users]]\nname = \"bob\"\npass = \"bobpw\"",
         );
         let basic = |u: &str| format!("Basic {}", BASE64.encode(u));
-        let cam = users.cameras[0].clone();
-        assert_eq!(authorize(&users, &cam, None), Auth::Unauthorized);
+        assert_eq!(authenticate(&users, None), Err(()));
+        assert_eq!(authenticate(&users, Some(&basic("alice:nope"))), Err(()));
+        assert_eq!(authenticate(&users, Some(&basic("alice:bobpw"))), Err(()));
         assert_eq!(
-            authorize(&users, &cam, Some(&basic("alice:nope"))),
-            Auth::Unauthorized
-        );
-        assert_eq!(
-            authorize(&users, &cam, Some(&basic("alice:alicepw"))),
-            Auth::Ok
+            authenticate(&users, Some(&basic("alice:alicepw"))),
+            Ok(Some("alice".to_string()))
         );
         users.cameras[0].permitted_users = Some(vec!["alice".to_string()]);
-        let cam = users.cameras[0].clone();
-        assert_eq!(
-            authorize(&users, &cam, Some(&basic("bob:bobpw"))),
-            Auth::Forbidden
-        );
-        assert_eq!(
-            authorize(&users, &cam, Some(&basic("alice:alicepw"))),
-            Auth::Ok
-        );
+        assert!(!permitted(&users.cameras[0], Some("bob")));
+        assert!(permitted(&users.cameras[0], Some("alice")));
+    }
+
+    #[test]
+    fn test_helpers() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert_eq!(percent_decode("front%20door"), "front door");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%aé%41"), "%aéA");
     }
 
     #[test]

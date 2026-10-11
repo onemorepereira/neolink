@@ -436,15 +436,17 @@ async fn test_backoff_with_demand() {
     let permit = instance.permit("test:demand").await.unwrap();
     tokio::time::sleep(Duration::from_secs(40)).await;
     drop(permit);
-    // Each attempt is a port check plus a login connection. With backoff the attempts
-    // start at 0, 1, 3, 7, 15 and 31 s; the old 5 s cap made about 13 in 40 s
-    let attempts = cam.stats().connections / 2;
+    // Each attempt is one probe connection (it fails, so no login connection follows).
+    // With backoff the attempts start at 0, 1, 3, 7, 15 and 31 s; the old 5 s cap made
+    // about 13 in 40 s
+    let attempts = cam.stats().connections;
     assert!((4..=8).contains(&attempts), "{} attempts in 40 s", attempts);
 }
 
 /// A28 / P12: a motion Start that never stops does not hold the camera after a drop
 #[tokio::test]
 async fn test_motion_permit_released_on_disconnect() {
+    let _ = env_logger::builder().is_test(true).try_init();
     let cam = FakeCamera::start(FakeCameraConfig::default())
         .await
         .unwrap();
@@ -458,6 +460,14 @@ async fn test_motion_permit_released_on_disconnect() {
     // Wait until the motion listener has subscribed (MSG_ID_MOTION_REQUEST)
     wait_stats(&cam, 10, |s| s.messages.get(&31).is_some()).await;
     drop(permit);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while neocam.use_count() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "test permit not released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     cam.motion(true);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while neocam.use_count() == 0 {
@@ -473,11 +483,66 @@ async fn test_motion_permit_released_on_disconnect() {
     while neocam.use_count() != 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "motion permit kept after the drop"
+            "motion permit kept after the drop: {:?}",
+            neocam.permit_reasons()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // No demand left: it stays disconnected
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(cam.stats().open_connections, 0);
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase 1 review regressions
+
+/// Switching from always-on to sleeping releases the connected camera
+#[tokio::test]
+async fn test_always_on_to_sleep_disconnects() {
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
+    let config = config_for(&cam, "idle_disconnect = false\nidle_grace_s = 1");
+    let neocam = new_neocam(config.clone()).await;
+    wait_stats(&cam, 10, |s| s.logins == 1).await;
+    let mut sleeping = config;
+    sleeping.idle_disconnect = Some(true);
+    neocam.update_config(sleeping).await.unwrap();
+    wait_stats(&cam, 10, |s| s.open_connections == 0 && s.logouts == 1).await;
+}
+
+/// A dropped connection after a good session retries at once, not on the slow schedule
+#[tokio::test]
+async fn test_retry_state_resets_after_a_good_session() {
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
+    let neocam = new_neocam(config_for(&cam, "idle_disconnect = false")).await;
+    wait_stats(&cam, 10, |s| s.logins == 1).await;
+    // One failure, then a good session, then a drop
+    cam.set_unreachable(true);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    cam.set_unreachable(false);
+    wait_stats(&cam, 10, |s| s.logins == 2).await;
+    cam.drop_connections();
+    wait_stats(&cam, 5, |s| s.logins == 3).await;
+    drop(neocam);
+}
+
+/// Shutdown is quick even while waiting to retry an unreachable camera
+#[tokio::test]
+async fn test_shutdown_during_backoff_is_fast() {
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
+    cam.set_unreachable(true);
+    let mut neocam = new_neocam(config_for(&cam, "idle_disconnect = false")).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let t = tokio::time::Instant::now();
+    neocam.shutdown().await;
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "shutdown took {:?}",
+        t.elapsed()
+    );
 }

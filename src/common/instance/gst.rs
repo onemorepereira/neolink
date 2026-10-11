@@ -53,27 +53,36 @@ impl NeoInstance {
         };
         // Now listen to the motion
         let thread_name = name.clone();
+        let hold_max = tokio::time::Duration::from_secs(config.motion_hold_max_s);
         let md_task = tokio::spawn(
             async move {
+                // A hold ends at Stop, at Unknown (the connection dropped) or after
+                // motion_hold_max_s (SPEC P12)
+                let mut hold_until: Option<tokio::time::Instant> = None;
                 loop {
-                    match md.changed().await {
-                        Ok(_) => {
+                    tokio::select! {
+                        v = md.changed() => {
+                            if let Err(e) = v {
+                                break AnyResult::Err(e.into());
+                            }
                             let md_state: MdState = md.borrow_and_update().clone();
                             match md_state {
                                 MdState::Start(_) => {
                                     log::info!("{thread_name}::{stream:?}: Motion Started");
                                     md_permit.activate().await?;
+                                    hold_until = Some(tokio::time::Instant::now() + hold_max);
                                 }
-                                MdState::Stop(_) => {
+                                MdState::Stop(_) | MdState::Unknown => {
                                     log::info!("{thread_name}::{stream:?}: Motion Stopped");
                                     md_permit.deactivate().await?;
+                                    hold_until = None;
                                 }
-                                MdState::Unknown => {}
                             }
                         }
-                        Err(e) => {
-                            // Use break here so we can define the full type on the async closure
-                            break AnyResult::Err(e.into());
+                        _ = tokio::time::sleep_until(hold_until.unwrap_or_else(tokio::time::Instant::now)), if hold_until.is_some() => {
+                            log::info!("{thread_name}::{stream:?}: Motion held the stream for {hold_max:?}, pausing");
+                            md_permit.deactivate().await?;
+                            hold_until = None;
                         }
                     }
                 }?;

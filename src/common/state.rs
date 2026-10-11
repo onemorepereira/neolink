@@ -106,7 +106,10 @@ impl StateFile {
     }
 
     /// Change the state and write it atomically
+    /// Updates within a process are serialized, so concurrent writers (wake reads, a
+    /// fresh snapshot) don't lose each other's fields
     pub(crate) fn update(&self, f: impl FnOnce(&mut CameraState)) -> Result<CameraState> {
+        let _guard = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = self.load();
         f(&mut state);
         write_atomic(&self.json, &serde_json::to_vec_pretty(&state)?)?;
@@ -130,10 +133,15 @@ impl StateFile {
         let path = self.json.with_extension("lock");
         if let Ok(pid) = std::fs::read_to_string(&path) {
             let pid = pid.trim();
-            if pid != std::process::id().to_string() && Path::new("/proc").join(pid).exists() {
+            if !pid.is_empty()
+                && pid != std::process::id().to_string()
+                && Path::new("/proc").join(pid).exists()
+            {
                 log::warn!(
                     "Another neolink process (pid {pid}) uses this camera too; each one wakes it separately"
                 );
+                // Leave its lock alone: a CLI run must not take over the daemon's lock
+                return None;
             }
         }
         std::fs::create_dir_all(path.parent()?).ok()?;
@@ -162,10 +170,17 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
+static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let dir = path.parent().context("state path has no parent")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    // Unique per file, process and write, so concurrent writes never share a temp file
+    let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}.{}", std::process::id(), n));
+    let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
     Ok(())
@@ -180,6 +195,32 @@ mod tests {
             "name = \"{name}\"\nusername = \"admin\"\naddress = \"{addr}\""
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn test_concurrent_updates_keep_every_field() {
+        let dir = std::env::temp_dir().join(format!("neolink-state-conc-{}", std::process::id()));
+        let f = StateFile::in_dir(&dir, &config("argus", "10.0.0.1"));
+        f.update(|s| s.uid = Some("UID".to_string())).unwrap();
+        let threads: Vec<_> = (0..2)
+            .map(|t| {
+                let f = f.clone();
+                std::thread::spawn(move || {
+                    for i in 0..200u64 {
+                        if t == 0 {
+                            f.update(|s| s.snapshot_at = Some(i)).unwrap();
+                        } else {
+                            f.save_snapshot(b"jpg").unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(f.load().uid.as_deref(), Some("UID"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

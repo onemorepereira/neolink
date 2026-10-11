@@ -105,10 +105,13 @@ impl NeoCamMdThread {
                     // Any change of connection (gone, or replaced by a quick reconnect
                     // that this may not see as "gone") ends the old connection's motion
                     let current = camera_watch.borrow_and_update().clone();
+                    // Decide now: once the old connection is freed its Weak no longer upgrades
+                    let was_connected = current.upgrade().is_some();
                     camera_watch
                         .wait_for(|cam| !std::sync::Weak::ptr_eq(cam, &current))
                         .await?;
-                    if current.upgrade().is_some() || camera_watch.borrow().upgrade().is_none() {
+                    log::debug!("motion: connection changed (was connected: {was_connected})");
+                    if was_connected {
                         reset_watcher.send_replace(MdState::Unknown);
                     }
                 }

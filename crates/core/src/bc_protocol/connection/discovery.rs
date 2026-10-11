@@ -3,6 +3,8 @@
 //! Given a UID find the associated IP
 //!
 use super::DiscoveryResult;
+use crate::bc::model::*;
+use crate::bc_protocol::TcpSource;
 use crate::bcudp::codex::BcUdpCodex;
 use crate::bcudp::model::*;
 use crate::bcudp::xml::*;
@@ -1074,14 +1076,31 @@ impl Discovery {
     // Check if TCP is possible
     //
     // To do this we send a dummy login  and see if it replies with any BC packet
-    /// Check that something accepts TCP connections at `addr`
+    /// Check that a Baichuan camera answers at `addr`
     ///
-    /// This used to log in as admin/123456 to prove it was a Baichuan camera, which costs a
-    /// failed login on the camera every connection (SPEC P13). A refused or timed-out
-    /// connect is what distinguishes "not here"; the real login follows right after.
-    pub(crate) async fn check_tcp(&self, addr: SocketAddr, _channel_id: u8) -> Result<()> {
-        let stream = timeout(*TCP_WAIT, tokio::net::TcpStream::connect(addr)).await??;
-        drop(stream);
+    /// Sends the header-only "login upgrade" request, which is the first step of every
+    /// login and carries no credentials, and waits for any Baichuan reply. Before, this
+    /// logged in as admin/123456, which made the camera record a failed login every time
+    /// (SPEC P13); a bare TCP connect would accept any service on the port.
+    pub(crate) async fn check_tcp(&self, addr: SocketAddr, channel_id: u8) -> Result<()> {
+        let mut tcp_source =
+            timeout(*TCP_WAIT, TcpSource::new(addr, "", None::<String>, false)).await??;
+        tcp_source
+            .send(Bc {
+                meta: BcMeta {
+                    msg_id: MSG_ID_LOGIN,
+                    channel_id,
+                    msg_num: 0,
+                    stream_type: 0,
+                    response_code: 0xdc00,
+                    class: 0x6514,
+                },
+                body: BcBody::LegacyMsg(LegacyMsg::LoginUpgrade),
+            })
+            .await?;
+        let _bc: Bc = timeout(*TCP_WAIT, tcp_source.next())
+            .await?
+            .ok_or(Error::CannotInitCamera)??;
         Ok(())
     }
 

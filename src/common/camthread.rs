@@ -19,6 +19,8 @@ pub(crate) struct NeoCamThread {
     config: WatchReceiver<CameraConfig>,
     cancel: CancellationToken,
     camera_watch: WatchSender<Weak<BcCamera>>,
+    /// Set by run_camera after a successful login, so retry state can be reset
+    logged_in: bool,
 }
 
 impl NeoCamThread {
@@ -33,6 +35,7 @@ impl NeoCamThread {
             config: watch_config_rx,
             cancel,
             camera_watch: camera_watch_tx,
+            logged_in: false,
         }
     }
     /// Connect, log in, and serve the camera until it fails, the config changes, or it is
@@ -44,14 +47,17 @@ impl NeoCamThread {
         let mut state = self.state.clone();
         let mut config_rec = self.config.clone();
         config_rec.borrow_and_update();
+        let cancel = self.cancel.clone();
         let camera = tokio::select! {
             v = connect_and_login(config) => Arc::new(v?),
+            _ = cancel.cancelled() => return Ok(Exit::Shutdown),
             Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
                 return Ok(Exit::Released);
             }
             Ok(_) = config_rec.wait_for(|new| connection_changed(new, config)) => return Ok(Exit::Released),
         };
         log::trace!("  - Connected");
+        self.logged_in = true;
 
         // Some calls answer 400 while the camera wakes up; retry those instead of sleeping a
         // fixed time before every use (SPEC P13)
@@ -148,12 +154,14 @@ impl NeoCamThread {
             let name = config.name.clone();
 
             // run_camera handles release and config changes itself so that it can log out
+            self.logged_in = false;
             let result = self.run_camera(&config).await;
             self.camera_watch.send_replace(Weak::new());
 
-            if now.elapsed() > Duration::from_secs(60) {
-                // Command ran long enough to be considered a success
+            if self.logged_in || now.elapsed() > Duration::from_secs(60) {
+                // It worked for a while: a later failure starts the retry sequence afresh
                 backoff = MIN_BACKOFF;
+                failing_since = None;
             }
 
             match result {
@@ -194,6 +202,7 @@ impl NeoCamThread {
                             let mut state = self.state.clone();
                             tokio::select! {
                                 _ = sleep(wait) => {},
+                                _ = self.cancel.cancelled() => return Ok(()),
                                 Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
                                     failing_since = None;
                                     backoff = MIN_BACKOFF;

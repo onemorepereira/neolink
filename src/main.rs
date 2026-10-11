@@ -223,6 +223,24 @@ async fn shutdown_signal() -> &'static str {
 /// still let users pick the mode with an environment variable (PLAN 1.9)
 fn args_with_mode(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     use clap::CommandFactory;
+    // Compose files written for the old shell entrypoint pass the binary itself first
+    // (`command: /usr/local/bin/neolink mqtt ...`); with neolink as the entrypoint that
+    // would be argv[1]
+    if args
+        .get(1)
+        .and_then(|a| a.to_str())
+        .is_some_and(|a| a == "neolink" || a.ends_with("/neolink"))
+    {
+        args.remove(1);
+    }
+    if args.iter().skip(1).any(|a| {
+        matches!(
+            a.to_str(),
+            Some("-h" | "--help" | "-V" | "--version" | "help")
+        )
+    }) {
+        return args;
+    }
     let Some(mode) = std::env::var_os("NEO_LINK_MODE").filter(|m| !m.is_empty()) else {
         return args;
     };
@@ -270,6 +288,20 @@ mod main_tests {
         assert_eq!(
             args_with_mode(args(&["neolink", "battery", "--config", "c", "cam"])),
             args(&["neolink", "battery", "--config", "c", "cam"])
+        );
+        assert_eq!(
+            args_with_mode(args(&["neolink", "--version"])),
+            args(&["neolink", "--version"])
+        );
+        assert_eq!(
+            args_with_mode(args(&[
+                "neolink",
+                "/usr/local/bin/neolink",
+                "mqtt",
+                "--config",
+                "c"
+            ])),
+            args(&["neolink", "mqtt", "--config", "c"])
         );
         std::env::remove_var("NEO_LINK_MODE");
         assert_eq!(

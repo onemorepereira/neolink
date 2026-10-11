@@ -203,8 +203,15 @@ impl BcCamera {
             // Local first, the Reolink cloud only if that fails and `discovery` allows it,
             // never both at once: a parallel cloud registration wakes battery cameras
             // through Reolink's servers on every attempt (SPEC P9)
+            // When the cloud may be tried next, don't spend the whole local wait on it
+            let cloud_allowed = allow_remote || allow_map || allow_relay;
+            let local_wait = if cloud_allowed {
+                tokio::time::Duration::from_secs(8)
+            } else {
+                tokio::time::Duration::from_secs(3600)
+            };
             let local_result: Result<CameraLocation> = if allow_local {
-                async {
+                tokio::time::timeout(local_wait, async {
                     let uid_local = uid.clone();
                     info!("{}: Trying local discovery", options.name);
                     let result = discovery.local(&uid_local, Some(sockets)).await;
@@ -220,8 +227,9 @@ impl BcCamera {
                         }
                         Err(e) => Err(e),
                     }
-                }
+                })
                 .await
+                .unwrap_or(Err(Error::DiscoveryTimeout))
             } else {
                 Err(Error::DiscoveryTimeout)
             };

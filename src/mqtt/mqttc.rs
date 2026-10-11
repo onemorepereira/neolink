@@ -245,11 +245,13 @@ impl<'a> MqttBackend<'a> {
                                         v?;
                                     }
                                     MqttRequest::HangUp(reply) => {
+                                        // The same payload as the last will, which HA's
+                                        // availability expects
                                         send_client.publish(
                                             "neolink/status".to_string(),
                                             QoS::AtLeastOnce,
                                             true,
-                                            "disconnected".to_string(),
+                                            "offline".to_string(),
                                         ).await?;
                                         let _ = reply.send(());
                                         return Err(anyhow!("Disconneting"));

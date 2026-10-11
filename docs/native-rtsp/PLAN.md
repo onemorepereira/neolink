@@ -143,7 +143,38 @@ session leaked; motion `Start` survived a disconnect and could hold a permit.
 - ✅ The golden structural diff against the GStreamer backend is clean: on the fake camera the Phase 1 binary is identical to the pre-Phase-1 binary and both match the goldens (`tests/e2e/golden-fake.sh`; GStreamer's pre-existing PLAY 503 for back-to-back clients is retried and counted).
 - ✅ No password appears in the most verbose release log (trace is compiled out; debug checked in `power.sh`) or in config `Debug`.
 - ✅ The config corpus parses.
-- Red-team review of the Phase 1 diff.
+- ✅ Red-team review of the Phase 1 diff (fresh agent, 2026-10-11). 20 findings:
+  - **Fixed, with tests:**
+    - switching always-on → sleep never disconnected;
+    - the 10-min slow-retry clock wasn't reset after a good session;
+    - concurrent state-file writes lost fields (shared temp name, no lock);
+    - shutdown during a backoff or connect took the full 5 s;
+    - the snapshot endpoint leaked camera names (404 before auth).
+  - **Fixed:**
+    - `NEO_LINK_MODE` broke `--version`/`--help` and old compose `command:` lines;
+    - push registration woke the camera at boot (now passive), and each push took a 30 s permit even without a motion consumer;
+    - the GStreamer `on_motion` path ignored Unknown and had no hold cap;
+    - the 60 s deadline killed `talk` and `image --use-stream` (now stream tasks);
+    - `?fresh=1` couldn't finish within the 10 s request timeout (headers keep 10 s, the request gets 75 s);
+    - `check_tcp` accepted any listener (it now sends the credential-free login-upgrade request and needs a Baichuan reply);
+    - a read-only state dir aborted the wake reads;
+    - a CLI run took over and deleted the daemon's lock;
+    - the snapshot endpoint now uses constant-time password checks, a real `Content-Length` on HEAD, percent-decoded names and a 503 over the connection cap;
+    - clean MQTT hang-up published `disconnected` where HA now expects `offline`;
+    - reason de-duplication;
+    - the motion permit lingered 30 s after a disconnect and reconnected.
+  - **Mitigated:**
+    - local-first discovery delayed cloud users by up to 15 s (local is capped at 8 s when the cloud is allowed);
+    - mains cameras without `battery = false` now sleep, which is the intended P1 default: a startup info line says how to keep them connected.
+  - **Release notes (behaviour change):**
+    - HA availability moved to `neolink/status`; `neolink/<cam>/status` drives the new Awake sensor;
+    - retained `neolink/config` is ignored at startup.
+  - **Deferred:**
+    - the ledger counts from the connect request, not the login;
+    - an abandoned mid-handshake login skips `C2D_DISC`;
+    - per-IP limits on the snapshot endpoint;
+    - a UDP fake for power tests (Phase 4; the UDP path is covered by A27 on hardware);
+    - Docker `--user` state-dir ownership (Phase 6 image work).
 
 ## Phase 2: `crates/rtsp` media core, no network (12–16 d; 0 hardware)
 
