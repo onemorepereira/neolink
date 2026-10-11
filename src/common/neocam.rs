@@ -20,8 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance, Permit,
-    UseCounter, WakeLedger,
+    LockGuard, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance,
+    Permit, StateFile, UseCounter, WakeLedger,
 };
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
@@ -50,6 +50,8 @@ pub(crate) struct NeoCam {
     camera_watch: WatchReceiver<Weak<BcCamera>>,
     set: JoinSet<AnyResult<()>>,
     ledger: Arc<std::sync::Mutex<WakeLedger>>,
+    state: StateFile,
+    _lock: Option<LockGuard>,
 }
 
 impl NeoCam {
@@ -74,7 +76,9 @@ impl NeoCam {
         } else {
             NeoCamThreadState::Connected
         });
-        let (uid_tx, uid_rx) = watch(config.camera_uid.clone());
+        let state = StateFile::for_camera(&config);
+        let lock = state.lock();
+        let (uid_tx, uid_rx) = watch(config.camera_uid.clone().or(state.load().uid));
 
         let set = JoinSet::new();
         let users = UseCounter::new().await;
@@ -88,6 +92,8 @@ impl NeoCam {
             camera_watch: camera_watch_rx.clone(),
             set,
             ledger: Default::default(),
+            state,
+            _lock: lock,
         };
 
         // This thread recieves messages from the instances
@@ -210,58 +216,24 @@ impl NeoCam {
             }
         });
 
-        // This thread just does a one time report on camera info
-        let report_instance = instance.subscribe().await?;
-        let report_cancel = me.cancel.clone();
-        let report_name = config.name.clone();
+        // On every wake, piggyback the reads that would otherwise need their own wake:
+        // battery, UID, model/firmware, streams, and a snapshot (SPEC P5, P7, P15). This is
+        // passive: it never causes or extends a wake.
+        let wake_instance = instance.subscribe().await?;
+        let wake_cancel = me.cancel.clone();
+        let wake_name = config.name.clone();
+        let wake_state = me.state.clone();
         me.set.spawn(async move {
             tokio::select! {
-                _ = report_cancel.cancelled() => {
-                    AnyResult::Ok(())
-                }
+                _ = wake_cancel.cancelled() => AnyResult::Ok(()),
                 v = async {
-                    // Passive: runs on the first wake, never causes one (SPEC P10)
-                    let version = report_instance.run_passive_task(|cam| Box::pin(
-                        async move {
-                            Ok(cam.version().await?)
+                    let mut reported = false;
+                    loop {
+                        wake_instance.next_connection().await?;
+                        if let Err(e) = wake_reads(&wake_instance, &wake_state, &uid_tx, &wake_name, &mut reported).await {
+                            log::debug!("{wake_name}: wake reads stopped: {e:?}");
                         }
-                    )).await?;
-                    log::info!("{}: Model {}", report_name, version.model.unwrap_or("Undeclared".to_string()));
-                    log::info!("{}: Firmware Version {}", report_name, version.firmwareVersion);
-
-                    let stream_info = report_instance.run_passive_task(|cam| Box::pin(
-                        async move {
-                            Ok(cam.get_stream_info().await?)
-                        }
-                    )).await?;
-                    let mut supported_streams = vec![];
-                    for encode in stream_info.stream_infos.iter().flat_map(|stream_info| stream_info.encode_tables.clone()) {
-                        supported_streams.push(std::format!("    {}: {}x{}", encode.name, encode.resolution.width, encode.resolution.height));
                     }
-
-
-                    Ok(())
-                } => v
-            }
-        });
-
-        // This thread will update the UID by asking the camera.
-        // We cache this in the uid_rx
-        let uid_instance = instance.clone();
-        let uid_cancel = me.cancel.clone();
-        me.set.spawn(async move {
-            tokio::select! {
-                _ = uid_cancel.cancelled() => {
-                    AnyResult::Ok(())
-                },
-                v = async {
-                    // Passive: runs on the first wake, never causes one (SPEC P10)
-                    let uid = uid_instance.run_passive_task(|cam| Box::pin(async move {
-                        let uid = cam.uid().await?;
-                        Ok(uid)
-                    })).await?;
-                    uid_tx.send_replace(Some(uid));
-                    AnyResult::Ok(())
                 } => v,
             }
         });
@@ -428,6 +400,12 @@ impl NeoCam {
         )
     }
 
+    /// The camera's state file (SPEC P15)
+    #[allow(dead_code)]
+    pub(crate) fn state(&self) -> StateFile {
+        self.state.clone()
+    }
+
     /// The wake ledger (SPEC P6)
     #[allow(dead_code)]
     pub(crate) fn ledger(&self) -> Arc<std::sync::Mutex<WakeLedger>> {
@@ -461,4 +439,92 @@ impl Drop for NeoCam {
             log::trace!("Dropped NeoCam");
         });
     }
+}
+
+/// The reads done once per wake (see the wake thread in `NeoCam::new`)
+async fn wake_reads(
+    instance: &NeoInstance,
+    state: &StateFile,
+    uid_tx: &WatchSender<Option<String>>,
+    name: &str,
+    reported: &mut bool,
+) -> AnyResult<()> {
+    use super::state::{unix_now, BatteryReading};
+
+    // The Argus answers 400 to the first battery read after a wake (SPEC §9);
+    // run_passive_task retries 400s
+    let battery = match instance
+        .run_passive_task(|cam| Box::pin(async move { Ok(cam.battery_info().await?) }))
+        .await
+    {
+        Ok(b) => Some(b),
+        Err(e) => {
+            log::debug!("{name}: no battery reading: {e:?}");
+            None
+        }
+    };
+    if let Some(b) = battery {
+        log::info!(
+            "{name}: battery {}% ({} mV, {} mA, {})",
+            b.battery_percent,
+            b.voltage,
+            b.current,
+            b.charge_status
+        );
+        state.update(|s| {
+            s.battery = Some(true);
+            s.last_battery = Some(BatteryReading {
+                percent: b.battery_percent,
+                voltage: b.voltage,
+                current: b.current,
+                temperature: b.temperature,
+                charge_status: b.charge_status.clone(),
+                adapter_status: b.adapter_status.clone(),
+                at: unix_now(),
+            });
+        })?;
+    }
+
+    if uid_tx.borrow().is_none() {
+        let uid = instance
+            .run_passive_task(|cam| Box::pin(async move { Ok(cam.uid().await?) }))
+            .await?;
+        state.update(|s| s.uid = Some(uid.clone()))?;
+        uid_tx.send_replace(Some(uid));
+    }
+
+    if !*reported {
+        let version = instance
+            .run_passive_task(|cam| Box::pin(async move { Ok(cam.version().await?) }))
+            .await?;
+        log::info!(
+            "{name}: Model {}",
+            version.model.clone().unwrap_or("Undeclared".to_string())
+        );
+        log::info!("{name}: Firmware Version {}", version.firmwareVersion);
+        let stream_info = instance
+            .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_stream_info().await?) }))
+            .await?;
+        let streams: Vec<String> = stream_info
+            .stream_infos
+            .iter()
+            .flat_map(|i| i.encode_tables.iter().map(|e| e.name.clone()))
+            .collect();
+        state.update(|s| {
+            s.model = version.model.clone();
+            s.firmware = Some(version.firmwareVersion.clone());
+            s.supported_streams = streams.clone();
+        })?;
+        *reported = true;
+    }
+
+    // One snapshot per wake, for the snapshot endpoint and the CLI (SPEC P5)
+    match instance
+        .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_snapshot().await?) }))
+        .await
+    {
+        Ok(jpeg) => state.save_snapshot(&jpeg)?,
+        Err(e) => log::debug!("{name}: no snapshot this wake: {e:?}"),
+    }
+    Ok(())
 }

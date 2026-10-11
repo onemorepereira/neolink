@@ -7,6 +7,12 @@ use std::time::Duration;
 
 /// A camera config that reaches `cam` over TCP, with extra TOML lines
 pub(crate) fn config_for(cam: &FakeCamera, extra: &str) -> CameraConfig {
+    // State files of all tests go to one temporary directory; the fake's port keeps
+    // them apart
+    std::env::set_var(
+        "NEOLINK_STATE_DIR",
+        std::env::temp_dir().join(format!("neolink-tests-{}", std::process::id())),
+    );
     let text = format!(
         "name = \"fake\"\nusername = \"admin\"\npassword = \"fakepass\"\naddress = \"{}\"\n{}",
         cam.addr(),
@@ -219,4 +225,33 @@ async fn test_config_push_reconnects_only_when_needed() {
     neocam.update_config(moved).await.unwrap();
     wait_stats(&cam, 10, |s| s.logins == 2).await;
     assert_eq!(cam.stats().logouts, 1);
+}
+
+/// P7, P15: a wake records battery, UID, model and streams in the state file
+#[tokio::test]
+async fn test_wake_fills_state_file() {
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
+    let neocam = new_neocam(config_for(&cam, "idle_grace_s = 1")).await;
+    let instance = neocam.subscribe().await.unwrap();
+    instance
+        .run_task(|cam| Box::pin(async move { Ok(cam.get_linktype().await?) }))
+        .await
+        .unwrap();
+    let state = neocam.state();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while state.load().model.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "state: {:?}",
+            state.load()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let s = state.load();
+    assert_eq!(s.battery, Some(true));
+    assert_eq!(s.last_battery.as_ref().map(|b| b.percent), Some(80));
+    assert_eq!(s.uid.as_deref(), Some("FAKEUID0000000001"));
+    assert_eq!(s.supported_streams, ["mainStream", "subStream"]);
 }

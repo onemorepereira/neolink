@@ -49,6 +49,7 @@ mod reboot;
 #[cfg(feature = "gstreamer")]
 mod rtsp;
 mod services;
+mod snapshot;
 mod statusled;
 #[cfg(feature = "gstreamer")]
 mod talk;

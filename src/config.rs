@@ -49,6 +49,10 @@ pub(crate) struct Config {
     #[validate(nested)]
     #[serde(default)]
     pub(crate) users: Vec<UserConfig>,
+
+    /// Port of the cached snapshot endpoint; unset means bind_port + 1, 0 disables it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
@@ -232,6 +236,10 @@ pub(crate) struct CameraConfig {
     /// Seconds to stay connected after the last use (SPEC P2)
     #[serde(default = "default_idle_grace_s")]
     pub(crate) idle_grace_s: u64,
+
+    /// Allow `?fresh=1` on the snapshot endpoint, which wakes the camera (SPEC P5)
+    #[serde(default = "default_false")]
+    pub(crate) snapshot_fresh: bool,
 
     /// Longest time a motion event keeps the camera connected (SPEC P12)
     #[serde(default = "default_motion_hold_max_s")]

@@ -92,6 +92,16 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
 
     let mut set = JoinSet::new();
 
+    // Cached snapshots for sleeping cameras (SPEC P5)
+    let snapshot_reactor = reactor.clone();
+    let snapshot_cancel = global_cancel.clone();
+    set.spawn(async move {
+        if let Err(e) = crate::snapshot::serve(snapshot_reactor, snapshot_cancel).await {
+            log::error!("Snapshot endpoint stopped: {e:?}");
+        }
+        AnyResult::Ok(())
+    });
+
     // Thread for the TLS from the config
     let mut thread_config = reactor.config().await?;
     let thread_cancel = global_cancel.clone();
