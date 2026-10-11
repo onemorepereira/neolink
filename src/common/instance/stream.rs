@@ -17,6 +17,8 @@ pub(crate) enum StreamEvent {
     Media(BcMedia),
     /// The camera stream started again (a reconnect); timestamps may jump
     Restarted,
+    /// `pause.on_motion`: no motion, so the camera stream stopped until motion resumes
+    Paused,
 }
 
 /// The receiving end of a camera stream; dropping it stops the stream
@@ -36,6 +38,7 @@ impl StreamRx {
     }
 
     /// The next frame, skipping other events; `None` when the stream ended
+    #[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
     pub(crate) async fn recv(&mut self) -> Option<BcMedia> {
         loop {
             match self.rx.recv().await? {
@@ -46,6 +49,7 @@ impl StreamRx {
     }
 
     /// [`Self::recv`] for a non-async thread
+    #[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
     pub(crate) fn blocking_recv(&mut self) -> Option<BcMedia> {
         loop {
             match self.rx.blocking_recv()? {

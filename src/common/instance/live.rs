@@ -12,7 +12,14 @@ impl NeoInstance {
     ///
     /// Every task this starts belongs to the returned [`StreamRx`] and stops when it is
     /// dropped. Before, the motion and push-notification watchers outlived the client.
-    pub(crate) async fn stream_while_live(&self, stream: StreamKind) -> AnyResult<StreamRx> {
+    /// `init_permit` streams that long on every start regardless of motion: the GStreamer
+    /// backend needs 5 s to negotiate; the native one learns streams itself (`None`).
+    /// While paused it emits `StreamEvent::Paused`.
+    pub(crate) async fn stream_while_live(
+        &self,
+        stream: StreamKind,
+        init_permit: Option<tokio::time::Duration>,
+    ) -> AnyResult<StreamRx> {
         let config = self.config().await?.borrow().clone();
         let name = config.name.clone();
 
@@ -26,16 +33,18 @@ impl NeoInstance {
 
         let mut md = self.motion().await?;
         let mut tasks = FuturesUnordered::new();
-        // Stream for 5s on a new client always
-        // This lets us negotiate the camera stream type
-        let init_permit = counter.create_activated().await?;
-        handles.push(
-            tokio::spawn(async {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                drop(init_permit);
-            })
-            .abort_handle(),
-        );
+        // Stream for a while on a new client regardless of motion (GStreamer: 5 s, to
+        // negotiate the stream type)
+        if let Some(d) = init_permit {
+            let init_permit = counter.create_activated().await?;
+            handles.push(
+                tokio::spawn(async move {
+                    tokio::time::sleep(d).await;
+                    drop(init_permit);
+                })
+                .abort_handle(),
+            );
+        }
 
         // Create the permit for controlling the motion
         let mut md_permit = {
@@ -165,6 +174,9 @@ impl NeoInstance {
                             }
                         }?;
                         log::debug!("Pausing stream");
+                        if media_tx.send(StreamEvent::Paused).await.is_err() {
+                            break AnyResult::Ok(());
+                        }
                     }
                 } => v,
             };

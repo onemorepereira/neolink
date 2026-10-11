@@ -95,11 +95,31 @@ use self::{
 /// Entry point for the mqtt subcommand
 ///
 /// Opt is the command line options
+/// A config parse error without the quoted source line (SPEC R25)
+fn redacted_parse_error(text: &str, e: &toml::de::Error) -> String {
+    let line = e
+        .span()
+        .map(|s| text[..s.start.min(text.len())].matches('\n').count() + 1);
+    match line {
+        Some(l) => format!("Failed to parse the config at line {l}: {}", e.message()),
+        None => format!("Failed to parse the config: {}", e.message()),
+    }
+}
+
 pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
     let global_cancel = CancellationToken::new();
     let cancel_drop = global_cancel.clone().drop_guard();
     let config = reactor.config().await?;
+    {
+        let c = config.borrow();
+        if c.mqtt_config_writes && !c.users.is_empty() {
+            log::warn!(
+                "MQTT clients can rewrite the config, including users and permitted_users, \
+                 on the neolink/config topic; set mqtt_config_writes = false to prevent that"
+            );
+        }
+    }
     let mqtt = Mqtt::new(config.clone()).await;
 
     // Startup and stop cameras as they are added/removed to the config
@@ -202,18 +222,32 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
             v = async {
                 while let Ok(msg) = thread_instance.recv().await {
                     if msg.topic == "config" {
-                        crate::config::warn_unknown_keys(&msg.message, "MQTT neolink/config");
-                        let config: Result<Config> = toml::from_str(&msg.message).with_context(|| {
-                            format!("Failed to parse the MQTT {:?} config file", msg.topic)
-                        });
-                        if let Err(e) = config {
+                        // SPEC R29: the topic can rewrite users and permissions
+                        if !thread_config.borrow().mqtt_config_writes {
+                            log::warn!("Ignored a config write over MQTT: mqtt_config_writes = false");
                             thread_instance
-                                .send_message("config/status", &format!("{:?}", e), false)
+                                .send_message(
+                                    "config/status",
+                                    "Rejected: config writes over MQTT are disabled (mqtt_config_writes = false)",
+                                    false,
+                                )
                                 .await?;
                             continue;
                         }
+                        crate::config::warn_unknown_keys(&msg.message, "MQTT neolink/config");
+                        let config = match toml::from_str::<Config>(&msg.message) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                // The parse error quotes the offending line, which may hold
+                                // a password: report only the message and the line
+                                thread_instance
+                                    .send_message("config/status", &redacted_parse_error(&msg.message, &e), false)
+                                    .await?;
+                                continue;
+                            }
+                        };
                         let curr_config = thread_config.borrow().clone();
-                        let mut config = config?;
+                        let mut config = config;
 
                         // Fill in skipped passwords
                         if let (Some(mqtt), Some(curr_mqtt)) = (config.mqtt.as_mut(), curr_config.mqtt.as_ref()) {
@@ -1385,5 +1419,19 @@ async fn wait_for_state(updated: impl Fn() -> bool) {
             return;
         }
         sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_error_does_not_echo_the_line() {
+        let text = "bind = \"0.0.0.0\"\n[[cameras]]\nname = \"a\"\npassword = \"s3cret\" oops\n";
+        let e = toml::from_str::<Config>(text).unwrap_err();
+        let msg = redacted_parse_error(text, &e);
+        assert!(!msg.contains("s3cret"), "{}", msg);
+        assert!(msg.contains("line 4"), "{}", msg);
     }
 }

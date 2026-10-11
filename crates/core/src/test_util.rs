@@ -625,7 +625,9 @@ impl Conn {
             }
             MSG_ID_VIDEO_STOP => {
                 self.shared.stats.lock().unwrap().video_stops += 1;
-                for (_, v) in std::mem::take(&mut self.videos) {
+                // Like the camera: the stop names its stream by the start's msg_num, and
+                // the other streams on the connection go on
+                if let Some(v) = self.videos.remove(&meta.msg_num) {
                     v.cancel();
                 }
                 self.reply(meta, 200, None).await
@@ -701,10 +703,38 @@ async fn replay(
     out: mpsc::Sender<Vec<u8>>,
 ) {
     let config = &shared.config;
+    // Looping like a camera that keeps streaming: each lap moves the arrival clock and the
+    // camera µs clock by the media span (the arrival span is shorter: a start-up burst),
+    // and audio is topped up to the video's length, so media never outruns wall time
+    let period = lap_period(&media);
+    let au_us = 1024 * 1_000_000 / 16_000u64;
+    let last_aac = media.iter().rev().find(|r| r.kind == Kind::Aac).cloned();
+    let mut audio_us = 0u64;
+    let start = tokio::time::Instant::now();
+    let first_us = media.first().map(|r| r.host_us).unwrap_or(0);
+    let mut lap = 0u64;
     loop {
-        let start = tokio::time::Instant::now();
-        let first_us = media.first().map(|r| r.host_us).unwrap_or(0);
+        let mut records: Vec<Record> = vec![];
+        if lap > 0 {
+            if let Some(a) = &last_aac {
+                while audio_us + au_us / 2 < lap * period {
+                    let mut pad = a.clone();
+                    pad.host_us = first_us + lap * period;
+                    records.push(pad);
+                    audio_us += au_us;
+                }
+            }
+        }
         for rec in media.iter() {
+            let mut rec = rec.clone();
+            rec.host_us += lap * period;
+            rec.cam_us = rec.cam_us.wrapping_add((lap * period) as u32);
+            if rec.kind == Kind::Aac {
+                audio_us += au_us;
+            }
+            records.push(rec);
+        }
+        for rec in records.iter() {
             if config.speed > 0.0 {
                 let at =
                     Duration::from_micros(((rec.host_us - first_us) as f64 / config.speed) as u64);
@@ -744,7 +774,25 @@ async fn replay(
             // Keep the stream open, like a camera with nothing new to send
             std::future::pending::<()>().await;
         }
+        lap += 1;
     }
+}
+
+/// The media span of a recording plus one frame interval, from the video's camera clock
+fn lap_period(media: &[Record]) -> u64 {
+    let cams: Vec<u32> = media
+        .iter()
+        .filter(|r| matches!(r.kind, Kind::Iframe | Kind::Pframe))
+        .map(|r| r.cam_us)
+        .collect();
+    if cams.len() < 2 {
+        return match (media.first(), media.last()) {
+            (Some(a), Some(b)) => (b.host_us - a.host_us).max(1),
+            _ => 1,
+        };
+    }
+    let span = cams[cams.len() - 1].wrapping_sub(cams[0]) as u64;
+    span + span / (cams.len() as u64 - 1)
 }
 
 #[cfg(test)]

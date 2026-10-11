@@ -19,8 +19,8 @@ use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
 use neolink_core::bc_protocol::BcCamera;
 
-#[cfg(feature = "gstreamer")]
-mod gst;
+#[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
+mod live;
 mod stream;
 pub(crate) use stream::*;
 

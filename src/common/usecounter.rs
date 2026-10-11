@@ -69,7 +69,7 @@ impl UseCounter {
         }
     }
 
-    #[cfg(feature = "gstreamer")]
+    #[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
     pub(crate) async fn create_activated(&self) -> Result<Permit> {
         self.create_activated_for("").await
     }
@@ -81,7 +81,7 @@ impl UseCounter {
         Ok(res)
     }
 
-    #[cfg(feature = "gstreamer")]
+    #[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
     #[allow(dead_code)]
     pub(crate) async fn create_deactivated(&self) -> Result<Permit> {
         Ok(Permit::new(self, ""))
@@ -120,7 +120,7 @@ pub(crate) struct Permit {
 }
 
 impl Permit {
-    #[cfg(feature = "gstreamer")]
+    #[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
     #[allow(dead_code)]
     pub(crate) fn subscribe(&self) -> Self {
         Self {
