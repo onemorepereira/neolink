@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 publish = false
 
 [dependencies]
+bytes = "1.6.0"
 log = "0.4.17"
 
 [dev-dependencies]
