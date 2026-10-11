@@ -1,5 +1,5 @@
 use crate::mqtt::Discoveries;
-#[cfg(feature = "gstreamer")]
+#[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
 use neolink_core::bc_protocol::StreamKind;
 use neolink_core::bc_protocol::{DiscoveryMethods, PrintFormat};
 use once_cell::sync::Lazy;
@@ -12,6 +12,10 @@ use validator::ValidationError;
 
 static RE_TLS_CLIENT_AUTH: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(none|request|require)$").unwrap());
+static RE_RTSP_BACKEND: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(gstreamer|native)$").unwrap());
+static RE_AUDIO: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(aac|none)$").unwrap());
+static RE_PARAMETER_SETS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(strip|passthrough|inject)$").unwrap());
 static RE_PAUSE_MODE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(black|still|test|none)$").unwrap());
 static RE_MAXENC_SRC: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^([nN]one|[Aa][Ee][Ss]|[Bb][Cc][Ee][Nn][Cc][Rr][Yy][Pp][Tt])$").unwrap()
@@ -53,6 +57,108 @@ pub(crate) struct Config {
     /// Port of the cached snapshot endpoint; unset means bind_port + 1, 0 disables it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) snapshot_port: Option<u16>,
+
+    /// `gstreamer` or `native`; unset: GStreamer when built in (SPEC §8)
+    #[validate(regex(
+        path = *RE_RTSP_BACKEND,
+        message = "rtsp_backend must be \"gstreamer\" or \"native\"",
+        code = "rtsp_backend"
+    ))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rtsp_backend: Option<String>,
+
+    /// Native backend: the schemes offered, in order (`digest`, `basic`)
+    #[validate(custom(function = "validate_rtsp_auth"))]
+    #[serde(default = "default_rtsp_auth")]
+    pub(crate) rtsp_auth: Vec<String>,
+
+    /// Whether MQTT may replace the config (SPEC R29)
+    #[serde(default = "default_true")]
+    pub(crate) mqtt_config_writes: bool,
+
+    /// Native backend: largest RTP packet
+    #[validate(range(
+        min = 576,
+        max = 9000,
+        message = "rtp_mtu must be 576-9000",
+        code = "rtp_mtu"
+    ))]
+    #[serde(default = "default_rtp_mtu")]
+    pub(crate) rtp_mtu: u16,
+
+    /// Native backend: connection limits (SPEC R24)
+    #[validate(nested)]
+    #[serde(default)]
+    pub(crate) limits: LimitsConfig,
+}
+
+/// Native RTSP server limits (SPEC R24)
+#[derive(Deserialize, Serialize, Validate, Clone, PartialEq, Debug)]
+pub(crate) struct LimitsConfig {
+    #[validate(range(min = 1, max = 4096))]
+    #[serde(default = "default_max_connections")]
+    pub(crate) max_connections: usize,
+    #[validate(range(min = 1, max = 4096))]
+    #[serde(default = "default_max_unauthenticated_per_ip")]
+    pub(crate) max_unauthenticated_per_ip: usize,
+    #[validate(range(min = 1, max = 300))]
+    #[serde(default = "default_first_request_timeout_s")]
+    pub(crate) first_request_timeout_s: u64,
+    #[validate(range(min = 5, max = 3600))]
+    #[serde(default = "default_idle_timeout_s")]
+    pub(crate) idle_timeout_s: u64,
+    #[validate(range(min = 1, max = 1000))]
+    #[serde(default = "default_requests_per_second")]
+    pub(crate) requests_per_second: u32,
+    #[validate(range(min = 1, max = 1000))]
+    #[serde(default = "default_failed_auth_per_minute")]
+    pub(crate) failed_auth_per_minute: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: default_max_connections(),
+            max_unauthenticated_per_ip: default_max_unauthenticated_per_ip(),
+            first_request_timeout_s: default_first_request_timeout_s(),
+            idle_timeout_s: default_idle_timeout_s(),
+            requests_per_second: default_requests_per_second(),
+            failed_auth_per_minute: default_failed_auth_per_minute(),
+        }
+    }
+}
+
+const fn default_max_connections() -> usize {
+    128
+}
+const fn default_max_unauthenticated_per_ip() -> usize {
+    64
+}
+const fn default_first_request_timeout_s() -> u64 {
+    10
+}
+const fn default_idle_timeout_s() -> u64 {
+    60
+}
+const fn default_requests_per_second() -> u32 {
+    20
+}
+const fn default_failed_auth_per_minute() -> usize {
+    10
+}
+const fn default_rtp_mtu() -> u16 {
+    1400
+}
+fn default_rtsp_auth() -> Vec<String> {
+    vec!["digest".into(), "basic".into()]
+}
+
+fn validate_rtsp_auth(v: &[String]) -> Result<(), ValidationError> {
+    if v.is_empty() || v.iter().any(|s| s != "digest" && s != "basic") {
+        return Err(ValidationError::new("rtsp_auth")
+            .with_message("rtsp_auth lists \"digest\" and/or \"basic\"".into()));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
@@ -105,7 +211,7 @@ pub(crate) enum StreamConfig {
 }
 
 impl StreamConfig {
-    #[cfg(feature = "gstreamer")]
+    #[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
     pub(crate) fn as_stream_kinds(&self) -> Vec<StreamKind> {
         match self {
             StreamConfig::All => {
@@ -244,6 +350,71 @@ pub(crate) struct CameraConfig {
     /// Longest time a motion event keeps the camera connected (SPEC P12)
     #[serde(default = "default_motion_hold_max_s")]
     pub(crate) motion_hold_max_s: u64,
+
+    /// Native backend: `aac` or `none`
+    #[validate(regex(path = *RE_AUDIO, message = "audio must be \"aac\" or \"none\"", code = "audio"))]
+    #[serde(default = "default_audio")]
+    pub(crate) audio: String,
+
+    /// Native backend: pacing latency; unset: automatic (1500 ms)
+    #[validate(range(
+        min = 0,
+        max = 3000,
+        message = "pacing_latency_ms must be 0-3000",
+        code = "pacing_latency_ms"
+    ))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pacing_latency_ms: Option<u64>,
+
+    /// Native backend: in-band VPS/SPS/PPS, `strip`, `passthrough` or `inject` (SPEC R10)
+    #[validate(regex(
+        path = *RE_PARAMETER_SETS,
+        message = "parameter_sets must be strip, passthrough or inject",
+        code = "parameter_sets"
+    ))]
+    #[serde(default = "default_parameter_sets")]
+    pub(crate) parameter_sets: String,
+
+    /// Native backend: bridge frames per second during an outage
+    #[validate(range(
+        min = 0.1,
+        max = 2.0,
+        message = "bridge_fps must be 0.1-2",
+        code = "bridge_fps"
+    ))]
+    #[serde(default = "default_bridge_fps")]
+    pub(crate) bridge_fps: f64,
+
+    /// Native backend: longest outage bridged before the session ends
+    #[validate(range(
+        min = 10,
+        max = 3600,
+        message = "bridge_max_s must be 10-3600",
+        code = "bridge_max_s"
+    ))]
+    #[serde(default = "default_bridge_max_s")]
+    pub(crate) bridge_max_s: u64,
+
+    /// Native backend: send RTCP sender reports
+    #[serde(default = "default_true")]
+    pub(crate) rtcp_sr: bool,
+
+    /// Native backend: keep the last IRAP on disk to show while the camera wakes
+    #[serde(default = "default_true")]
+    pub(crate) persist_irap: bool,
+}
+
+fn default_audio() -> String {
+    "aac".into()
+}
+fn default_parameter_sets() -> String {
+    "strip".into()
+}
+const fn default_bridge_fps() -> f64 {
+    0.2
+}
+const fn default_bridge_max_s() -> u64 {
+    120
 }
 
 impl CameraConfig {
@@ -643,6 +814,19 @@ const CONFIG_KEYS: &[&str] = &[
     "tls_client_auth",
     "users",
     "snapshot_port",
+    "rtsp_backend",
+    "rtsp_auth",
+    "mqtt_config_writes",
+    "rtp_mtu",
+    "limits",
+];
+const LIMITS_KEYS: &[&str] = &[
+    "max_connections",
+    "max_unauthenticated_per_ip",
+    "first_request_timeout_s",
+    "idle_timeout_s",
+    "requests_per_second",
+    "failed_auth_per_minute",
 ];
 const MQTT_SERVER_KEYS: &[&str] = &[
     "broker_addr",
@@ -696,6 +880,13 @@ const CAMERA_KEYS: &[&str] = &[
     "idle_grace_s",
     "snapshot_fresh",
     "motion_hold_max_s",
+    "audio",
+    "pacing_latency_ms",
+    "parameter_sets",
+    "bridge_fps",
+    "bridge_max_s",
+    "rtcp_sr",
+    "persist_irap",
 ];
 const USER_KEYS: &[&str] = &["name", "username", "pass", "password"];
 const CAMERA_MQTT_KEYS: &[&str] = &[
@@ -735,6 +926,9 @@ pub(crate) fn unknown_keys(text: &str) -> Vec<String> {
     check(&root, CONFIG_KEYS, "", &mut out);
     if let Some(toml::Value::Table(mqtt)) = root.get("mqtt") {
         check(mqtt, MQTT_SERVER_KEYS, "mqtt.", &mut out);
+    }
+    if let Some(toml::Value::Table(limits)) = root.get("limits") {
+        check(limits, LIMITS_KEYS, "limits.", &mut out);
     }
     if let Some(toml::Value::Array(users)) = root.get("users") {
         for (i, user) in users.iter().enumerate() {
@@ -789,6 +983,7 @@ mod key_tests {
         let field = regex::Regex::new(r"^\s*pub\(crate\) (\w+):").unwrap();
         let lists: &[(&str, &[&str])] = &[
             ("Config", CONFIG_KEYS),
+            ("LimitsConfig", LIMITS_KEYS),
             ("MqttServerConfig", MQTT_SERVER_KEYS),
             ("CameraConfig", CAMERA_KEYS),
             ("UserConfig", USER_KEYS),
@@ -799,7 +994,7 @@ mod key_tests {
         for (name, known) in lists {
             let start = src
                 .find(&format!("pub(crate) struct {name} {{"))
-                .unwrap_or_else(|| panic!("struct {name}"));
+                .unwrap_or_else(|| panic!("struct {}", name));
             let body = &src[start..start + src[start..].find("\n}").unwrap()];
             let mut keys = vec![];
             let mut attrs = String::new();

@@ -56,6 +56,8 @@ pub struct HubConfig {
     pub describe_wait: Duration,
     /// In-band VPS/SPS/PPS handling (SPEC R10)
     pub parameter_sets: ParameterSets,
+    /// Keep the last IRAP in the cache, to show while the camera wakes
+    pub persist_irap: bool,
 }
 
 /// In-band parameter sets (SPEC R10, DESIGN §5.1). The SDP always carries them.
@@ -87,6 +89,7 @@ impl HubConfig {
             skew_estimate_us: 0,
             describe_wait: Duration::from_secs(2),
             parameter_sets: ParameterSets::default(),
+            persist_irap: true,
         }
     }
 }
@@ -130,6 +133,8 @@ enum Cmd {
     Pause(u64),
     Unsubscribe(u64),
     Stats(oneshot::Sender<HubStats>),
+    /// Stop the source, close every session and end the Hub (its mount went away)
+    Shutdown,
 }
 
 /// Talk to a Hub
@@ -167,6 +172,11 @@ impl HubHandle {
 
     pub async fn unsubscribe(&self, session: u64) {
         let _ = self.tx.send(Cmd::Unsubscribe(session)).await;
+    }
+
+    /// End the Hub: the source stops and every session is closed (BYE)
+    pub async fn shutdown(&self) {
+        let _ = self.tx.send(Cmd::Shutdown).await;
     }
 
     pub async fn stats(&self) -> Option<HubStats> {
@@ -368,7 +378,7 @@ impl Hub {
     fn new(cfg: HubConfig, source: Arc<dyn StreamSource>) -> Self {
         let cached = cfg.cache.as_ref().and_then(|c| c.load_desc());
         let cached_irap = match (&cfg.cache, &cached) {
-            (Some(c), Some(d)) => c.load_irap(d),
+            (Some(c), Some(d)) if cfg.persist_irap => c.load_irap(d),
             _ => None,
         };
         let rate = cached
@@ -443,8 +453,8 @@ impl Hub {
             let wake = self.next_wake();
             tokio::select! {
                 cmd = cmds.recv() => match cmd {
+                    Some(Cmd::Shutdown) | None => break,
                     Some(cmd) => self.command(cmd),
-                    None => break,
                 },
                 started = recv_start(&mut self.starting) => self.started(started),
                 unit = recv_opt(&mut self.source_rx) => match unit {
@@ -461,9 +471,12 @@ impl Hub {
         for s in self.sessions.values() {
             s.closed.cancel();
         }
-        if let (Some(cache), Some(desc), Some(irap)) =
-            (&self.cfg.cache, self.learner.current(), &self.cached_irap)
-        {
+        if let (true, Some(cache), Some(desc), Some(irap)) = (
+            self.cfg.persist_irap,
+            &self.cfg.cache,
+            self.learner.current(),
+            &self.cached_irap,
+        ) {
             let _ = cache.save_irap(desc, irap);
         }
     }
@@ -593,6 +606,13 @@ impl Hub {
                 }
                 self.linger_until = None;
                 match self.running_mode() {
+                    // The source wants demand semantics (e.g. pause.on_motion): restart it
+                    // as Demand; the camera is awake, so this is no extra wake
+                    Some(StartMode::Learn) if self.source.restart_for_demand() => {
+                        self.stop_source();
+                        self.learn_deadline = None;
+                        self.start_source(StartMode::Demand);
+                    }
                     // A learning start simply becomes the demand start: no second wake
                     Some(StartMode::Learn) => {
                         if self.source_mode == Some(StartMode::Learn) {
@@ -616,6 +636,7 @@ impl Hub {
                     s.closed.cancel();
                 }
             }
+            Cmd::Shutdown => {} // handled by the loop
             Cmd::Stats(reply) => {
                 let now = self.now_us();
                 let mut st = self.stats.clone();
@@ -909,6 +930,9 @@ impl Hub {
     }
 
     fn save_irap(&self, nals: &[Bytes]) {
+        if !self.cfg.persist_irap {
+            return;
+        }
         if let (Some(c), Some(d)) = (self.cfg.cache.clone(), self.learner.current().cloned()) {
             let nals = nals.to_vec();
             tokio::task::spawn_blocking(move || {
@@ -1741,6 +1765,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A source whose demand starts differ (pause.on_motion) is restarted as Demand when a
+    /// session plays during its learning start
+    #[tokio::test(start_paused = true)]
+    async fn test_learn_restarts_as_demand_when_the_source_asks() {
+        let (h, source) = hub("plain_h265.bcm", true);
+        source.restart_for_demand.store(true, Ordering::SeqCst);
+        h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        let frames = drain(&mut sub, 5).await;
+        assert!(frames.iter().any(|f| f.track == Track::Video));
+        assert_eq!(
+            source.starts.lock().unwrap().as_slice(),
+            &[StartMode::Learn, StartMode::Demand]
+        );
+        assert_eq!(
+            source.running.load(Ordering::SeqCst),
+            1,
+            "the learning start ended"
+        );
     }
 
     /// A spinning Hub never lets paused time advance, so these tests would hang: fail

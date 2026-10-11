@@ -356,7 +356,10 @@ async fn test_on_motion_stream_drop_stops_tasks() {
         .metrics()
         .num_alive_tasks();
     let rx = instance
-        .stream_while_live(neolink_core::bc_protocol::StreamKind::Main)
+        .stream_while_live(
+            neolink_core::bc_protocol::StreamKind::Main,
+            Some(tokio::time::Duration::from_secs(5)),
+        )
         .await
         .unwrap();
     wait_stats(&cam, 10, |s| s.video_starts == 1).await;

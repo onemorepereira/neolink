@@ -48,6 +48,10 @@ mod ptz;
 mod reboot;
 #[cfg(feature = "gstreamer")]
 mod rtsp;
+#[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
+mod rtsp_cmd;
+#[cfg(feature = "native-rtsp")]
+mod rtsp_native;
 mod services;
 mod snapshot;
 mod statusled;
@@ -93,15 +97,15 @@ async fn main() -> Result<()> {
     let cmd = opt.cmd;
     let run = async {
         match cmd {
-            #[cfg(feature = "gstreamer")]
+            #[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
             None => {
                 warn!(
                     "Deprecated command line option. Please use: `neolink rtsp --config={:?}`",
                     conf_path
                 );
-                rtsp::main(rtsp::Opt {}, neo_reactor.clone()).await?;
+                rtsp_cmd::main(Default::default(), neo_reactor.clone()).await?;
             }
-            #[cfg(not(feature = "gstreamer"))]
+            #[cfg(not(any(feature = "gstreamer", feature = "native-rtsp")))]
             None => {
                 // When gstreamer is disabled the default command is MQTT
                 warn!(
@@ -110,9 +114,9 @@ async fn main() -> Result<()> {
                 );
                 mqtt::main(mqtt::Opt {}, neo_reactor.clone()).await?;
             }
-            #[cfg(feature = "gstreamer")]
+            #[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
             Some(Command::Rtsp(opts)) => {
-                rtsp::main(opts, neo_reactor.clone()).await?;
+                rtsp_cmd::main(opts, neo_reactor.clone()).await?;
             }
             Some(Command::StatusLight(opts)) => {
                 statusled::main(opts, neo_reactor.clone()).await?;
@@ -133,11 +137,11 @@ async fn main() -> Result<()> {
             Some(Command::Mqtt(opts)) => {
                 mqtt::main(opts, neo_reactor.clone()).await?;
             }
-            #[cfg(feature = "gstreamer")]
+            #[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
             Some(Command::MqttRtsp(opts)) => {
                 tokio::select! {
                     v = mqtt::main(opts, neo_reactor.clone()) => v,
-                    v = rtsp::main(rtsp::Opt {}, neo_reactor.clone()) => v,
+                    v = rtsp_cmd::main(Default::default(), neo_reactor.clone()) => v,
                 }?;
             }
             #[cfg(feature = "gstreamer")]

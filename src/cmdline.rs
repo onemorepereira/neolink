@@ -17,8 +17,8 @@ pub struct Opt {
 
 #[derive(Parser, Debug)]
 pub enum Command {
-    #[cfg(feature = "gstreamer")]
-    Rtsp(super::rtsp::Opt),
+    #[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
+    Rtsp(super::rtsp_cmd::Opt),
     StatusLight(super::statusled::Opt),
     Reboot(super::reboot::Opt),
     Pir(super::pir::Opt),
@@ -26,7 +26,7 @@ pub enum Command {
     #[cfg(feature = "gstreamer")]
     Talk(super::talk::Opt),
     Mqtt(super::mqtt::Opt),
-    #[cfg(feature = "gstreamer")]
+    #[cfg(any(feature = "gstreamer", feature = "native-rtsp"))]
     MqttRtsp(super::mqtt::Opt),
     #[cfg(feature = "gstreamer")]
     Image(super::image::Opt),

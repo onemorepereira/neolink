@@ -55,6 +55,13 @@ pub trait StreamSource: Send + Sync + 'static {
     fn start(&self, mode: StartMode, cancel: CancellationToken) -> BoxFuture<'static, StartResult>;
     /// Watched; changes apply live
     fn availability(&self) -> watch::Receiver<Availability>;
+    /// Whether a running `Learn` start must be restarted as `Demand` when a session plays,
+    /// rather than simply continue: true when demand starts behave differently (neolink's
+    /// `pause.on_motion`, which a learning start ignores). The camera is awake already, so
+    /// the restart costs no wake.
+    fn restart_for_demand(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -124,6 +131,8 @@ pub struct FixtureSource {
     pub stalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Simulated wake time: each start takes this long, in ms, before media can flow
     pub start_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// What `restart_for_demand` answers
+    pub restart_for_demand: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FixtureSource {
@@ -143,6 +152,7 @@ impl FixtureSource {
             looping: Default::default(),
             stalled: Default::default(),
             start_delay_ms: Default::default(),
+            restart_for_demand: Default::default(),
         }
     }
 }
@@ -256,6 +266,10 @@ impl StreamSource for FixtureSource {
 
     fn availability(&self) -> watch::Receiver<Availability> {
         self.availability.subscribe()
+    }
+
+    fn restart_for_demand(&self) -> bool {
+        self.restart_for_demand.load(SeqCst)
     }
 }
 
