@@ -1,0 +1,4 @@
+# The golden caught GStreamer's back-to-back PLAY 503 (see tests/e2e/golden-fake.sh); native plays
+^msg 10 \(< RTSP/1\.0 503 Service Unavailable\): 
+media flow: \["conn 1 closed:"\] vs \["conn 1 closed: < \$0 x10\+, < \$1 x1, < \$2 x10\+, < \$3 x1"\]$
+interleaved only in second: < \$[0-3] (rtp|rtcp) pt=(96|200)$

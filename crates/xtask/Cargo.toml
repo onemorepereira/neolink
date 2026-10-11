@@ -11,7 +11,9 @@ publish = false
 anyhow = "1.0.70"
 clap = { version = "4.2.2", features = ["derive"] }
 neolink_core = { path = "../core", features = ["test-util"] }
+neolink_rtsp = { path = "../rtsp" }
+tokio-util = "0.7.7"
 serde_json = "1.0.96"
-tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
 regex = "1.7.3"
 sha2 = "0.10.8"

@@ -1,0 +1,3 @@
+# The Argus has no extern stream: GStreamer answers 400 for its mount, native has no such mount (404)
+status: 400 vs 404$
+reason: Bad Request vs Not Found$

@@ -1,0 +1,5 @@
+# A2b: native answers 461 to UDP (dropped from the diff), ffmpeg retries over TCP
+transport: RTP/AVP/UDP;client_port;unicast vs RTP/AVP/TCP;interleaved=[02]-[13];unicast$
+transport: RTP/AVP;client_port;mode=PLAY;server_port;ssrc;unicast vs RTP/AVP/TCP;interleaved=[02]-[13];mode=PLAY;ssrc;unicast$
+media flow: \["conn 1 closed:"\] vs \["conn 1 closed: < \$0 x10\+, < \$1 x1, < \$2 x10\+, < \$3 x1"\]$
+interleaved only in second: < \$[0-3] (rtp|rtcp) pt=(96|200)$

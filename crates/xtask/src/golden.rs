@@ -353,6 +353,27 @@ pub fn parse(text: &str) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// Remove each response with `status` and the request it answers
+pub fn drop_status(entries: Vec<Entry>, status: u16) -> Vec<Entry> {
+    let prefix = format!("RTSP/1.0 {status} ");
+    let mut out: Vec<Entry> = vec![];
+    for e in entries {
+        if let Entry::Msg(m) = &e {
+            if m.is_response() && m.start.starts_with(&prefix) {
+                if let Some(i) = out
+                    .iter()
+                    .rposition(|p| matches!(p, Entry::Msg(r) if !r.is_response()))
+                {
+                    out.remove(i);
+                }
+                continue;
+            }
+        }
+        out.push(e);
+    }
+    out
+}
+
 pub fn render(entries: &[Entry]) -> String {
     let mut out = String::new();
     let mut conn = 0;
@@ -967,6 +988,21 @@ mod tests {
         let without = format!("{}> TEARDOWN rtsp://h/argus/main/ RTSP/1.0\n>\n", A);
         let d = structural_diff(&parse(&with).unwrap(), &parse(&without).unwrap());
         assert!(d.is_empty(), "{:?}", d);
+    }
+
+    #[test]
+    fn test_drop_status() {
+        let t = "# conn 1\n> SETUP rtsp://h/a/stream=0 RTSP/1.0\n> CSeq: 3\n>\n< RTSP/1.0 461 Unsupported Transport\n< CSeq: 3\n<\n> SETUP rtsp://h/a/stream=0 RTSP/1.0\n> CSeq: 4\n>\n< RTSP/1.0 200 OK\n< CSeq: 4\n<\n";
+        let e = drop_status(parse(t).unwrap(), 461);
+        let msgs: Vec<&Message> = e
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Msg(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].header("CSeq"), Some("4"));
     }
 
     #[test]

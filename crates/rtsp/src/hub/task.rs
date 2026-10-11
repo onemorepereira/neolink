@@ -15,7 +15,7 @@ use super::desc::{DescCache, DescEvent, DescLearner, IrapWritePolicy, StreamDesc
 use super::pacer::{Paced, Pacer};
 use super::wire::{eos_nal, Bridge, BridgeOut, SessionGuard, SourceState, Track, WireClock};
 use crate::codec::aac::{adts_access_units, silent_au, AdtsHeader};
-use crate::codec::annexb::{is_irap, split_nals, NalFilter, VideoCodec};
+use crate::codec::annexb::{is_irap, param_kind, split_nals, NalFilter, VideoCodec};
 use crate::rtp::packetize::{self, RtpChunk};
 use crate::source::{SourceUnit, StartMode, StartResult, StreamSource};
 use bytes::Bytes;
@@ -54,6 +54,21 @@ pub struct HubConfig {
     pub skew_estimate_us: i64,
     /// How long DESCRIBE waits for a learning start
     pub describe_wait: Duration,
+    /// In-band VPS/SPS/PPS handling (SPEC R10)
+    pub parameter_sets: ParameterSets,
+}
+
+/// In-band parameter sets (SPEC R10, DESIGN §5.1). The SDP always carries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParameterSets {
+    /// Remove in-band copies; clients use the SDP (provisional default, A4b)
+    #[default]
+    Strip,
+    /// Forward the camera's copies unchanged
+    Passthrough,
+    /// VPS/SPS/PPS from the current desc as separate NALs before every IRAP, replacing
+    /// the camera's copies
+    Inject,
 }
 
 impl HubConfig {
@@ -71,6 +86,7 @@ impl HubConfig {
             cache: None,
             skew_estimate_us: 0,
             describe_wait: Duration::from_secs(2),
+            parameter_sets: ParameterSets::default(),
         }
     }
 }
@@ -552,13 +568,13 @@ impl Hub {
                 let restamp = match (&self.cached_irap, self.codec, self.sessions.get(&id)) {
                     (Some(nals), Some(codec), Some(s)) if !s.playing => {
                         // Late joiner: the last released IRAP, at the last wire time, plus
-                        // EOS; live video then flows from the next IRAP (DESIGN §4.6)
+                        // EOS where needed; live video then flows from the next IRAP (DESIGN §4.6)
                         let wire = self
                             .wire
                             .last_out_wire()
                             .unwrap_or_else(|| self.wire.virtual_now(now));
                         let mut nals = nals.clone();
-                        nals.push(eos_nal(codec));
+                        nals.extend(eos_nal(codec, &nals));
                         Some(self.video_frame(codec, &nals, true, wire))
                     }
                     _ => None,
@@ -759,6 +775,38 @@ impl Hub {
         self.bridge.reset();
     }
 
+    /// After learning (which needs the in-band copies): strip, keep or inject
+    fn apply_parameter_sets(&self, codec: VideoCodec, irap: bool, nals: Vec<Bytes>) -> Vec<Bytes> {
+        let is_param = |n: &Bytes| param_kind(codec, n).is_some();
+        match self.cfg.parameter_sets {
+            ParameterSets::Passthrough => nals,
+            ParameterSets::Strip => nals.into_iter().filter(|n| !is_param(n)).collect(),
+            ParameterSets::Inject => {
+                let current = self
+                    .learner
+                    .current()
+                    .filter(|d| VideoCodec::from(d.video.codec) == codec);
+                match current {
+                    Some(d) if irap => {
+                        let p = &d.video.params;
+                        let mut out: Vec<Bytes> = vec![];
+                        if let Some(vps) = &p.vps {
+                            out.push(Bytes::copy_from_slice(vps));
+                        }
+                        out.push(Bytes::copy_from_slice(&p.sps));
+                        out.push(Bytes::copy_from_slice(&p.pps));
+                        out.extend(nals.into_iter().filter(|n| !is_param(n)));
+                        out
+                    }
+                    // Not an IRAP: in-band copies elsewhere are dropped; before a desc,
+                    // the camera's own copies are all there is
+                    Some(_) => nals.into_iter().filter(|n| !is_param(n)).collect(),
+                    None => nals,
+                }
+            }
+        }
+    }
+
     fn ingest(&mut self, unit: SourceUnit) {
         let now = self.now_us();
         match unit {
@@ -788,6 +836,10 @@ impl Hub {
                 }
                 if let Some(ev) = self.learner.video(codec, &nals, irap, t.media_us, now) {
                     self.desc_event(ev);
+                }
+                let nals = self.apply_parameter_sets(codec, irap, nals);
+                if nals.is_empty() {
+                    return;
                 }
                 self.pacer.push(
                     now,
@@ -1008,7 +1060,7 @@ impl Hub {
                     match out {
                         BridgeOut::Video { wire_us } => {
                             if let Some(mut nals) = self.cached_irap.clone() {
-                                nals.push(eos_nal(codec));
+                                nals.extend(eos_nal(codec, &nals));
                                 let f = self.video_frame(codec, &nals, true, wire_us);
                                 self.fan_out(f);
                             }
@@ -1343,6 +1395,57 @@ mod tests {
         );
     }
 
+    /// A21: a DESCRIBE every 10 s for 10 min against a cached battery mount starts the
+    /// camera 0 times
+    #[tokio::test(start_paused = true)]
+    async fn test_a21_health_probe_on_cached_mount() {
+        let dir = std::env::temp_dir().join(format!(
+            "neolink-a21-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = || Some(crate::hub::desc::DescCache::new(&dir, "argus", "main"));
+        // Learn once and persist the desc
+        {
+            let source = Arc::new(FixtureSource::new(
+                fixture("plain_h265.bcm"),
+                1.0,
+                Some(true),
+            ));
+            let mut cfg = HubConfig::new("learn");
+            cfg.cache = cache();
+            let h = spawn(cfg, source);
+            h.describe().await.unwrap();
+            // The cache write runs on a blocking thread, outside virtual time
+            for _ in 0..200 {
+                if cache().unwrap().load_desc().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                tokio::task::yield_now().await;
+            }
+            assert!(cache().unwrap().load_desc().is_some(), "desc persisted");
+        }
+        let source = Arc::new(FixtureSource::new(
+            fixture("plain_h265.bcm"),
+            1.0,
+            Some(true),
+        ));
+        let mut cfg = HubConfig::new("probe");
+        cfg.cache = cache();
+        let h = spawn(cfg, source.clone());
+        for _ in 0..60 {
+            let d = h.describe().await.unwrap();
+            assert_eq!(d.video.codec, crate::hub::desc::VideoCodecSer::H265);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+        assert_eq!(source.starts.lock().unwrap().len(), 0, "camera starts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A17 (clock part): the u32 wrap and a counter reset give a monotonic wire clock
     /// with no jump over 1 s between consecutive video frames
     #[tokio::test(start_paused = true)]
@@ -1583,6 +1686,61 @@ mod tests {
         drain(&mut sub, 20).await;
         let n = starts.load(Ordering::SeqCst);
         assert!(n <= 8, "{n} starts in 20 s");
+    }
+
+    /// R10: in-band parameter sets per `parameter_sets`
+    #[tokio::test(start_paused = true)]
+    async fn test_parameter_sets_modes() {
+        for mode in [
+            ParameterSets::Strip,
+            ParameterSets::Passthrough,
+            ParameterSets::Inject,
+        ] {
+            let source = Arc::new(FixtureSource::new(
+                fixture("plain_h265.bcm"),
+                1.0,
+                Some(false),
+            ));
+            let mut cfg = HubConfig::new("test");
+            cfg.battery = false;
+            cfg.parameter_sets = mode;
+            let h = spawn(cfg, source);
+            h.describe().await.unwrap();
+            let mut sub = h.subscribe(1).await.unwrap();
+            h.play(1).await;
+            let frames = drain(&mut sub, 8).await;
+            // (IRAPs, IRAPs led by VPS, SPS, PPS as single NALs, param NALs elsewhere)
+            let (mut iraps, mut led, mut elsewhere) = (0, 0, 0);
+            for f in frames.iter().filter(|f| f.track == Track::Video) {
+                let types: Vec<u8> = f
+                    .rtp
+                    .iter()
+                    .filter(|c| c.prefix_len == 0)
+                    .map(|c| (c.body[0] >> 1) & 0x3f)
+                    .collect();
+                let params = types.iter().filter(|t| (32..=34).contains(*t)).count();
+                if f.irap {
+                    iraps += 1;
+                    if types.starts_with(&[32, 33, 34]) && params == 3 {
+                        led += 1;
+                    }
+                } else {
+                    elsewhere += params;
+                }
+                if mode == ParameterSets::Strip {
+                    assert_eq!(params, 0, "{mode:?}: in-band parameter set");
+                }
+            }
+            assert!(iraps >= 2, "{mode:?}: {iraps} IRAPs");
+            assert_eq!(elsewhere, 0, "{mode:?}");
+            match mode {
+                ParameterSets::Strip => assert_eq!(led, 0),
+                // The fixture, like the Argus, sends them with every IRAP
+                ParameterSets::Passthrough | ParameterSets::Inject => {
+                    assert_eq!(led, iraps, "{mode:?}")
+                }
+            }
+        }
     }
 
     /// A spinning Hub never lets paused time advance, so these tests would hang: fail
