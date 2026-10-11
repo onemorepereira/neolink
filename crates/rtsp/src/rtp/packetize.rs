@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn test_body_is_zero_copy() {
         let n = nal(VideoCodec::H264, 3000);
-        let c = video(VideoCodec::H264, &[n.clone()], 1400);
+        let c = video(VideoCodec::H264, std::slice::from_ref(&n), 1400);
         let base = n.as_ptr() as usize;
         let p = c[1].body.as_ptr() as usize;
         assert!(

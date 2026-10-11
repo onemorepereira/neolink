@@ -3,4 +3,5 @@
 pub mod clock;
 pub mod desc;
 pub mod pacer;
+pub mod task;
 pub mod wire;

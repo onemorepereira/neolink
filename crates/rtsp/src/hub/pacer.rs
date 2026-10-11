@@ -75,7 +75,10 @@ impl<T: Paced> Pacer<T> {
     }
 
     fn due(&self, media_us: u64) -> u64 {
-        let (wall, media0) = self.anchor.expect("anchored");
+        // Not anchored (just restarted with frames queued): release them now
+        let Some((wall, media0)) = self.anchor else {
+            return 0;
+        };
         (wall + (media_us as i64 - media0 as i64) + self.latency_us as i64).max(0) as u64
     }
 
@@ -148,6 +151,12 @@ impl<T: Paced> Pacer<T> {
         } else {
             self.excess_since = None;
         }
+    }
+
+    /// Drop everything queued and forget the anchor (the source stopped)
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.restart();
     }
 
     /// When the next frame is due, if any

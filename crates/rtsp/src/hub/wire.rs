@@ -68,7 +68,11 @@ impl WireClock {
     /// Re-latch so that `media_us` is on the wire at `virtual_now` (resume after a bridge,
     /// or a MediaClock discontinuity)
     pub fn relatch(&mut self, media_us: u64, now_wall: u64) {
-        let v = self.virtual_now(now_wall);
+        // Strictly after anything already sent, even when no wall time has passed
+        let v = match self.last_out {
+            Some((wire, _)) => self.virtual_now(now_wall).max(wire + 1),
+            None => self.virtual_now(now_wall),
+        };
         self.offset = Some(v as i64 - media_us as i64);
         self.stats.relatches += 1;
     }
@@ -94,7 +98,7 @@ impl WireClock {
         let wire = match self.last_track[i] {
             Some(last) if wire <= last => {
                 self.stats.guard_engaged += 1;
-                log::debug!("wire clock guard engaged on {track:?}: {wire} <= {last}");
+                log::warn!("wire clock guard engaged on {track:?}: {wire} <= {last}");
                 last + 1
             }
             _ => wire,

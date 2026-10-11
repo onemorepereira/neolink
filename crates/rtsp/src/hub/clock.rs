@@ -10,7 +10,9 @@
 //! video frame, as the median over a sliding 20 s window of
 //! `err = audio position − video media time`. When `|median| > 80 ms` it is corrected by
 //! at most one AU per second (drop an AU when audio is ahead, skip 1024 samples when
-//! behind) until `|median| < 20 ms`. If the first 2 s show `|median| > 500 ms`, audio is
+//! behind) until `|median| < 20 ms`, or until it is within half an AU (corrections move in
+//! whole AUs, so a 32 ms offset at 16 kHz can't get closer). Corrections need 2 s of
+//! samples. If the first 2 s show `|median| > 500 ms`, audio is
 //! re-anchored once, before any session received audio.
 
 use std::collections::VecDeque;
@@ -172,10 +174,14 @@ impl MediaClock {
             }
         }
         let mut skip = false;
-        if let Some(m) = self.median_err() {
+        let au_us = (1024 * 1_000_000 / self.sample_rate as u64) as i64;
+        // Enough samples for a median (2 s of video), else no correction yet
+        let median = (self.errs.len() >= 30).then(|| self.median_err()).flatten();
+        if let Some(m) = median {
             if m.abs() > CORRECT_ABOVE_US {
                 self.correcting = true;
-            } else if m.abs() < CORRECT_UNTIL_US {
+            } else if m.abs() < CORRECT_UNTIL_US || m.abs() <= au_us / 2 {
+                // Corrections move in whole AUs: one more would not bring it closer
                 self.correcting = false;
             }
             let due = self
@@ -184,8 +190,11 @@ impl MediaClock {
             if self.correcting && due {
                 self.last_correction_host = Some(host_us);
                 self.drift_corrections += 1;
+                log::debug!(
+                    "audio drift correction: median {m} µs over {} samples",
+                    self.errs.len()
+                );
                 // The correction shifts every sample in the window by one AU
-                let au_us = (1024 * 1_000_000 / self.sample_rate as u64) as i64;
                 if m > 0 {
                     for e in self.errs.iter_mut() {
                         e.1 -= au_us;
@@ -304,7 +313,7 @@ mod tests {
         let mut c = MediaClock::new(16000, 0);
         let out = run(&mut c, 300, 2000, 0, true);
         assert!(c.drift_corrections > 0);
-        assert!(out.iter().any(|a| *a == AudioTime::Drop));
+        assert!(out.contains(&AudioTime::Drop));
         // At the end the error is back within the correction band
         let m = c.median_err().unwrap();
         assert!(m.abs() <= 100_000, "median error {} µs", m);
@@ -324,5 +333,32 @@ mod tests {
     fn test_audio_before_video_is_dropped() {
         let mut c = MediaClock::new(16000, 0);
         assert_eq!(c.audio(0, false), AudioTime::Drop);
+    }
+
+    #[test]
+    fn test_fixture_needs_no_corrections() {
+        let path = format!(
+            "{}/../../fixtures/synth/plain_h265.bcm",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let units = crate::source::parse_bcm(&std::fs::read(path).unwrap());
+        let mut c = MediaClock::new(16000, 0);
+        let mut errs = vec![];
+        for u in units {
+            match u.unit {
+                crate::source::SourceUnit::Video { cam_us, .. } => {
+                    c.video(cam_us, false, u.at_us);
+                    if let Some(m) = c.median_err() {
+                        errs.push(m);
+                    }
+                }
+                crate::source::SourceUnit::Aac { .. } => {
+                    c.audio(u.at_us, true);
+                }
+                _ => {}
+            }
+        }
+        let (min, max) = (errs.iter().min().unwrap(), errs.iter().max().unwrap());
+        assert_eq!(c.drift_corrections, 0, "median err range {min}..{max} µs");
     }
 }
