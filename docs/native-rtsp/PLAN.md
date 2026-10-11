@@ -272,6 +272,58 @@ session leaked; motion `Start` survived a disconnect and could hold a permit.
 - Fuzz smoke run passes.
 - Red-team review, including a security pass on auth and limits.
 
+**Status (2026-10-11).** Done on `feature/native-rtsp-p3`. Gate 3 evidence, on fixtures in the
+dev container (the same commands as CI):
+- **Client image** (3.9): `tests/e2e/clients/Containerfile`. It contains:
+  - go2rtc v1.9.14, sha256-pinned;
+  - VLC 3.0.24 from deb-multimedia (Debian's VLC has no live555);
+  - the pinned ffmpeg.
+- **retina** runs as `crates/rtsp-it` with its own lockfile, outside the workspace (retina 0.4.21
+  needs Rust 1.88).
+- **Clients** (`tests/e2e/clients.sh`):
+  - A1: main and sub exact, 15.000 fps, AAC present, the first frame decodes under strip.
+  - A2: 120 s each, 1802 video and 1875 audio frames, 0 decode errors, no `RTP: missed`.
+  - A2b: UDP gets 461, then TCP.
+  - A4: JPEGs.
+  - A5: 300 s, 4469 displayed, 0 lost, 0 too late.
+  - A10: 21 of 21 (ffmpeg, go2rtc, VLC × 7 rows).
+- **A4b** decides `parameter_sets = strip`. Passthrough and inject fail in go2rtc (an ffmpeg AP of
+  the parameter sets), and fail the same way without neolink in the chain.
+- **A6:** byte-identical over Basic and Digest (retina).
+- **A7:** staggered joins, one start per kind, strip and inject.
+- **A8:** 100 cycles; the camera stops within 5 s; tasks return to baseline.
+- **A9:** a stuck client is dropped and its slot freed; the other client's p99 deviation is
+  < 50 ms.
+- **A11:** a 60 s outage.
+- **A16:** |A−V| worst 35 / 58 / 74 ms at 5 s / 60 s / 15 min, with no drift; start offset
+  2–48 ms (GStreamer: 1.9 s).
+- **A17** (retina) and **A18**.
+- **A19:** 28 of 28 golden cases, only the SPEC §5 deltas (`native-deltas.txt`).
+- **A20:** security; plus credentials-in-logs at trace level.
+- **A21:** 0 starts over 60 probes.
+- **A22:** the SR part, including both tracks on one wall clock.
+- **N1** (simulated 3 s wake): first video 3 ms (the persisted IRAP), first live frame 3.005 s;
+  while streaming, 2 ms and 1.0 s (the next IRAP).
+- **Fuzz:** rtsp_msg, rtsp_headers, annexb, adts and sps, 60 s each, clean. MSRV check passes.
+- **Red-team:**
+  - The correctness pass found 7 issues plus 2 weak tests, all fixed.
+  - The security pass found 10, all fixed. Among them:
+    - unauthenticated lifetime and a global cap;
+    - failed-auth pacing per IP;
+    - Digest uri binding and salted nonces;
+    - control characters rejected;
+    - no mount enumeration;
+    - strict channel pairs.
+  - A re-review of the Phase 2 fixes found two Hub spins (fixed before the Phase 2 merge).
+  - The long A16 run found two defects, both fixed:
+    - looped-fixture timing;
+    - the 2-byte H.265 EOS, now sent only after CRA/BLA.
+- **Deferred:**
+  - the writer does not interleave control or audio between the 64 KiB chunks of one frame;
+  - Digest without qop can be replayed by the same IP for the same mount within the nonce's
+    5 minutes (the protocol's limit; live555 needs it);
+  - the go2rtc AP limitation goes to the release notes.
+
 ## Phase 4: neolink integration (6–9 d; 3–4 hardware sessions)
 
 | # | Task | Design ref |

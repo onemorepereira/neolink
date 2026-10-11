@@ -68,3 +68,26 @@ jobs:
         run: |
           cargo check --locked --all-targets -p neolink_core -p neolink_rtsp -p xtask -p neolink_decoder -p mailnoti
           cargo check --locked --bin neolink --no-default-features
+
+  clients:
+    name: Client matrix (A1, A2, A2b, A4, A4b, A5, A10)
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned ffmpeg
+        run: |
+          mkdir -p ~/ffmpeg
+          curl -sSL -o /tmp/ffmpeg.tar.xz "$FFMPEG_URL"
+          echo "$FFMPEG_SHA256  /tmp/ffmpeg.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/ffmpeg.tar.xz -C ~/ffmpeg --strip-components=1
+      - name: Build the dev and client images
+        run: |
+          podman build -t neolink-dev -f tests/e2e/dev/Containerfile tests/e2e/dev
+          podman build -t neolink-clients -f tests/e2e/clients/Containerfile tests/e2e/clients
+      - name: Fixtures, xtask and the client matrix
+        run: |
+          podman run --rm --network host -v "$PWD:/src:z" -v "$HOME/ffmpeg:/ffmpeg:ro,z" \
+            -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -e PATH=/usr/local/cargo/bin:/usr/bin:/bin:/ffmpeg/bin \
+            -e A5_SECS=300 -w /src neolink-clients sh -c \
+            'cargo xtask mkfixture --standard --out fixtures/synth && cargo build --release -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh'
