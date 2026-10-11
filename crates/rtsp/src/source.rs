@@ -6,6 +6,7 @@
 use crate::codec::annexb::VideoCodec;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use std::sync::atomic::Ordering::SeqCst;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -113,6 +114,10 @@ pub struct FixtureSource {
     pub starts: std::sync::Arc<std::sync::Mutex<Vec<StartMode>>>,
     /// Sources currently running
     pub running: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Fail this many of the next starts
+    pub fail_starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Close the stream at the end of the fixture instead of holding it open
+    pub end_at_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FixtureSource {
@@ -127,6 +132,8 @@ impl FixtureSource {
             .0,
             starts: Default::default(),
             running: Default::default(),
+            fail_starts: Default::default(),
+            end_at_eof: Default::default(),
         }
     }
 }
@@ -137,7 +144,22 @@ impl StreamSource for FixtureSource {
         let units = self.units.clone();
         let speed = self.speed;
         let running = self.running.clone();
+        let mut fail = false;
+        let mut n = self.fail_starts.load(SeqCst);
+        while n > 0 {
+            match self.fail_starts.compare_exchange(n, n - 1, SeqCst, SeqCst) {
+                Ok(_) => {
+                    fail = true;
+                    break;
+                }
+                Err(v) => n = v,
+            }
+        }
+        let end_at_eof = self.end_at_eof.load(SeqCst);
         Box::pin(async move {
+            if fail {
+                return Err("fixture: start failed".to_string());
+            }
             let (tx, rx) = mpsc::channel(256);
             running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::spawn(async move {
@@ -156,6 +178,9 @@ impl StreamSource for FixtureSource {
                     }
                 }
                 // Hold the stream open until cancelled, like a camera with nothing new
+                if end_at_eof {
+                    drop(tx);
+                }
                 cancel.cancelled().await;
                 running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             });

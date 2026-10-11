@@ -235,6 +235,10 @@ session leaked; motion `Start` survived a disconnect and could hold a permit.
       go backwards);
     - the cached desc detects an audio change;
     - `irap.bin` is a binary, hash-bound format.
+- Re-review of the fixes: two Hub spins, where a learning or linger deadline was left behind
+  after the source went away (a failed start, or the source ending during linger), are fixed.
+  `test_*_does_not_spin` cover them, use a `wakeups` stat and a watchdog, and fail without the
+  fix. A start still in flight is now cancelled if the Hub is gone.
 - **Deferred:**
   - availability watching (needs the Phase 4 source);
   - multi-block ADTS without CRC in the desc;

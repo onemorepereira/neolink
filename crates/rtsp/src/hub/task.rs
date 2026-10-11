@@ -180,6 +180,8 @@ pub struct HubStats {
     /// N2: added latency (release lateness + processing) per frame, µs, log2 buckets:
     /// bucket i counts latencies in [2^i, 2^(i+1))
     pub added_latency_hist: [u64; 24],
+    /// Hub loop iterations (a spinning loop shows here)
+    pub wakeups: u64,
 }
 
 impl HubStats {
@@ -421,6 +423,7 @@ impl Hub {
         let mut stats_tick = tokio::time::interval(Duration::from_secs(60));
         stats_tick.tick().await;
         loop {
+            self.stats.wakeups += 1;
             let wake = self.next_wake();
             tokio::select! {
                 cmd = cmds.recv() => match cmd {
@@ -463,10 +466,15 @@ impl Hub {
             .into_iter()
             .min()
             .map(|us| self.epoch + Duration::from_micros(us));
-        for e in [self.linger_until, self.learn_deadline, self.retry_at]
-            .into_iter()
-            .flatten()
-        {
+        // Linger and learning deadlines only act on a running source; one left behind
+        // after the source went away must not wake the loop (a past one would spin it)
+        let running = self.running_mode().is_some();
+        let deadlines = [
+            self.linger_until.filter(|_| running),
+            self.learn_deadline.filter(|_| running),
+            self.retry_at,
+        ];
+        for e in deadlines.into_iter().flatten() {
             wake = Some(wake.map_or(e, |w| w.min(e)));
         }
         // A pending outage still needs bridge_max checks
@@ -653,7 +661,10 @@ impl Hub {
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let r = fut.await;
-            let _ = tx.send((mode, cancel, r));
+            // The Hub is gone: cancellation is the only way the source is stopped
+            if let Err((_, cancel, _)) = tx.send((mode, cancel, r)) {
+                cancel.cancel();
+            }
         });
         self.starting = Some(rx);
         self.starting_mode = Some(mode);
@@ -664,6 +675,8 @@ impl Hub {
         let mode = self.starting_mode.take();
         let Some((_, cancel, result)) = started else {
             // The start itself failed (it panicked): an outage
+            self.linger_until = None;
+            self.learn_deadline = None;
             self.state = SourceState::Retrying;
             self.schedule_retry();
             return;
@@ -686,6 +699,8 @@ impl Hub {
             }
             Err(e) => {
                 cancel.cancel();
+                self.linger_until = None;
+                self.learn_deadline = None;
                 log::warn!("{}: source failed to start: {e}", self.cfg.name);
                 self.state = SourceState::Retrying;
                 self.schedule_retry();
@@ -710,6 +725,8 @@ impl Hub {
         }
         self.source_rx = None;
         self.source_mode = None;
+        self.linger_until = None;
+        self.learn_deadline = None;
         self.state = SourceState::Retrying;
         self.schedule_retry();
     }
@@ -1566,6 +1583,63 @@ mod tests {
         drain(&mut sub, 20).await;
         let n = starts.load(Ordering::SeqCst);
         assert!(n <= 8, "{n} starts in 20 s");
+    }
+
+    /// A spinning Hub never lets paused time advance, so these tests would hang: fail
+    /// loudly instead after a real-time limit
+    fn spin_watchdog(name: &'static str) -> Arc<std::sync::atomic::AtomicBool> {
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = done.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            if !d.load(Ordering::SeqCst) {
+                eprintln!("{name}: the Hub loop is spinning (virtual time stalled)");
+                std::process::exit(101);
+            }
+        });
+        done
+    }
+
+    /// Re-review #1: a failed learning start leaves no deadline behind to spin on
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_learning_start_does_not_spin() {
+        let done = spin_watchdog("test_failed_learning_start_does_not_spin");
+        let (h, source) = hub("plain_h264.bcm", true);
+        source.fail_starts.store(1, Ordering::SeqCst);
+        assert!(h.describe().await.is_err());
+        let w0 = h.stats().await.unwrap().wakeups;
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let w = h.stats().await.unwrap().wakeups - w0;
+        assert!(w < 50, "{w} wakeups in 120 s idle");
+        done.store(true, Ordering::SeqCst);
+    }
+
+    /// Re-review #2: the source ending during linger leaves no linger deadline behind
+    #[tokio::test(start_paused = true)]
+    async fn test_source_ending_in_linger_does_not_spin() {
+        let done = spin_watchdog("test_source_ending_in_linger_does_not_spin");
+        let source = Arc::new(FixtureSource::new(
+            fixture("plain_h264.bcm"),
+            1.0,
+            Some(false),
+        ));
+        source.end_at_eof.store(true, Ordering::SeqCst);
+        let mut cfg = HubConfig::new("test");
+        cfg.battery = false;
+        // Longer than the fixture, so the source ends while lingering
+        cfg.linger = Duration::from_secs(3600);
+        let h = spawn(cfg, source.clone());
+        h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        drain(&mut sub, 3).await;
+        h.pause(1).await;
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        let w0 = h.stats().await.unwrap().wakeups;
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let w = h.stats().await.unwrap().wakeups - w0;
+        assert!(w < 50, "{w} wakeups in 120 s idle");
+        done.store(true, Ordering::SeqCst);
     }
 
     /// Review #5, #6: a second DESCRIBE during the learning start waits for it, and the
