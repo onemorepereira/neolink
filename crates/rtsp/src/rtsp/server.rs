@@ -42,6 +42,8 @@ pub struct ServerConfig {
     pub session_timeout_s: u32,
     pub play_wait: Duration,
     pub rtcp_sr: bool,
+    /// SO_SNDBUF for client sockets; None keeps the kernel's autotuning
+    pub send_buffer: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -58,6 +60,7 @@ impl Default for ServerConfig {
             session_timeout_s: 60,
             play_wait: Duration::from_secs(2),
             rtcp_sr: true,
+            send_buffer: None,
         }
     }
 }
@@ -167,7 +170,7 @@ impl Server {
             self.connections.fetch_sub(1, Ordering::SeqCst);
             return;
         }
-        let _ = stream.set_nodelay(true);
+        set_socket_options(&stream, self.config.send_buffer);
         let local_ip = stream
             .local_addr()
             .map(|a| a.ip().to_string())
@@ -197,16 +200,23 @@ impl Server {
         };
         let mut buf = BytesMut::with_capacity(4096);
         let mut chunk = vec![0u8; 16 * 1024];
+        // Only complete requests (or client RTCP) count as activity, and a started request
+        // must complete within first_request_timeout: trickled bytes extend nothing
+        let connected = Instant::now();
         let mut seen_request = false;
-        let mut last_activity = Instant::now();
+        let mut last_activity = connected;
+        let mut partial_since: Option<Instant> = None;
         loop {
-            let idle_deadline = if !seen_request {
-                last_activity + self.config.first_request_timeout
+            let mut idle_deadline = if !seen_request {
+                connected + self.config.first_request_timeout
             } else if conn.playing() {
                 Instant::now() + Duration::from_secs(3600)
             } else {
                 last_activity + self.config.idle_timeout
             };
+            if let Some(t) = partial_since {
+                idle_deadline = idle_deadline.min(t + self.config.first_request_timeout);
+            }
             let n = tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep_until(idle_deadline) => break,
@@ -217,16 +227,17 @@ impl Server {
                 },
             };
             buf.extend_from_slice(&chunk[..n]);
-            last_activity = Instant::now();
             let mut close = false;
             loop {
                 match parse(&mut buf) {
                     Ok(None) => break,
                     Ok(Some(Parsed::Interleaved { .. })) => {
                         // Client RTCP (receiver reports): liveness only
+                        last_activity = Instant::now();
                     }
                     Ok(Some(Parsed::Request(req))) => {
                         seen_request = true;
+                        last_activity = Instant::now();
                         if !conn.rate_ok() {
                             let _ = conn.send(Response::new(503), req.cseq()).await;
                             continue;
@@ -248,6 +259,11 @@ impl Server {
             if close {
                 break;
             }
+            partial_since = match (buf.is_empty(), partial_since) {
+                (true, _) => None,
+                (false, None) => Some(Instant::now()),
+                (false, p) => p,
+            };
         }
         // Close: BYE, shutdown(Write) after a short drain, then drop (DESIGN §6.2)
         conn.teardown().await;
@@ -260,6 +276,13 @@ impl Server {
         log::info!("rtsp: connection from {peer} closed");
     }
 }
+
+type Routed = (
+    MountTarget,
+    super::route::RoutedPath,
+    HubHandle,
+    Option<String>,
+);
 
 struct SessionState {
     id: String,
@@ -396,6 +419,16 @@ impl Conn {
     async fn handle(&mut self, req: Request) -> bool {
         let cseq = req.cseq().map(|s| s.to_string());
         let cseq = cseq.as_deref();
+        // R23: every request on a session is re-authorized, as the session's user
+        if matches!(
+            req.method.as_str(),
+            "PLAY" | "PAUSE" | "TEARDOWN" | "GET_PARAMETER" | "SET_PARAMETER"
+        ) && self.session.is_some()
+        {
+            if let Err(r) = self.reauthorize(&req).await {
+                return self.send(r, cseq).await;
+            }
+        }
         let resp = match req.method.as_str() {
             "OPTIONS" => Response::new(200).header("Public", PUBLIC),
             "GET_PARAMETER" | "SET_PARAMETER" => self.keepalive(&req),
@@ -451,22 +484,33 @@ impl Conn {
         }
     }
 
-    async fn route(
-        &mut self,
-        req: &Request,
-    ) -> Result<(MountTarget, super::route::RoutedPath, HubHandle), Response> {
+    /// The session's camera and user must still authorize this request
+    async fn reauthorize(&mut self, req: &Request) -> Result<(), Response> {
+        self.session_header_ok(req)?;
+        let Some(s) = &self.session else {
+            return Ok(());
+        };
+        let (camera, user) = (s.target.camera.clone(), s.user.clone());
+        if self.authorize(req, &camera).await? != user {
+            return Err(Response::new(454));
+        }
+        Ok(())
+    }
+
+    /// The mount, its Hub and the authorized user (None: anonymous)
+    async fn route(&mut self, req: &Request) -> Result<Routed, Response> {
         let Some((target, path)) = self.server.routes.lookup(&req.uri) else {
             return Err(Response::new(404));
         };
-        self.authorize(req, &target.camera).await?;
+        let user = self.authorize(req, &target.camera).await?;
         let Some(hub) = self.server.provider.hub(&target) else {
             return Err(Response::new(404));
         };
-        Ok((target, path, hub))
+        Ok((target, path, hub, user))
     }
 
     async fn describe(&mut self, req: &Request) -> Result<Response, Response> {
-        let (_, path, hub) = self.route(req).await?;
+        let (_, path, hub, _) = self.route(req).await?;
         let desc = match hub.describe().await {
             Ok(d) => d,
             Err(DescribeError::NotReady) => {
@@ -484,7 +528,11 @@ impl Conn {
 
     async fn setup(&mut self, req: &Request) -> Result<Response, Response> {
         self.session_header_ok(req)?;
-        let (target, path, hub) = self.route(req).await?;
+        let (target, path, hub, user) = self.route(req).await?;
+        // The session belongs to the user who set it up (R23)
+        if self.session.as_ref().is_some_and(|s| s.user != user) {
+            return Err(Response::new(454));
+        }
         let track = path.track.unwrap_or(0);
         let transport = match choose_transport(req.header("Transport").unwrap_or("")) {
             Ok(t) => t,
@@ -504,7 +552,7 @@ impl Conn {
             self.session = Some(SessionState {
                 id,
                 num,
-                user: None,
+                user: user.clone(),
                 target: target.clone(),
                 hub,
                 desc,
@@ -622,7 +670,6 @@ impl Conn {
         }
         let _ = done_rx.await;
         s.playing = true;
-        s.user = None;
         Ok(None)
     }
 
@@ -656,6 +703,27 @@ impl Conn {
             }
         }
         Ok(None)
+    }
+}
+
+/// DESIGN §6.2: no Nagle; dead peers found by keepalive (idle 30 s, every 10 s, 3 probes)
+/// and, on Linux, by TCP_USER_TIMEOUT 20 s for unacknowledged data
+fn set_socket_options(stream: &TcpStream, send_buffer: Option<usize>) {
+    let _ = stream.set_nodelay(true);
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    if let Err(e) = sock.set_tcp_keepalive(&ka) {
+        log::debug!("rtsp: keepalive: {e}");
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Err(e) = sock.set_tcp_user_timeout(Some(Duration::from_secs(20))) {
+        log::debug!("rtsp: TCP_USER_TIMEOUT: {e}");
+    }
+    if let Some(n) = send_buffer {
+        let _ = sock.set_send_buffer_size(n);
     }
 }
 
