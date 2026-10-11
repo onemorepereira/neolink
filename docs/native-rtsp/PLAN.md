@@ -107,17 +107,42 @@ Useful on its own; it **ships with the GStreamer backend**.
 | 1.12 | **Power, part 2.** P5 cached snapshot endpoint (a small HTTP/1.1 listener sharing the RTSP auth module), P8 warning | §10 |
 | 1.10 | Test-only stats dump (task count, per-camera use-counter) on SIGUSR1 behind `cfg(any(test, feature = "debug-stats"))` | §4.8 |
 
-**Gate 1**
-- `podman stop` < 5 s with exit 0 on the GStreamer image (N9).
-- **100 connect/teardown cycles against the scripted peer in CI**: the use-counter returns
-  to 0 after *each* cycle, and the task count returns to baseline.
-- On hardware, 10 cycles with a 6 s gap (1 session): the use-counter returns to 0 each
-  cycle, checked with the 1.10 dump.
-- **A23–A26 and A28–A30 pass against the scripted peer**; the peer mocks the p2p cloud host and counts broadcasts.
-- **A27 on hardware (1 evening session).**
-- The golden structural diff against the GStreamer backend is clean.
-- No password appears in `RUST_LOG=trace` output (grep test).
-- The config corpus parses.
+**Status (2026-10-11).** Done on `feature/native-rtsp`; how each task landed:
+
+| # | Result |
+|---|---|
+| 1.1 | Not applicable: no upstream PRs (owner decision 4). The PIR fix is in local `master` with Phase 0 |
+| 1.2a | `neolink_core::test_util::FakeCamera` (TCP, unencrypted): login, abilities, ping, version, UID, stream info, battery (with busy 400s), time, snapshot, motion events, `.bcm` replay; counts connections, logins, logouts, messages; drop/unreachable injection. `BcCamera::from_parts` was not needed: the fake is reached through the real `BcCamera::new` |
+| 1.2b | 29 tests in `src/common/tests.rs` drive `NeoCam` against the fake; `cargo xtask fakecam` runs it as a process for `tests/e2e/*.sh` |
+| 1.3 | `StreamRx`: dropping it aborts the stream task and every `pause.on_motion` helper (one task leaked per session before); `StreamEvent { Media, Restarted }` |
+| 1.4 | Already true: the 5 s initial permit is in `stream_while_live` and `pause.on_motion` is read on each start. No change |
+| 1.5, 1.14 | SIGTERM/SIGINT → `NeoReactor::shutdown` (logout, close) → explicit exit. `podman stop` 155–172 ms, exit 0, one logout. No "Thread panicked" |
+| 1.6 | Config `Debug` is the serialized form (secrets skipped); test |
+| 1.7 | Unknown-key warnings (file and MQTT); key lists checked against the structs; config corpus test (sample config, README blocks, legacy aliases) |
+| 1.8 | `build.rs` keyed on `CARGO_FEATURE_GSTREAMER`/target OS; `strip = "symbols"` (17.8 → 13.0 MB); explicit release features |
+| 1.9 | Exec form, neolink is PID 1, `NEO_LINK_MODE` and `RLIMIT_NOFILE` handled in-process, state volume. Still root and Debian |
+| 1.10 | Feature `debug-stats`: SIGUSR1 logs tasks and per-camera permits/wakes |
+| 1.11, 1.13 | P1–P4, P6, P9–P16 implemented (power increments A–C). P13's C2D_DISC is sent on every deliberate UDP close. Deferred: P11's MQTT query coalescing (each query is bounded by the 60 s deadline instead); P17/P18 belong to the native Hub (Phase 4) |
+| 1.12 | P5 snapshot endpoint (Basic auth; Digest comes with the native auth module), P7, P8 |
+
+Found and fixed along the way: requests on a dropped TCP connection hung until five ping
+timeouts; `logout()` was lost because shutdown cancelled the writer first; the TCP probe
+logged in as admin/123456 on every connection; GStreamer published no mounts for a
+sleeping camera, so no client could wake it; the motion watcher of every `on_motion`
+session leaked; motion `Start` survived a disconnect and could hold a permit.
+
+**Gate 1** (status 2026-10-11)
+- ✅ `podman stop` < 5 s with exit 0 on the GStreamer image (N9): 155–172 ms (`tests/e2e/container.sh`).
+- ✅ **100 connect/teardown cycles against the scripted peer**: the use-counter returns
+  to 0 after *each* cycle, and the task count returns to baseline (`test_100_cycles_return_to_baseline`).
+- ⏳ On hardware, 10 cycles with a 6 s gap (1 session): the use-counter returns to 0 each
+  cycle, checked with the 1.10 dump. **Deferred to the next day**: 2026-10-11 already had
+  four camera sessions against the budget of two.
+- ✅ **A23–A26 and A28–A30 pass against the scripted peer** (`src/common/tests.rs`, `tests/e2e/power.sh` with the real `neolink mqtt-rtsp`, mosquitto and ffmpeg). The fake is TCP-only, so "0 discovery broadcasts / 0 cloud registrations" is shown by 0 connections with UDP discovery unused; a UDP/p2p mock is deferred to Phase 4.
+- ✅/⏳ **A27 on hardware**: 2026-10-11 15:54 UTC, 60 s of sub: 0 connections at boot, one wake of 79.3 s, battery read on the deferred retry (50 %), then no contact during the idle checks (running at the time of writing).
+- ✅ The golden structural diff against the GStreamer backend is clean: on the fake camera the Phase 1 binary is identical to the pre-Phase-1 binary and both match the goldens (`tests/e2e/golden-fake.sh`; GStreamer's pre-existing PLAY 503 for back-to-back clients is retried and counted).
+- ✅ No password appears in the most verbose release log (trace is compiled out; debug checked in `power.sh`) or in config `Debug`.
+- ✅ The config corpus parses.
 - Red-team review of the Phase 1 diff.
 
 ## Phase 2: `crates/rtsp` media core, no network (12–16 d; 0 hardware)
