@@ -461,9 +461,35 @@ Defects this found, all fixed:
 - **6.5:** `docs/native-rtsp/NATIVE.md` covers install, config keys, battery behaviour, the
   §5 deltas, Docker changes, the `irap.bin` privacy note, the MQTT trust boundary and
   bridged media. The README links to it.
-- **Pending:**
-  - 5.1 and 5.3 hardware sessions, and the Gate 6 fresh-machine session;
-  - Gate 5's full-branch red-team review.
+- **Gate 5 full-branch red-team review:** 11 findings, all fixed:
+  - **Docs and builds:**
+    - push notifications are compiled out of the native build. They would also break
+      local-only networking, so NATIVE.md now says plainly that `pause.on_motion` can't
+      start a sleeping camera, and neolink warns at startup;
+    - hot reload is via MQTT only, and the docs now say so;
+    - the snapshot endpoint and the remaining keys are documented;
+    - the Frigate claim is corrected;
+    - the leftover env vars are removed.
+  - **Security:**
+    - an unreadable MQTT CA is now an error, not a fall back to plaintext;
+    - an MQTT config write that points a camera or the broker elsewhere no longer
+      receives the current secrets;
+    - the snapshot endpoint paces failed logins.
+  - **Power:**
+    - with `PUID`, the state directory is handed to that user first and checked for
+      writes;
+    - the learning gate shares one wake for 30 s, so main and sub opened together both
+      succeed. The 1 h soak caught this: sub got 503 on a cold start.
+  - **Tests:**
+    - `perf.sh` N4 uses a fresh server;
+    - the soak also asserts one camera login and no neolink errors.
+  - The soak (600 s after the fix; 1 h before it, main only) passes with 1 login, no
+    errors and RSS ±4 %.
+- **Pending (hardware):** see `docs/native-rtsp/HARDWARE-SESSIONS.md`:
+  - Gate 4's four sessions;
+  - 5.1 and 5.3;
+  - the Phase 1 10-cycle check;
+  - the Gate 6 fresh-machine test.
 
 ## Phase 7: default flip (later, spec §8)
 

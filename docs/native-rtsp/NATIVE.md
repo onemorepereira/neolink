@@ -6,9 +6,15 @@ backend stays the default until the native one has run on more cameras (SPEC §8
 
 ## Install
 
-**Binary.** Download the native build for your platform from the release artifacts:
+**Binary.** Build it, or take it from the `Native release artifacts` workflow's
+artifacts:
 - `neolink-native-x86_64-linux-musl`
-- `neolink-native-aarch64-linux-musl` (Raspberry Pi 4/5 and other arm64 boards)
+- `neolink-native-aarch64-linux-musl`, for 64-bit ARM boards. It is not yet tested on
+  hardware: it is built, but no arm64 machine was available to run it.
+
+```sh
+cargo build --release --no-default-features --features native-rtsp   # x86_64 musl on Alpine
+```
 
 Then:
 
@@ -33,8 +39,11 @@ GStreamer image:
 - **No shell, no `/entrypoint.sh`.** neolink is PID 1 and stops cleanly on `docker stop`
   (BYE to clients, camera logout, under 1 s).
 - **Runs as root by default**, so existing root-owned `0600` configs still work. Set
-  `PUID`/`PGID` to drop to that user once the config is read. The state volume must then
-  be writable by that user.
+  `PUID`/`PGID` to drop to that user once the config is read:
+  - neolink first hands the state directory to that user;
+  - MQTT TLS files (`ca`, `client_auth`) must be readable by it. An unreadable configured
+    CA is an error, never a fall back to plaintext;
+  - ports below 1024 need root, since the listeners open after the drop.
 
 ## Choosing the backend
 
@@ -73,14 +82,35 @@ The URLs are the same 19 aliases per camera (`/Cam`, `/Cam/main`, `/Cam/mainStre
 | `rtcp_sr` | camera | `true` | RTCP sender reports (A/V sync). Per server for now: on while any camera wants it |
 | `persist_irap` | camera | `true` | Keep the last keyframe on disk to show while a sleeping camera wakes |
 
-`bind`, `bind_port`, `limits` and `rtcp_sr` apply at start. Everything else applies
-live, without a restart:
-- users and permitted users;
-- cameras added or removed;
-- stream settings (these restart that camera's sessions).
+**Changing the config while running.** The only live path is the MQTT `neolink/config`
+topic (in memory: the file is not rewritten and there is no file watch). Through it:
+- users, permitted users and cameras added or removed apply at once;
+- stream settings apply at once, restarting that camera's sessions;
+- `rtp_mtu` applies when a camera's streams are next recreated;
+- `bind`, `bind_port`, `limits` and `rtcp_sr` need a restart.
 
-A live reload that adds `certificate` or `tls_client_auth` is refused as a whole: RTSPS is
-not supported yet.
+A config sent there with `certificate` or `tls_client_auth` is refused as a whole: RTSPS
+is not supported yet. Otherwise, edit the file and restart (`docker restart` takes under
+a second).
+
+**Settings from before the native backend that matter here:**
+
+| Key | Where | Default | What |
+|---|---|---|---|
+| `idle_grace_s` | camera | 10 | How long the camera stays connected after the last use |
+| `battery` | camera | auto | `false` marks a mains camera (it may then stay connected) |
+| `idle_disconnect` | camera | sleep if battery or unknown | Force sleeping or always-on |
+| `motion_hold_max_s` | camera | 120 | Longest a motion event keeps the camera awake |
+| `snapshot_port` | top | `bind_port + 1` | The snapshot endpoint (below); `0` turns it off |
+| `snapshot_fresh` | camera | `false` | Allow `?fresh=1`, which wakes the camera for a new picture |
+
+**The snapshot endpoint.** It is on by default at `http://<bind>:<bind_port+1>/<camera>/snapshot.jpg`.
+- It serves the last picture taken at a wake, without waking a sleeping camera.
+- With no `[[users]]`, anyone who can reach the port may fetch it. With users, it takes
+  HTTP Basic only, even when `rtsp_auth` is digest-only. Failed logins are paced like
+  RTSP's.
+- Set `snapshot_port = 0` if you don't use it, or if the port clashes: 8555 is also
+  go2rtc's WebRTC port. A clash is logged, and RTSP keeps running.
 
 ## Battery cameras
 
@@ -98,8 +128,11 @@ The native backend is built for cameras that must sleep:
 - `battery` unknown is treated as battery.
 
 `pause.on_motion` needs motion events, and a camera sends those only over an open
-connection. On a sleeping camera, motion-gated streaming therefore needs push
-notifications, or the camera must stay connected (`idle_disconnect = false`).
+connection. **On a sleeping camera, `pause.on_motion` cannot start the stream on motion.**
+The native build has no push notifications, which would go through Google's and
+Reolink's cloud. Neolink warns about this at startup. Use it only on a camera that stays
+connected (`idle_disconnect = false`, which costs battery), or let clients wake the camera
+by playing.
 
 ## What behaves differently from the GStreamer backend
 
@@ -130,10 +163,15 @@ These are the SPEC §5 deltas:
 - **`irap.bin`** (in the state directory, one per camera stream) holds the last keyframe:
   an image of what the camera last saw. Set `persist_irap = false` to keep it only in
   memory, and protect the state directory like the config.
-- **MQTT.** The `neolink/config` topic can rewrite the whole config, including users and
-  `permitted_users`. Anyone who can publish to your broker can do that. Set
-  `mqtt_config_writes = false` unless you use it. A malformed config sent there is
-  answered with the line number only, never the line's text.
+- **MQTT.** The `neolink/config` topic can rewrite the whole config, including users,
+  `permitted_users` and camera addresses. Anyone who can publish to your broker can do
+  that. Set `mqtt_config_writes = false` unless you use it.
+  - Passwords left out of a config sent there are filled in from the running config only
+    when the camera's address (and UID) and the MQTT broker are unchanged. A config that
+    points a camera or the broker elsewhere doesn't get the current secrets.
+  - A malformed config is answered with the line number only, never the line's text.
+- **Snapshots.** `<camera>.jpg` in the state directory is the last picture of each camera;
+  treat it like `irap.bin`.
 - **Logs** never contain passwords, `Authorization` headers or `user:pass@` URLs, at any
   level.
 - **Bridged media during outages is synthetic** (a repeated keyframe and silence). A
@@ -141,12 +179,12 @@ These are the SPEC §5 deltas:
 
 ## Tested clients
 
-On synthetic fixtures in CI, and through neolink with a scripted camera:
-- ffmpeg/ffprobe, plain ffmpeg (UDP first, then TCP);
-- go2rtc 1.9.14 (direct, and the Home Assistant re-publish path);
-- VLC 3.0.24;
-- retina 0.4.21;
-- Frigate 0.14's `preset-rtsp-generic` and `preset-rtsp-restream` command lines (15 min across
-  the camera clock wrap, plus a 60 s outage).
+On synthetic fixtures in CI:
+- **Through neolink with a scripted camera, and against the server crate alone:**
+  ffmpeg/ffprobe, plain ffmpeg (UDP first, then TCP), go2rtc 1.9.14 (direct, and the Home
+  Assistant re-publish path), VLC 3.0.24.
+- **Against the server crate:** retina 0.4.21, and Frigate 0.14's `preset-rtsp-generic` and
+  `preset-rtsp-restream` command lines (15 min across the camera clock wrap, plus a 60 s
+  stall of the replayed stream).
 
 Hardware testing on an Argus PT Ultra is in progress (PLAN Phase 4).

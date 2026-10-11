@@ -24,8 +24,10 @@ chmod 0644 "$W/neolink.toml"
 podman run -d --name neolink-a13 --network host -e PUID=1000 -e PGID=1000 \
   -v "$W/neolink.toml":/etc/neolink.toml:ro,z "$IMAGE" >/dev/null
 i=0; until podman logs neolink-a13 2>&1 | grep -q "Starting RTSP Server (native)" || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
-if podman logs neolink-a13 2>&1 | grep -q "Running as uid 1000, gid 1000"; then echo "PASS PUID/PGID drop"
-else echo "FAIL PUID/PGID drop"; FAILS=$((FAILS+1)); fi
+if podman logs neolink-a13 2>&1 | grep -q "Running as uid 1000, gid 1000" \
+  && ! podman logs neolink-a13 2>&1 | grep -q "is not writable by PUID"; then
+  echo "PASS PUID/PGID drop, state directory writable"
+else echo "FAIL PUID/PGID drop or state directory"; podman logs neolink-a13 2>&1 | grep -i "uid\|writable" | sed 's/^/    /'; FAILS=$((FAILS+1)); fi
 # A13: a client plays from the FROM-scratch image
 podman run -d --rm --name client-a13 --network host -v "$FFMPEG_DIR":/ffmpeg:ro,z -v "$W":/w:z neolink-dev \
   /ffmpeg/bin/ffmpeg -nostdin -v error -rtsp_transport tcp -i "rtsp://127.0.0.1:$PORT/fake/main" \

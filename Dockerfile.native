@@ -4,7 +4,8 @@
 # - the config is /etc/neolink.toml;
 # - state goes in /var/lib/neolink.
 # It runs as root by default for existing root-owned 0600 configs. Set PUID/PGID to drop to
-# that user after the config is read; the state volume must then be writable by it.
+# that user after the config is read; neolink hands the state directory to that user
+# first. Ports below 1024 need root (the listeners open after the drop).
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 FROM docker.io/library/rust:1.90-alpine AS build
@@ -28,7 +29,7 @@ LABEL version="$VERSION"
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/var/lib/neolink /var/lib/neolink
 COPY --from=build /out/neolink /usr/local/bin/neolink
-ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554 NEOLINK_STATE_DIR=/var/lib/neolink NEO_IN_CONTAINER=1
+ENV NEO_LINK_MODE="rtsp" NEOLINK_STATE_DIR=/var/lib/neolink
 VOLUME /var/lib/neolink
 ENTRYPOINT ["/usr/local/bin/neolink"]
 CMD ["--config", "/etc/neolink.toml"]

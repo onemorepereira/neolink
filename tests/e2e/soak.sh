@@ -48,6 +48,11 @@ for p in main sub; do
   if [ "$ex" = 0 ] && [ "$warn" = 0 ]; then echo "PASS soak client $p: ${SOAK_SECS}s, exit 0, no warnings"
   else echo "FAIL soak client $p: exit=$ex warnings=$warn"; head -5 "$W/client.$p.log" | sed 's/^/    /'; FAILS=$((FAILS+1)); fi
 done
+# The camera connection held: one login, and nothing neolink logged as an error
+logins=$(sed -n 's/.*"logins":\([0-9]*\).*/\1/p' "$W/fakestats.json")
+errs=$(grep -c " ERROR " "$W/neolink.log" || true)
+if [ "$logins" = 1 ] && [ "$errs" = 0 ]; then echo "PASS soak camera: 1 login, no errors"
+else echo "FAIL soak camera: logins=$logins errors=$errs"; grep " ERROR " "$W/neolink.log" | head -5 | sed 's/^/    /'; FAILS=$((FAILS+1)); fi
 growth=$(awk -v a="${RSS_MARK:-0}" -v b="$RSS_END" 'BEGIN {if (a>0) printf "%.1f", (b-a)*100/a; else print 999}')
 ok=$(awk -v g="$growth" 'BEGIN {print (g <= 10) ? 1 : 0}')
 msg="RSS ${RSS_MARK:-?} KiB at ${mark}s, $RSS_END KiB at the end (${growth} %)"

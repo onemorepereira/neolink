@@ -133,32 +133,30 @@ impl<'a> MqttBackend<'a> {
         let max_size = 100 * (1024 * 1024);
         mqttoptions.set_max_packet_size(max_size, max_size);
 
-        // Use TLS if ca path is set
+        // Use TLS if ca path is set. A configured but unreadable CA or client key is an
+        // error, never a silent fall back to plaintext (which would send the broker
+        // credentials and config traffic in clear)
         if let Some(ca_path) = &self.config.ca {
-            if let Ok(ca) = std::fs::read(ca_path) {
-                // Use client_auth if they have cert and key
-                let client_auth = if let Some((cert_path, key_path)) = &self.config.client_auth {
-                    if let (Ok(cert_buf), Ok(key_buf)) =
-                        (std::fs::read(cert_path), std::fs::read(key_path))
-                    {
-                        Some((cert_buf, key_buf))
-                    } else {
-                        error!("Failed to set client tls");
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let transport = Transport::Tls(TlsConfiguration::Simple {
-                    ca,
-                    alpn: None,
-                    client_auth,
-                });
-                mqttoptions.set_transport(transport);
-            } else {
-                error!("Failed to set CA");
-            }
+            let ca = std::fs::read(ca_path).with_context(|| {
+                format!("MQTT: cannot read the CA {ca_path:?} (with PUID, it must be readable by that user)")
+            })?;
+            let client_auth = match &self.config.client_auth {
+                Some((cert_path, key_path)) => Some((
+                    std::fs::read(cert_path).with_context(|| {
+                        format!("MQTT: cannot read the client cert {cert_path:?}")
+                    })?,
+                    std::fs::read(key_path).with_context(|| {
+                        format!("MQTT: cannot read the client key {key_path:?}")
+                    })?,
+                )),
+                None => None,
+            };
+            let transport = Transport::Tls(TlsConfiguration::Simple {
+                ca,
+                alpn: None,
+                client_auth,
+            });
+            mqttoptions.set_transport(transport);
         };
 
         if let Some((username, password)) = &self.config.credentials {

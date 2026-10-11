@@ -180,6 +180,9 @@ async fn respond(
     let user = match authenticate(config, authorization.as_deref()) {
         Ok(user) => user,
         Err(()) => {
+            if authorization.is_some() {
+                pace_failed_auth(config.limits.failed_auth_per_minute).await;
+            }
             let mut r = Response::text("401 Unauthorized", "");
             r.headers
                 .push(("WWW-Authenticate", "Basic realm=\"neolink\"".to_string()));
@@ -250,6 +253,37 @@ async fn take_fresh(reactor: &NeoReactor, name: &str, state: &StateFile) -> Resu
         })
         .await?;
     state.save_snapshot(&jpeg)
+}
+
+/// Failed logins, across all clients: past `per_minute` in a minute each failure waits for
+/// its own 1 s slot, like the RTSP server, so the endpoint can't be used to guess the RTSP
+/// passwords quickly
+async fn pace_failed_auth(per_minute: usize) {
+    use std::collections::VecDeque;
+    static FAILS: Mutex<Option<(VecDeque<Instant>, Instant)>> = Mutex::new(None);
+    let wait = {
+        let mut g = FAILS.lock().unwrap();
+        let now = Instant::now();
+        let (times, next) = g.get_or_insert_with(|| (VecDeque::new(), now));
+        while times
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
+        {
+            times.pop_front();
+        }
+        times.push_back(now);
+        if times.len() > per_minute {
+            times.pop_front();
+            let slot = (*next).max(now) + Duration::from_secs(1);
+            *next = slot;
+            Some(slot)
+        } else {
+            None
+        }
+    };
+    if let Some(slot) = wait {
+        tokio::time::sleep_until(slot.into()).await;
+    }
 }
 
 /// The authenticated user: `Ok(None)` when no users are configured (anyone may fetch)

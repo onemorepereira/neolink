@@ -89,6 +89,7 @@ async fn main() -> Result<()> {
     config
         .validate()
         .with_context(|| format!("Failed to validate the {:?} config file", conf_path))?;
+    config::warn_feature_mismatches(&config);
     // The config is read (as root, if the image runs so): now become PUID/PGID if asked
     drop_privileges()?;
 
@@ -288,6 +289,23 @@ fn drop_privileges() -> Result<()> {
                 }
                 return Ok(());
             }
+            // The state directory (desc cache, learning gate, snapshots) must stay writable,
+            // or every restart forgets them and a battery camera is woken more often
+            let dir = crate::common::state_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) {
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::stat(c.as_ptr(), &mut st) == 0
+                    && st.st_uid == 0
+                    && libc::chown(c.as_ptr(), uid, gid) != 0
+                {
+                    warn!(
+                        "could not hand the state directory {} to PUID={uid}: {}",
+                        dir.display(),
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
             let groups = [gid];
             if libc::setgroups(1, groups.as_ptr()) != 0
                 || libc::setgid(gid) != 0
@@ -300,6 +318,18 @@ fn drop_privileges() -> Result<()> {
             }
         }
         info!("Running as uid {uid}, gid {gid}");
+        let probe = crate::common::state_dir().join(".neolink-write-test");
+        match std::fs::write(&probe, b"ok") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+            }
+            Err(e) => log::error!(
+                "The state directory {} is not writable by PUID={uid} ({e}): the stream cache, \
+                 the learning-start limit and snapshots will not survive a restart, so a \
+                 battery camera is woken more often. Make it writable by that user",
+                crate::common::state_dir().display()
+            ),
+        }
     }
     Ok(())
 }

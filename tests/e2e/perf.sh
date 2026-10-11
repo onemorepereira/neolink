@@ -42,7 +42,13 @@ pct=$(awk -v t=$((b - a)) -v hz="$HZ" -v s="$PERF_SECS" 'BEGIN {printf "%.2f", t
 ok=$(awk -v p="$pct" 'BEGIN {print (p <= 5) ? 1 : 0}')
 msg="4K H.265 to 4 clients: ${pct} % of one core over ${PERF_SECS}s"
 if [ "$ok" = 1 ]; then echo "PASS N3 $msg"; else echo "FAIL N3 $msg"; FAILS=$((FAILS+1)); fi
-# N4: RSS with 1, then 5 clients
+# N4: RSS with 1, then 5 clients, on a fresh server (N3's high-water mark would
+# otherwise be in the 1-client baseline)
+kill -TERM $SRV; wait $SRV
+"$BIN/xtask" rtsp-serve --bind 127.0.0.1:$PORT --main "$FIX" --loop --ready-file "$W/ready2" \
+  > "$W/server2.log" 2>&1 &
+SRV=$!
+i=0; until [ -e "$W/ready2" ] || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
 clients 1 70; sleep 60; r1=$(rss); wait_clients
 clients 5 70; sleep 60; r5=$(rss); wait_clients
 per=$(awk -v a="$r1" -v b="$r5" 'BEGIN {printf "%.0f", (b - a) / 4}')
