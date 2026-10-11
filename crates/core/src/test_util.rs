@@ -62,6 +62,8 @@ pub struct FakeCameraConfig {
     pub loop_media: bool,
     /// Largest binary payload per Baichuan message
     pub chunk_size: usize,
+    /// JPEG returned by snapshot requests; `None` answers them with 400
+    pub snapshot: Option<Arc<Vec<u8>>>,
 }
 
 impl Default for FakeCameraConfig {
@@ -78,12 +80,13 @@ impl Default for FakeCameraConfig {
             speed: 1.0,
             loop_media: false,
             chunk_size: 40_000,
+            snapshot: Some(Arc::new(b"\xff\xd8fake jpeg\xff\xd9".to_vec())),
         }
     }
 }
 
 /// Counters of everything the fake camera saw
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct FakeStats {
     /// TCP connections accepted (including those closed while unreachable)
     pub connections: u32,
@@ -101,6 +104,8 @@ pub struct FakeStats {
     pub video_stops: u32,
     /// Media records sent
     pub media_sent: u64,
+    /// Snapshots sent
+    pub snapshots: u32,
     /// Messages received, by msg_id
     pub messages: BTreeMap<u32, u32>,
 }
@@ -546,6 +551,45 @@ impl Conn {
                 self.reply(meta, 200, Some(xml)).await
             }
             MSG_ID_SET_GENERAL | MSG_ID_UDP_KEEP_ALIVE => self.reply(meta, 200, None).await,
+            MSG_ID_SNAP => match config.snapshot.clone() {
+                None => self.reply(meta, 400, None).await,
+                Some(jpeg) => {
+                    let xml = BcXml {
+                        snap: Some(Snap {
+                            version: "1.1".to_string(),
+                            channel_id: 0,
+                            file_name: Some("snap.jpg".to_string()),
+                            picture_size: Some(jpeg.len() as u32),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    self.reply(meta, 200, Some(xml)).await?;
+                    let chunks: Vec<&[u8]> = jpeg.chunks(config.chunk_size.max(1)).collect();
+                    for (i, chunk) in chunks.iter().enumerate() {
+                        let last = i + 1 == chunks.len();
+                        let bc = Bc::new(
+                            BcMeta {
+                                msg_id: MSG_ID_SNAP,
+                                channel_id: 0,
+                                msg_num: meta.msg_num,
+                                stream_type: 0,
+                                response_code: if last { 201 } else { 200 },
+                                class: 0x0000,
+                            },
+                            Some(Extension {
+                                version: "1.1".to_string(),
+                                binary_data: Some(1),
+                                ..Default::default()
+                            }),
+                            Some(BcPayloads::Binary(chunk.to_vec())),
+                        );
+                        self.write(&bc).await?;
+                    }
+                    self.shared.stats.lock().unwrap().snapshots += 1;
+                    Ok(())
+                }
+            },
             MSG_ID_MOTION_REQUEST => {
                 self.motion_msg_num = Some(meta.msg_num);
                 self.reply(meta, 200, None).await
@@ -742,6 +786,10 @@ mod tests {
             camera.get_stream_info().await.unwrap().stream_infos.len(),
             1
         );
+        assert_eq!(
+            camera.get_snapshot().await.unwrap(),
+            b"\xff\xd8fake jpeg\xff\xd9"
+        );
         camera.logout().await.unwrap();
         // logout() only queues the message; give it time to reach the camera before the
         // connection is shut down (PLAN 1.13 makes logout wait for the reply)
@@ -811,7 +859,13 @@ mod tests {
             .await
             .unwrap();
         cam.set_unreachable(true);
-        assert!(BcCamera::new(&cam.camera_opts("t")).await.is_err());
+        // The port check passes (connections are accepted, then closed); login fails
+        let result = async {
+            let camera = BcCamera::new(&cam.camera_opts("t")).await?;
+            camera.login().await
+        }
+        .await;
+        assert!(result.is_err());
         assert!(cam.stats().connections >= 1);
         assert_eq!(cam.stats().logins, 0);
     }

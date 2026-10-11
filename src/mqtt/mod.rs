@@ -77,7 +77,7 @@ mod discovery;
 mod mqttc;
 
 use crate::{
-    common::{MdState, NeoInstance, NeoReactor},
+    common::{MdState, NeoInstance, NeoReactor, StateFile},
     config::Config,
     AnyResult,
 };
@@ -478,6 +478,24 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     }, if config.enable_motion => v,
                     // Handle the SNAP (image preview)
                     v = async {
+                        // A sleeping camera's preview comes from the snapshot its wake
+                        // reads saved: one per wake, and no second snapshot request
+                        // competing with theirs (SPEC P5, P14)
+                        let cam_config = camera_snap.config().await?.borrow().clone();
+                        if cam_config.sleeps() {
+                            let state = StateFile::for_camera(&cam_config);
+                            loop {
+                                let before = state.load().snapshot_at;
+                                camera_snap.next_connection().await?;
+                                wait_for_state(|| state.load().snapshot_at != before).await;
+                                if let Some((jpeg, _)) = state.snapshot() {
+                                    mqtt_snap
+                                        .send_message("status/preview", BASE64.encode(jpeg).as_str(), true)
+                                        .await
+                                        .with_context(|| format!("{}: Failed to publish preview", camera_name))?;
+                                }
+                            }
+                        }
                         let mut wait = IntervalStream::new({
                             let mut i = interval(Duration::from_millis(config.preview_update));
                             i.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -508,10 +526,6 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                         .with_context(|| {
                                             format!("{}: Failed to publish preview", camera_name)
                                         })?;
-                                // A sleeping camera gets one preview per wake (SPEC P14)
-                                if camera_snap.config().await?.borrow().sleeps() {
-                                    camera_snap.next_connection().await?;
-                                }
                             }
                             AnyResult::Ok(())
                         }.await;
@@ -525,6 +539,22 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     }, if config.enable_preview => v,
                     // Handle the battery publish
                     v = async {
+                        // A sleeping camera's battery comes from its wake reads (SPEC P7)
+                        let cam_config = camera_battery.config().await?.borrow().clone();
+                        if cam_config.sleeps() {
+                            let state = StateFile::for_camera(&cam_config);
+                            loop {
+                                let before = state.load().last_battery.map(|b| b.at);
+                                camera_battery.next_connection().await?;
+                                wait_for_state(|| state.load().last_battery.map(|b| b.at) != before).await;
+                                if let Some(b) = state.load().last_battery {
+                                    mqtt_battery
+                                        .send_message("status/battery_level", format!("{}", b.percent).as_str(), true)
+                                        .await
+                                        .with_context(|| format!("{}: Failed to publish battery", camera_name))?;
+                                }
+                            }
+                        }
                         let mut wait = IntervalStream::new({
                             let mut i = interval(Duration::from_millis(config.battery_update));
                             i.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -556,10 +586,6 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                         .with_context(|| {
                                             format!("{}: Failed to publish battery", camera_name)
                                         })?;
-                                // A sleeping camera gets one battery read per wake (SPEC P14)
-                                if camera_battery.config().await?.borrow().sleeps() {
-                                    camera_battery.next_connection().await?;
-                                }
                             }
                             AnyResult::Ok(())
                         }.await;
@@ -1349,4 +1375,14 @@ async fn handle_mqtt_message(
         _ => {}
     }
     Ok(())
+}
+
+/// Wait up to 60 s for the wake reads to update the state file
+async fn wait_for_state(updated: impl Fn() -> bool) {
+    for _ in 0..120 {
+        if updated() {
+            return;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }

@@ -3843,7 +3843,9 @@ dependencies = [
  "clap",
  "neolink_core",
  "regex",
+ "serde_json",
  "sha2",
+ "tokio",
 ]
 
 [[package]]
