@@ -66,3 +66,7 @@ pushnoti = [
   "dep:dirs",
   "dep:md5"
 ]
+
+[profile.release]
+# Smaller binaries (PLAN 1.8)
+strip = "symbols"

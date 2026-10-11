@@ -120,7 +120,7 @@ jobs:
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
           # pkg-config --variable pc_path pkg-config
           export JEMALLOC_SYS_WITH_LG_PAGE=16
-          cargo  build --release --all-features
+          cargo  build --release --features gstreamer,pushnoti
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.os }}
@@ -187,7 +187,7 @@ jobs:
           TARGET: ${{ matrix.target }}
       - name: Build
         run: |
-          cargo build --release --verbose --all-features --target=${TARGET}
+          cargo build --release --verbose --features gstreamer,pushnoti --target=${TARGET}
         env:
           # Retarget pkg-config as described in https://www.freedesktop.org/wiki/Software/pkg-config/CrossCompileProposal/
           PKG_CONFIG_ALLOW_CROSS: 1
