@@ -37,12 +37,19 @@ regex = "1.7.3"
 rumqttc = "0.24.0"
 serde = { version = "1.0.160", features = ["derive"] }
 serde_json = "1.0.96"
-tokio = { version = "1.27.0", features = ["rt-multi-thread", "macros", "io-util", "tracing"] }
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "io-util", "tracing", "signal", "net", "time", "sync"] }
 tokio-stream = "0.1.12"
 tokio-util = { version = "0.7.7", features = ["full", "tracing"] }
 toml = "0.8.2"
 uuid = { version = "1.8.0", features = ["v4"] }
 validator = {version="0.18.1", features = ["derive"] }
+
+[dev-dependencies]
+neolink_core = { path = "crates/core", version = "0.6.3-rc.3", features = ["test-util"] }
+tokio = { version = "1.39", features = ["test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.153"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5"
@@ -57,8 +64,14 @@ gstreamer = [
   "dep:byte-slice-cast",
   "dep:crossbeam-channel"
 ]
+# Log task and permit counts on SIGUSR1 (for leak checks on hardware)
+debug-stats = []
 pushnoti = [
   "dep:fcm-push-listener",
   "dep:dirs",
   "dep:md5"
 ]
+
+[profile.release]
+# Smaller binaries (PLAN 1.8)
+strip = "symbols"

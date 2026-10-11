@@ -151,9 +151,11 @@ impl PushNotiThread {
                 let uid = uid.clone();
                 let fcm_token = fcm_token.clone();
                 let instance = instance.clone();
+                // Passive: registration rides on the next wake instead of causing one
+                // (SPEC P1, P10)
                 tokio::task::spawn(async move {
                     let _ = instance
-                        .run_task(|camera| {
+                        .run_passive_task(|camera| {
                             let fcm_token = fcm_token.clone();
                             let uid = uid.clone();
                             Box::pin(async move {
@@ -235,7 +237,7 @@ impl PushNotiThread {
                                 let fcm_token = fcm_token.clone();
                                 self.registed_cameras.insert(uid.clone(), instance.clone());
                                 tokio::task::spawn(async move {
-                                    let r = instance.run_task(|camera| {
+                                    let r = instance.run_passive_task(|camera| {
                                         let fcm_token = fcm_token.clone();
                                         let uid = uid.clone();
                                         Box::pin(async move {

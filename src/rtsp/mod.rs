@@ -92,6 +92,16 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
 
     let mut set = JoinSet::new();
 
+    // Cached snapshots for sleeping cameras (SPEC P5)
+    let snapshot_reactor = reactor.clone();
+    let snapshot_cancel = global_cancel.clone();
+    set.spawn(async move {
+        if let Err(e) = crate::snapshot::serve(snapshot_reactor, snapshot_cancel).await {
+            log::error!("Snapshot endpoint stopped: {e:?}");
+        }
+        AnyResult::Ok(())
+    });
+
     // Thread for the TLS from the config
     let mut thread_config = reactor.config().await?;
     let thread_cancel = global_cancel.clone();
@@ -254,7 +264,26 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
     let name = camera.config().await?.borrow().name.clone();
     log::debug!("{name}: Camera Main");
     let later_camera = camera.clone();
-    let (supported_streams_tx, supported_streams) = watch(HashSet::<StreamKind>::new());
+    // A sleeping camera is only asked for its streams when it wakes, so until then the
+    // mounts come from the config (SPEC P16); otherwise no client could ever wake it.
+    // With `stream = "all"` that is main and sub, the streams every camera has.
+    let seed = {
+        let config = camera.config().await?.borrow().clone();
+        if config.sleeps() {
+            let kinds = config.stream.as_stream_kinds();
+            if kinds.len() > 1 {
+                kinds
+                    .into_iter()
+                    .filter(|k| *k != StreamKind::Extern)
+                    .collect()
+            } else {
+                kinds.into_iter().collect()
+            }
+        } else {
+            HashSet::new()
+        }
+    };
+    let (supported_streams_tx, supported_streams) = watch::<HashSet<StreamKind>>(seed);
 
     let mut set = JoinSet::new();
     set.spawn(async move {

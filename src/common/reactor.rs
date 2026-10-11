@@ -25,6 +25,8 @@ use crate::{config::Config, AnyResult, Result};
 #[allow(clippy::large_enum_variant)]
 enum NeoReactorCommand {
     HangUp,
+    Shutdown(OneshotSender<()>),
+    Stats(OneshotSender<Vec<String>>),
     Config(OneshotSender<WatchReceiver<Config>>),
     UpdateConfig(Config, OneshotSender<Result<()>>),
     Get(String, OneshotSender<Result<Option<NeoInstance>>>),
@@ -67,6 +69,25 @@ impl NeoReactor {
                             NeoReactorCommand::HangUp =>  {
                                 instances.clear();
                                 cancel2.cancel();
+                                return Result::<(), anyhow::Error>::Ok(());
+                            }
+                            NeoReactorCommand::Stats(reply) => {
+                                let lines = instances.iter().map(|(name, cam)| {
+                                    let wakes = cam.ledger().lock().unwrap().wakes();
+                                    let awake: f32 = wakes.iter().filter_map(|w| w.awake).map(|d| d.as_secs_f32()).sum();
+                                    format!("{name}: permits={} wakes={} awake={awake:.0}s", cam.use_count(), wakes.len())
+                                }).collect();
+                                let _ = reply.send(lines);
+                            }
+                            NeoReactorCommand::Shutdown(reply) => {
+                                // Log every camera out before the runtime goes away
+                                let cams = futures::future::join_all(
+                                    instances.values_mut().map(|cam| cam.shutdown()),
+                                );
+                                cams.await;
+                                instances.clear();
+                                cancel2.cancel();
+                                let _ = reply.send(());
                                 return Result::<(), anyhow::Error>::Ok(());
                             }
                             NeoReactorCommand::Config(reply) =>  {
@@ -176,6 +197,34 @@ impl NeoReactor {
             .await?;
 
         Ok(sender_rx.await?)
+    }
+
+    /// One line per camera: active permits, wakes and awake time (PLAN 1.10)
+    #[allow(dead_code)]
+    pub(crate) async fn stats(&self) -> Vec<String> {
+        let (sender_tx, sender_rx) = oneshot();
+        if self
+            .commander
+            .send(NeoReactorCommand::Stats(sender_tx))
+            .await
+            .is_err()
+        {
+            return vec![];
+        }
+        sender_rx.await.unwrap_or_default()
+    }
+
+    /// Stop every camera cleanly (logout, close), bounded to 6 s
+    pub(crate) async fn shutdown(&self) {
+        let (sender_tx, sender_rx) = oneshot();
+        if self
+            .commander
+            .send(NeoReactorCommand::Shutdown(sender_tx))
+            .await
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(6), sender_rx).await;
+        }
     }
 
     pub(crate) async fn update_config(&self, new_config: Config) -> Result<()> {

@@ -47,7 +47,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         let stream_type_tx = Arc::new(RwLock::new(Some(stream_type_tx)));
         tokio::task::spawn(async move {
             thread_camera
-                .run_task(|cam| {
+                .run_stream_task("cli:image", |cam| {
                     let stream_type_tx = stream_type_tx.clone();
                     let stream_data_tx = stream_data_tx.clone();
 

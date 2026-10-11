@@ -67,6 +67,9 @@ pub mod bcmedia;
 pub mod bcudp;
 /// Reading and writing `.bcm` media fixtures
 pub mod fixture;
+/// A scripted fake camera for tests
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 
 /// This is the top level error structure of the library
 ///

@@ -17,7 +17,7 @@ static RE_MAXENC_SRC: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^([nN]one|[Aa][Ee][Ss]|[Bb][Cc][Ee][Nn][Cc][Rr][Yy][Pp][Tt])$").unwrap()
 });
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Validate, Clone, PartialEq)]
 pub(crate) struct Config {
     #[validate(nested)]
     pub(crate) cameras: Vec<CameraConfig>,
@@ -49,9 +49,13 @@ pub(crate) struct Config {
     #[validate(nested)]
     #[serde(default)]
     pub(crate) users: Vec<UserConfig>,
+
+    /// Port of the cached snapshot endpoint; unset means bind_port + 1, 0 disables it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_port: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
 #[validate(schema(function = "validate_mqtt_server", skip_on_field_errors = true))]
 pub(crate) struct MqttServerConfig {
     #[serde(alias = "server")]
@@ -126,7 +130,7 @@ impl StreamConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Validate, Clone, PartialEq)]
 #[validate(schema(function = "validate_camera_config"))]
 pub(crate) struct CameraConfig {
     pub(crate) name: String,
@@ -216,11 +220,52 @@ pub(crate) struct CameraConfig {
     #[serde(default = "default_true", alias = "push", alias = "push_noti")]
     pub(crate) push_notifications: bool,
 
-    #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
-    pub(crate) idle_disconnect: bool,
+    /// Disconnect when idle. Unset means: yes for battery or unknown cameras (SPEC P1)
+    #[serde(
+        default,
+        alias = "idle",
+        alias = "idle_disc",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) idle_disconnect: Option<bool>,
+
+    /// Whether the camera runs on battery. Unset means unknown, which is treated as battery
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) battery: Option<bool>,
+
+    /// Seconds to stay connected after the last use (SPEC P2)
+    #[serde(default = "default_idle_grace_s")]
+    pub(crate) idle_grace_s: u64,
+
+    /// Allow `?fresh=1` on the snapshot endpoint, which wakes the camera (SPEC P5)
+    #[serde(default = "default_false")]
+    pub(crate) snapshot_fresh: bool,
+
+    /// Longest time a motion event keeps the camera connected (SPEC P12)
+    #[serde(default = "default_motion_hold_max_s")]
+    pub(crate) motion_hold_max_s: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
+impl CameraConfig {
+    /// The camera sleeps (is only connected on demand) unless always-on was asked for,
+    /// or it is known to be mains powered and `idle_disconnect` is unset
+    pub(crate) fn sleeps(&self) -> bool {
+        match self.idle_disconnect {
+            Some(idle) => idle,
+            None => self.battery != Some(false),
+        }
+    }
+}
+
+const fn default_idle_grace_s() -> u64 {
+    10
+}
+
+const fn default_motion_hold_max_s() -> u64 {
+    120
+}
+
+#[derive(Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UserConfig {
     #[validate(custom(function = "validate_username"))]
     #[serde(alias = "username")]
@@ -531,5 +576,320 @@ fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), Validation
             "Either camera address or uid must be given",
         )),
         _ => Ok(()),
+    }
+}
+
+/// Debug output is the serialized form, which skips passwords and credentials
+/// (`skip_serializing`), so configs can be logged at any level (PLAN 1.6)
+macro_rules! redacted_debug {
+    ($($t:ty),*) => {$(
+        impl std::fmt::Debug for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match serde_json::to_string(self) {
+                    Ok(json) => write!(f, "{} {}", stringify!($t), json),
+                    Err(_) => write!(f, "{} {{ .. }}", stringify!($t)),
+                }
+            }
+        }
+    )*};
+}
+redacted_debug!(Config, MqttServerConfig, CameraConfig, UserConfig);
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn test_debug_has_no_secrets() {
+        let config: Config = toml::from_str(
+            r#"
+            [mqtt]
+            broker_addr = "127.0.0.1"
+            port = 1883
+            credentials = ["mqttuser", "mqttsecret"]
+            [[users]]
+            name = "alice"
+            pass = "usersecret"
+            [[cameras]]
+            name = "cam"
+            username = "admin"
+            password = "camsecret"
+            address = "127.0.0.1"
+            "#,
+        )
+        .unwrap();
+        let debug = format!("{:?} {:?} {:#?}", config, config.cameras[0], config.users);
+        for secret in ["mqttsecret", "usersecret", "camsecret"] {
+            assert!(!debug.contains(secret), "{} leaked in {}", secret, debug);
+        }
+        assert!(debug.contains("\"name\":\"cam\""));
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Unknown keys (PLAN 1.7)
+//
+// serde ignores keys it doesn't know, so a misspelt `idle_disconect = false` silently did
+// nothing. Each section's names and aliases are listed here; a test checks the list
+// against the structs above.
+
+const CONFIG_KEYS: &[&str] = &[
+    "cameras",
+    "bind",
+    "bind_port",
+    "tokio_console",
+    "certificate",
+    "mqtt",
+    "tls_client_auth",
+    "users",
+    "snapshot_port",
+];
+const MQTT_SERVER_KEYS: &[&str] = &[
+    "broker_addr",
+    "server",
+    "port",
+    "credentials",
+    "ca",
+    "client_auth",
+];
+const CAMERA_KEYS: &[&str] = &[
+    "name",
+    "address",
+    "uid",
+    "username",
+    "password",
+    "pass",
+    "stream",
+    "permitted_users",
+    "channel_id",
+    "channel",
+    "mqtt",
+    "pause",
+    "discovery",
+    "max_encryption",
+    "strict",
+    "print_format",
+    "print",
+    "update_time",
+    "time",
+    "buffer_duration",
+    "duration",
+    "buffer",
+    "enabled",
+    "enable",
+    "debug",
+    "verbose",
+    "use_splash",
+    "splash",
+    "splash_pattern",
+    "pattern",
+    "max_discovery_retries",
+    "retries",
+    "max_retries",
+    "push_notifications",
+    "push",
+    "push_noti",
+    "idle_disconnect",
+    "idle",
+    "idle_disc",
+    "battery",
+    "idle_grace_s",
+    "snapshot_fresh",
+    "motion_hold_max_s",
+];
+const USER_KEYS: &[&str] = &["name", "username", "pass", "password"];
+const CAMERA_MQTT_KEYS: &[&str] = &[
+    "enable_motion",
+    "enable_light",
+    "enable_battery",
+    "battery_update",
+    "enable_preview",
+    "preview_update",
+    "enable_floodlight",
+    "floodlight_update",
+    "discovery",
+];
+const CAMERA_MQTT_DISCOVERY_KEYS: &[&str] = &["topic", "features"];
+const PAUSE_KEYS: &[&str] = &[
+    "on_motion",
+    "on_disconnect",
+    "on_client",
+    "motion_timeout",
+    "timeout",
+    "mode",
+];
+
+/// Keys in a config text that neolink does not know, as dotted paths
+pub(crate) fn unknown_keys(text: &str) -> Vec<String> {
+    let Ok(toml::Value::Table(root)) = text.parse::<toml::Value>() else {
+        return vec![]; // The real parse reports syntax errors
+    };
+    let mut out = vec![];
+    fn check(table: &toml::Table, known: &[&str], path: &str, out: &mut Vec<String>) {
+        for key in table.keys() {
+            if !known.contains(&key.as_str()) {
+                out.push(format!("{path}{key}"));
+            }
+        }
+    }
+    check(&root, CONFIG_KEYS, "", &mut out);
+    if let Some(toml::Value::Table(mqtt)) = root.get("mqtt") {
+        check(mqtt, MQTT_SERVER_KEYS, "mqtt.", &mut out);
+    }
+    if let Some(toml::Value::Array(users)) = root.get("users") {
+        for (i, user) in users.iter().enumerate() {
+            if let toml::Value::Table(user) = user {
+                check(user, USER_KEYS, &format!("users[{i}]."), &mut out);
+            }
+        }
+    }
+    if let Some(toml::Value::Array(cameras)) = root.get("cameras") {
+        for (i, camera) in cameras.iter().enumerate() {
+            let toml::Value::Table(camera) = camera else {
+                continue;
+            };
+            let path = format!("cameras[{i}].");
+            check(camera, CAMERA_KEYS, &path, &mut out);
+            if let Some(toml::Value::Table(pause)) = camera.get("pause") {
+                check(pause, PAUSE_KEYS, &format!("{path}pause."), &mut out);
+            }
+            if let Some(toml::Value::Table(mqtt)) = camera.get("mqtt") {
+                check(mqtt, CAMERA_MQTT_KEYS, &format!("{path}mqtt."), &mut out);
+                if let Some(toml::Value::Table(d)) = mqtt.get("discovery") {
+                    check(
+                        d,
+                        CAMERA_MQTT_DISCOVERY_KEYS,
+                        &format!("{path}mqtt.discovery."),
+                        &mut out,
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Log a warning for each unknown key
+pub(crate) fn warn_unknown_keys(text: &str, source: &str) {
+    for key in unknown_keys(text) {
+        log::warn!("{source}: unknown config key `{key}` is ignored; check its spelling");
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    /// The key lists match the structs' field names, renames and aliases
+    #[test]
+    fn test_key_lists_match_structs() {
+        let src = include_str!("config.rs");
+        let rename = regex::Regex::new(r#"rename = "([^"]+)""#).unwrap();
+        let alias = regex::Regex::new(r#"alias = "([^"]+)""#).unwrap();
+        let field = regex::Regex::new(r"^\s*pub\(crate\) (\w+):").unwrap();
+        let lists: &[(&str, &[&str])] = &[
+            ("Config", CONFIG_KEYS),
+            ("MqttServerConfig", MQTT_SERVER_KEYS),
+            ("CameraConfig", CAMERA_KEYS),
+            ("UserConfig", USER_KEYS),
+            ("MqttConfig", CAMERA_MQTT_KEYS),
+            ("MqttDiscoveryConfig", CAMERA_MQTT_DISCOVERY_KEYS),
+            ("PauseConfig", PAUSE_KEYS),
+        ];
+        for (name, known) in lists {
+            let start = src
+                .find(&format!("pub(crate) struct {name} {{"))
+                .unwrap_or_else(|| panic!("struct {name}"));
+            let body = &src[start..start + src[start..].find("\n}").unwrap()];
+            let mut keys = vec![];
+            let mut attrs = String::new();
+            for line in body.lines().skip(1) {
+                if let Some(f) = field.captures(line) {
+                    match rename.captures(&attrs) {
+                        Some(r) => keys.push(r[1].to_string()),
+                        None => keys.push(f[1].to_string()),
+                    }
+                    keys.extend(alias.captures_iter(&attrs).map(|a| a[1].to_string()));
+                    attrs.clear();
+                } else {
+                    attrs.push_str(line);
+                    attrs.push('\n');
+                }
+            }
+            let known: Vec<String> = known.iter().map(|s| s.to_string()).collect();
+            assert_eq!(keys, known, "key list for {name} is out of date");
+        }
+    }
+
+    #[test]
+    fn test_unknown_keys() {
+        let text = r#"
+            bind = "0.0.0.0"
+            bnd_port = 1
+            [[cameras]]
+            name = "a"
+            username = "admin"
+            address = "1.2.3.4"
+            idle_disconect = false
+            [cameras.pause]
+            on_moton = true
+            [cameras.mqtt.discovery]
+            topc = "x"
+        "#;
+        assert_eq!(
+            unknown_keys(text),
+            [
+                "bnd_port",
+                "cameras[0].idle_disconect",
+                "cameras[0].pause.on_moton",
+                "cameras[0].mqtt.discovery.topc"
+            ]
+        );
+    }
+
+    /// The shipped sample config and the README's examples parse, with known keys only
+    #[test]
+    fn test_config_corpus() {
+        let mut corpus = vec![(
+            "sample_config.toml".to_string(),
+            include_str!("../sample_config.toml").to_string(),
+        )];
+        let readme = include_str!("../README.md");
+        for (i, block) in readme.split("```toml").skip(1).enumerate() {
+            let block = block.split("```").next().unwrap();
+            corpus.push((format!("README.md toml block {i}"), block.to_string()));
+        }
+        // Configs from older releases that must keep working
+        corpus.push((
+            "legacy aliases".to_string(),
+            r#"
+            [[cameras]]
+            name = "old"
+            username = "admin"
+            pass = "x"
+            address = "192.168.1.2:9000"
+            channel = 0
+            idle = true
+            time = false
+            splash = false
+            [cameras.pause]
+            on_client = true
+            timeout = 2.0
+            "#
+            .to_string(),
+        ));
+        for (name, text) in corpus {
+            // README blocks are often fragments: they only need known keys
+            if !name.starts_with("README") {
+                let parsed: Result<Config, _> = toml::from_str(&text);
+                assert!(parsed.is_ok(), "{name} does not parse: {:?}", parsed.err());
+            }
+            // A README snippet without a header may be top-level or camera settings
+            let unknown: Vec<String> = unknown_keys(&text)
+                .into_iter()
+                .filter(|k| !(name.starts_with("README") && CAMERA_KEYS.contains(&k.as_str())))
+                .collect();
+            assert_eq!(unknown, Vec::<String>::new(), "{name}");
+        }
     }
 }

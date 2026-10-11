@@ -1907,6 +1907,7 @@ dependencies = [
  "gstreamer-rtsp",
  "gstreamer-rtsp-server",
  "heck 0.5.0",
+ "libc",
  "log",
  "md5",
  "neolink_core",
@@ -3843,7 +3844,9 @@ dependencies = [
  "clap",
  "neolink_core",
  "regex",
+ "serde_json",
  "sha2",
+ "tokio",
 ]
 
 [[package]]

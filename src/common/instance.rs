@@ -21,6 +21,11 @@ use neolink_core::bc_protocol::BcCamera;
 
 #[cfg(feature = "gstreamer")]
 mod gst;
+mod stream;
+pub(crate) use stream::*;
+
+/// How long a [`NeoInstance::run_task`] may take before it fails (SPEC P11)
+pub(crate) const TASK_DEADLINE: Duration = Duration::from_secs(60);
 
 #[cfg(feature = "pushnoti")]
 mod pushnoti;
@@ -69,14 +74,52 @@ impl NeoInstance {
     /// - If the camera instance is changed: Rerun the task with the new instance
     /// - If the camera returns a retryable error, wait for camera instance to change then rerun
     /// - else return the result of the function
-    pub(crate) async fn run_task<F, T>(&self, task: F) -> AnyResult<T>
+    ///
+    /// The caller's source location is the permit's reason (SPEC P6), and the task fails
+    /// after [`TASK_DEADLINE`] (SPEC P11). Use [`Self::run_task_for`] to name the reason or
+    /// [`Self::run_stream_task`] for long-running streams.
+    #[track_caller]
+    pub(crate) fn run_task<'s, F, T>(
+        &'s self,
+        task: F,
+    ) -> impl futures::Future<Output = AnyResult<T>> + 's
+    where
+        F: for<'a> Fn(
+                &'a BcCamera,
+            )
+                -> std::pin::Pin<Box<dyn futures::Future<Output = AnyResult<T>> + Send + 'a>>
+            + 's,
+        T: 's,
+    {
+        let caller = std::panic::Location::caller();
+        let reason = format!("task:{}:{}", caller.file(), caller.line());
+        async move { self.run_task_for(&reason, task).await }
+    }
+
+    /// [`Self::run_task`] with an explicit reason
+    pub(crate) async fn run_task_for<F, T>(&self, reason: &str, task: F) -> AnyResult<T>
     where
         F: for<'a> Fn(
             &'a BcCamera,
         )
             -> std::pin::Pin<Box<dyn futures::Future<Output = AnyResult<T>> + Send + 'a>>,
     {
-        let _permit = self.permit().await?;
+        let _permit = self.permit(reason).await?;
+        tokio::time::timeout(TASK_DEADLINE, self.run_passive_task(task))
+            .await
+            .map_err(|_| anyhow!("{reason}: no result within {TASK_DEADLINE:?}"))?
+    }
+
+    /// Like [`Self::run_task_for`] but without a deadline, for streams that end when their
+    /// consumer goes away
+    pub(crate) async fn run_stream_task<F, T>(&self, reason: &str, task: F) -> AnyResult<T>
+    where
+        F: for<'a> Fn(
+            &'a BcCamera,
+        )
+            -> std::pin::Pin<Box<dyn futures::Future<Output = AnyResult<T>> + Send + 'a>>,
+    {
+        let _permit = self.permit(reason).await?;
         self.run_passive_task(task).await
     }
 
@@ -153,7 +196,9 @@ impl NeoInstance {
                         // If error we check for retryable errors
                         Err(e) => {
                             match e.downcast::<neolink_core::Error>() {
-                                Ok(neolink_core::Error::DroppedConnection) | Ok(neolink_core::Error::TimeoutDisconnected) => {
+                                Ok(neolink_core::Error::DroppedConnection) | Ok(neolink_core::Error::TimeoutDisconnected) | Ok(neolink_core::Error::DroppedSubscriber) => {
+                                    // The connection went away mid-request: wait for the
+                                    // next camera and run it again
                                     continue;
                                 },
                                 Ok(neolink_core::Error::TokioBcSendError) => {
@@ -246,6 +291,17 @@ impl NeoInstance {
         Ok(instance_rx.await?)
     }
 
+    /// Wait for the next connection: a different camera than the current one, or any
+    /// camera if there is none now. Never causes a connection
+    pub(crate) async fn next_connection(&self) -> Result<()> {
+        let mut watch = self.camera_watch.clone();
+        let current = watch.borrow_and_update().clone();
+        watch
+            .wait_for(|cam| !Weak::ptr_eq(cam, &current) && cam.upgrade().is_some())
+            .await?;
+        Ok(())
+    }
+
     pub(crate) fn camera(&self) -> WatchReceiver<Weak<BcCamera>> {
         self.camera_watch.clone()
     }
@@ -275,10 +331,12 @@ impl NeoInstance {
         Ok(instance_rx.await?)
     }
 
-    pub(crate) async fn permit(&self) -> Result<Permit> {
+    /// A permit keeps the camera connected while held. `reason` is recorded in the wake
+    /// ledger (SPEC P6)
+    pub(crate) async fn permit(&self, reason: &str) -> Result<Permit> {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control
-            .send(NeoCamCommand::GetPermit(instance_tx))
+            .send(NeoCamCommand::GetPermit(reason.to_string(), instance_tx))
             .await?;
         Ok(instance_rx.await?)
     }

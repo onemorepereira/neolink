@@ -4,7 +4,7 @@
 //!
 use super::DiscoveryResult;
 use crate::bc::model::*;
-use crate::bc_protocol::{md5_string, Md5Trunc, TcpSource};
+use crate::bc_protocol::TcpSource;
 use crate::bcudp::codex::BcUdpCodex;
 use crate::bcudp::model::*;
 use crate::bcudp::xml::*;
@@ -1076,17 +1076,15 @@ impl Discovery {
     // Check if TCP is possible
     //
     // To do this we send a dummy login  and see if it replies with any BC packet
+    /// Check that a Baichuan camera answers at `addr`
+    ///
+    /// Sends the header-only "login upgrade" request, which is the first step of every
+    /// login and carries no credentials, and waits for any Baichuan reply. Before, this
+    /// logged in as admin/123456, which made the camera record a failed login every time
+    /// (SPEC P13); a bare TCP connect would accept any service on the port.
     pub(crate) async fn check_tcp(&self, addr: SocketAddr, channel_id: u8) -> Result<()> {
-        let username = "admin";
-        let password = Some("123456");
         let mut tcp_source =
-            timeout(*TCP_WAIT, TcpSource::new(addr, username, password, false)).await??;
-
-        let md5_username = md5_string(username, Md5Trunc::ZeroLast);
-        let md5_password = password
-            .map(|p| md5_string(p, Md5Trunc::ZeroLast))
-            .unwrap_or_else(|| EMPTY_LEGACY_PASSWORD.to_owned());
-
+            timeout(*TCP_WAIT, TcpSource::new(addr, "", None::<String>, false)).await??;
         tcp_source
             .send(Bc {
                 meta: BcMeta {
@@ -1094,19 +1092,15 @@ impl Discovery {
                     channel_id,
                     msg_num: 0,
                     stream_type: 0,
-                    response_code: 0x00,
+                    response_code: 0xdc00,
                     class: 0x6514,
                 },
-                body: BcBody::LegacyMsg(LegacyMsg::LoginMsg {
-                    username: md5_username,
-                    password: md5_password,
-                }),
+                body: BcBody::LegacyMsg(LegacyMsg::LoginUpgrade),
             })
             .await?;
-
         let _bc: Bc = timeout(*TCP_WAIT, tcp_source.next())
             .await?
-            .ok_or(Error::CannotInitCamera)??; // Successful recv should mean a Bc packet if not then deser will fail
+            .ok_or(Error::CannotInitCamera)??;
         Ok(())
     }
 

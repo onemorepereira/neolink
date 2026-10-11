@@ -27,6 +27,14 @@ struct Subscriber {
 }
 
 pub(crate) type BcConnSink = Box<dyn Sink<Bc, Error = Error> + Send + Sync + Unpin>;
+
+/// What the writer task receives
+#[allow(clippy::large_enum_variant)] // Msg is the common case
+enum Outgoing {
+    Msg(Result<Bc>),
+    /// Reply once every message queued before this one has been written
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
 pub(crate) type BcConnSource = Box<dyn Stream<Item = Result<Bc>> + Send + Sync + Unpin>;
 
 /// A shareable connection to a camera.  Handles serialization of messages.  To send/receive, call
@@ -35,7 +43,7 @@ pub(crate) type BcConnSource = Box<dyn Stream<Item = Result<Bc>> + Send + Sync +
 ///
 /// There can be only one subscriber per kind of message at a time.
 pub struct BcConnection {
-    sink: Sender<Result<Bc>>,
+    sink: Sender<Outgoing>,
     poll_commander: Sender<PollCommand>,
     rx_thread: RwLock<JoinSet<Result<()>>>,
     cancel: CancellationToken,
@@ -43,7 +51,7 @@ pub struct BcConnection {
 
 impl BcConnection {
     pub async fn new(mut sink: BcConnSink, mut source: BcConnSource) -> Result<BcConnection> {
-        let (sinker, sinker_rx) = channel::<Result<Bc>>(100);
+        let (sinker, sinker_rx) = channel::<Outgoing>(100);
         let cancel = CancellationToken::new();
 
         let (poll_commander, poll_commanded) = channel(200);
@@ -66,7 +74,11 @@ impl BcConnection {
                     while let Some(bc) = source.next().await {
                         sender.send(PollCommand::Bc(Box::new(bc))).await?;
                     }
-                    Result::Ok(())
+                    // The camera closed the connection. Stop the other tasks, which drops
+                    // every subscriber so pending requests fail now instead of hanging
+                    // until a ping timeout, and make join() return an error
+                    thread_cancel.cancel();
+                    Result::Err(Error::DroppedConnection)
                 } => v
             }
         });
@@ -78,7 +90,12 @@ impl BcConnection {
                 v = async {
                     let mut stream = ReceiverStream::new(sinker_rx);
                     while let Some(packet) = stream.next().await {
-                        sink.send(packet?).await?;
+                        match packet {
+                            Outgoing::Msg(packet) => sink.send(packet?).await?,
+                            Outgoing::Flush(done) => {
+                                let _ = done.send(());
+                            }
+                        }
                     }
                     Ok(())
                 } => v
@@ -109,7 +126,10 @@ impl BcConnection {
     }
 
     pub(super) async fn send(&self, bc: Bc) -> crate::Result<()> {
-        self.sink.send(Ok(bc)).await?;
+        self.sink
+            .send(Outgoing::Msg(Ok(bc)))
+            .await
+            .map_err(|_| Error::DroppedConnection)?;
         Ok(())
     }
 
@@ -177,6 +197,11 @@ impl BcConnection {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        // Let queued messages (a logout) reach the camera before the tasks are cancelled
+        let (done, flushed) = tokio::sync::oneshot::channel();
+        if self.sink.send(Outgoing::Flush(done)).await.is_ok() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), flushed).await;
+        }
         let _ = self.poll_commander.send(PollCommand::Disconnect).await;
         self.cancel.cancel();
         let mut locked_threads = self.rx_thread.write().await;
@@ -224,7 +249,7 @@ impl std::fmt::Debug for PollCommand {
 
 struct Poller {
     subscribers: Subscriber,
-    sink: Sender<Result<Bc>>,
+    sink: Sender<Outgoing>,
     reciever: ReceiverStream<PollCommand>,
 }
 
@@ -277,7 +302,7 @@ impl Poller {
                                             v = occ(&response) => {
                                                 if let Some(reply) = v {
                                                     assert!(reply.meta.msg_num == response.meta.msg_num);
-                                                    sink.send(Ok(reply)).await?;
+                                                    sink.send(Outgoing::Msg(Ok(reply))).await.map_err(|_| Error::DroppedConnection)?;
                                                 }
                                                 Result::Ok(())
                                             }

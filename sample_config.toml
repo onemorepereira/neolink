@@ -6,6 +6,14 @@ bind = "0.0.0.0"
 # Default port is 8554 but you can change it by uncommenting the following
 # bind_port = 8554
 
+# Cached snapshots: http://<bind>:<snapshot_port>/<camera>/snapshot.jpg serves the picture
+# taken during the camera's last wake and never wakes it. Use it as Home Assistant's
+# still image URL for battery cameras. Default bind_port + 1; 0 disables it.
+# snapshot_port = 8555
+#
+# What neolink learns about each camera (battery level, streams, last snapshot) is kept
+# in $NEOLINK_STATE_DIR (default ~/.local/state/neolink).
+
 # Uncomment the following and supply a path to a valid PEM
 # to activate TLS encryption.
 # The PEM should contain the certificate and the private key
@@ -49,6 +57,16 @@ address = "192.168.1.187:9000"
 # If you use a battery camera: **Instead** of an `address` supply the uid
 # as follows
 # uid = "ABCD01234567890EFG"
+
+# Power. Neolink only connects to a camera while something needs it (an RTSP viewer, a
+# CLI or MQTT command) and disconnects `idle_grace_s` seconds after the last use, so
+# battery cameras can sleep. That is the default unless the camera is known to be on
+# mains power:
+# battery = false        # mains powered: stay connected (as before)
+# idle_disconnect = false # stay connected even on battery (drains it; logs a warning)
+# idle_grace_s = 10      # seconds to stay connected after the last use
+# motion_hold_max_s = 120 # longest a motion event keeps the camera connected
+# snapshot_fresh = false # allow /<name>/snapshot.jpg?fresh=1, which wakes the camera
 
 # By default any of the users can connect (or anyone at all if no users are specfied)
 # You can uncomment the following to permit only specfic users

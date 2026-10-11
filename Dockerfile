@@ -78,16 +78,18 @@ RUN apt-get update && \
 COPY --from=build \
   /usr/local/src/neolink/target/release/neolink \
   /usr/local/bin/neolink
-COPY docker/entrypoint.sh /entrypoint.sh
 
 RUN gst-inspect-1.0; \
     chmod +x "/usr/local/bin/neolink" && \
     "/usr/local/bin/neolink" --version && \
-    mkdir -m 0700 /root/.config/
+    mkdir -m 0700 /root/.config/ /var/lib/neolink
 
-ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554
-
-CMD /usr/local/bin/neolink "${NEO_LINK_MODE}" --config /etc/neolink.toml
-ENTRYPOINT ["/entrypoint.sh"]
+# neolink is PID 1 (exec form), so `docker stop` reaches it as SIGTERM and it logs the
+# cameras out before exiting (PLAN 1.9). NEO_LINK_MODE picks the subcommand.
+# Mount /var/lib/neolink to keep what neolink learns about each camera (battery level,
+# streams, last snapshot) across restarts.
+ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554 NEOLINK_STATE_DIR=/var/lib/neolink
+VOLUME /var/lib/neolink
+ENTRYPOINT ["/usr/local/bin/neolink"]
+CMD ["--config", "/etc/neolink.toml"]
 EXPOSE ${NEO_LINK_PORT}
-

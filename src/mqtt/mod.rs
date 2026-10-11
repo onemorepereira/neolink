@@ -77,7 +77,7 @@ mod discovery;
 mod mqttc;
 
 use crate::{
-    common::{MdState, NeoInstance, NeoReactor},
+    common::{MdState, NeoInstance, NeoReactor, StateFile},
     config::Config,
     AnyResult,
 };
@@ -202,6 +202,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
             v = async {
                 while let Ok(msg) = thread_instance.recv().await {
                     if msg.topic == "config" {
+                        crate::config::warn_unknown_keys(&msg.message, "MQTT neolink/config");
                         let config: Result<Config> = toml::from_str(&msg.message).with_context(|| {
                             format!("Failed to parse the MQTT {:?} config file", msg.topic)
                         });
@@ -478,6 +479,24 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     }, if config.enable_motion => v,
                     // Handle the SNAP (image preview)
                     v = async {
+                        // A sleeping camera's preview comes from the snapshot its wake
+                        // reads saved: one per wake, and no second snapshot request
+                        // competing with theirs (SPEC P5, P14)
+                        let cam_config = camera_snap.config().await?.borrow().clone();
+                        if cam_config.sleeps() {
+                            let state = StateFile::for_camera(&cam_config);
+                            loop {
+                                let before = state.load().snapshot_at;
+                                camera_snap.next_connection().await?;
+                                wait_for_state(|| state.load().snapshot_at != before).await;
+                                if let Some((jpeg, _)) = state.snapshot() {
+                                    mqtt_snap
+                                        .send_message("status/preview", BASE64.encode(jpeg).as_str(), true)
+                                        .await
+                                        .with_context(|| format!("{}: Failed to publish preview", camera_name))?;
+                                }
+                            }
+                        }
                         let mut wait = IntervalStream::new({
                             let mut i = interval(Duration::from_millis(config.preview_update));
                             i.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -521,6 +540,22 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     }, if config.enable_preview => v,
                     // Handle the battery publish
                     v = async {
+                        // A sleeping camera's battery comes from its wake reads (SPEC P7)
+                        let cam_config = camera_battery.config().await?.borrow().clone();
+                        if cam_config.sleeps() {
+                            let state = StateFile::for_camera(&cam_config);
+                            loop {
+                                let before = state.load().last_battery.map(|b| b.at);
+                                camera_battery.next_connection().await?;
+                                wait_for_state(|| state.load().last_battery.map(|b| b.at) != before).await;
+                                if let Some(b) = state.load().last_battery {
+                                    mqtt_battery
+                                        .send_message("status/battery_level", format!("{}", b.percent).as_str(), true)
+                                        .await
+                                        .with_context(|| format!("{}: Failed to publish battery", camera_name))?;
+                                }
+                            }
+                        }
                         let mut wait = IntervalStream::new({
                             let mut i = interval(Duration::from_millis(config.battery_update));
                             i.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1073,7 +1108,7 @@ async fn handle_mqtt_message(
         } => {
             let reply = match message.parse::<u64>() {
                 Ok(secs) => {
-                    if let Ok(permit) = camera.permit().await {
+                    if let Ok(permit) = camera.permit("mqtt:control/wakeup").await {
                         // This task waits for the `run_task` to send the OK then starts the countdown
                         // to drop the permit
                         let camera = camera.clone();
@@ -1341,4 +1376,14 @@ async fn handle_mqtt_message(
         _ => {}
     }
     Ok(())
+}
+
+/// Wait up to 60 s for the wake reads to update the state file
+async fn wait_for_state(updated: impl Fn() -> bool) {
+    for _ in 0..120 {
+        if updated() {
+            return;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }

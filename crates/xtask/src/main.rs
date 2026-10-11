@@ -3,7 +3,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use xtask::{golden, mkfixture};
+use xtask::{fakecam, golden, mkfixture};
 
 #[derive(Parser)]
 struct Cli {
@@ -15,6 +15,8 @@ struct Cli {
 enum Cmd {
     /// Generate synthetic `.bcm` fixtures with ffmpeg
     Mkfixture(mkfixture::Opts),
+    /// Run the scripted fake camera as a process (end-to-end tests)
+    Fakecam(fakecam::Opts),
     /// Golden RTSP transcripts
     #[command(subcommand)]
     Golden(GoldenCmd),
@@ -55,6 +57,7 @@ fn read(p: &PathBuf) -> anyhow::Result<Vec<golden::Entry>> {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Cmd::Mkfixture(opts) => mkfixture::run(opts),
+        Cmd::Fakecam(opts) => fakecam::run(opts),
         Cmd::Golden(GoldenCmd::Record {
             listen,
             upstream,

@@ -87,7 +87,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
     };
 
     camera
-        .run_task(|cam| {
+        .run_stream_task("cli:talk", |cam| {
             let rx = rx.clone();
             let talk_config = talk_config.clone();
             Box::pin(async move {

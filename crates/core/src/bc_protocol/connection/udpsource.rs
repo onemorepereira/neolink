@@ -401,6 +401,26 @@ impl UdpPayloadInner {
                     Ok(())
                 } => v,
             };
+            if send_cancel.is_cancelled() {
+                // A deliberate close: tell the camera, so it can sleep now instead of
+                // waiting for its own timeout (SPEC P13)
+                let msg = BcUdp::Discovery(UdpDiscovery {
+                    tid: {
+                        let mut rng = thread_rng();
+                        (rng.gen::<u8>()) as u32
+                    },
+                    payload: UdpXml::C2dDisc(C2dDisc {
+                        cid: thread_client_id,
+                        did: thread_camera_id,
+                    }),
+                });
+                log::debug!("Sending C2D_DISC");
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(250),
+                    inner.send((msg, thread_camera_addr)),
+                )
+                .await;
+            }
             send_cancel.cancel();
             result
         });
