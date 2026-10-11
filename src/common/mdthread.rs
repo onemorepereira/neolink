@@ -102,9 +102,15 @@ impl NeoCamMdThread {
             // motion permit (and the camera) alive after a drop (SPEC P12)
             v = async {
                 loop {
-                    camera_watch.wait_for(|cam| cam.upgrade().is_some()).await?;
-                    camera_watch.wait_for(|cam| cam.upgrade().is_none()).await?;
-                    reset_watcher.send_replace(MdState::Unknown);
+                    // Any change of connection (gone, or replaced by a quick reconnect
+                    // that this may not see as "gone") ends the old connection's motion
+                    let current = camera_watch.borrow_and_update().clone();
+                    camera_watch
+                        .wait_for(|cam| !std::sync::Weak::ptr_eq(cam, &current))
+                        .await?;
+                    if current.upgrade().is_some() || camera_watch.borrow().upgrade().is_none() {
+                        reset_watcher.send_replace(MdState::Unknown);
+                    }
                 }
             } => v,
         }
