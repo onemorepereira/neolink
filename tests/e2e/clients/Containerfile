@@ -1,0 +1,33 @@
+# Client image for the Gate 3 client tests (PLAN 3.9): tests/e2e/clients.sh.
+# Adds VLC 3 (cvlc) and a pinned go2rtc release to neolink-dev (Debian bookworm, Rust,
+# mosquitto, curl). The pinned static ffmpeg/ffprobe is mounted at /ffmpeg at run time,
+# as with neolink-dev, and go2rtc is pointed at /ffmpeg/bin/ffmpeg by its config.
+#   podman build -t neolink-clients -f tests/e2e/clients/Containerfile tests/e2e/clients
+# VLC refuses to run as root, so clients.sh runs cvlc as the `vlc` user created here.
+FROM localhost/neolink-dev:latest
+
+# Debian's own VLC is built without live555, so it has no RTSP client. deb-multimedia's
+# bookworm build has it (liblive555_plugin.so); its keyring package is pinned by sha256.
+ARG DMO_KEYRING=deb-multimedia-keyring_2024.9.1_all.deb
+ARG DMO_KEYRING_SHA256=8dc6cbb266c701cfe58bd1d2eb9fe2245a1d6341c7110cfbfe3a5a975dcf97ca
+RUN curl -fsSL -o /tmp/dmo.deb "https://www.deb-multimedia.org/pool/main/d/deb-multimedia-keyring/${DMO_KEYRING}" \
+ && echo "${DMO_KEYRING_SHA256}  /tmp/dmo.deb" | sha256sum -c - \
+ && dpkg -i /tmp/dmo.deb && rm /tmp/dmo.deb \
+ && echo "deb https://www.deb-multimedia.org bookworm main" > /etc/apt/sources.list.d/dmo.list \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      vlc-bin vlc-plugin-base util-linux \
+ && rm -rf /var/lib/apt/lists/* \
+ && test -f /usr/lib/x86_64-linux-gnu/vlc/plugins/access/liblive555_plugin.so \
+ && useradd --create-home --shell /usr/sbin/nologin vlc
+
+# go2rtc, pinned by version and by the sha256 GitHub publishes for the asset
+ARG GO2RTC_VERSION=v1.9.14
+ARG GO2RTC_SHA256=32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6
+RUN curl -fsSL -o /usr/local/bin/go2rtc \
+      "https://github.com/AlexxIT/go2rtc/releases/download/${GO2RTC_VERSION}/go2rtc_linux_amd64" \
+ && echo "${GO2RTC_SHA256}  /usr/local/bin/go2rtc" | sha256sum -c - \
+ && chmod 0755 /usr/local/bin/go2rtc
+
+RUN runuser -u vlc -- cvlc --version | head -1 \
+ && go2rtc -version
