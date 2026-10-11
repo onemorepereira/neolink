@@ -89,6 +89,8 @@ async fn main() -> Result<()> {
     config
         .validate()
         .with_context(|| format!("Failed to validate the {:?} config file", conf_path))?;
+    // The config is read (as root, if the image runs so): now become PUID/PGID if asked
+    drop_privileges()?;
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
 
@@ -265,6 +267,43 @@ fn args_with_mode(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> 
 
 /// Raise the open-file soft limit to the hard limit (the entrypoint's `ulimit -n` did
 /// this before); each RTSP client and camera connection needs descriptors
+/// `PUID`/`PGID` (the container convention): switch to that user and group after reading
+/// the config, when running as root (DESIGN §3.3). Nothing happens without `PUID`.
+fn drop_privileges() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let Some(uid) = std::env::var("PUID").ok().filter(|v| !v.is_empty()) else {
+            return Ok(());
+        };
+        let uid: libc::uid_t = uid.parse().context("PUID must be a number")?;
+        let gid: libc::gid_t = match std::env::var("PGID").ok().filter(|v| !v.is_empty()) {
+            Some(g) => g.parse().context("PGID must be a number")?,
+            None => uid as libc::gid_t,
+        };
+        // SAFETY: plain syscalls on integers; the group list is one valid gid
+        unsafe {
+            if libc::geteuid() != 0 {
+                if libc::geteuid() != uid {
+                    warn!("PUID={uid} ignored: not running as root");
+                }
+                return Ok(());
+            }
+            let groups = [gid];
+            if libc::setgroups(1, groups.as_ptr()) != 0
+                || libc::setgid(gid) != 0
+                || libc::setuid(uid) != 0
+            {
+                anyhow::bail!(
+                    "could not switch to PUID={uid} PGID={gid}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        info!("Running as uid {uid}, gid {gid}");
+    }
+    Ok(())
+}
+
 fn raise_fd_limit() {
     #[cfg(unix)]
     // SAFETY: getrlimit/setrlimit only read and write the struct we pass

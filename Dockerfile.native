@@ -1,0 +1,35 @@
+# Neolink with the native RTSP backend: one static binary, no GStreamer, FROM scratch
+# (PLAN 6.2). Same conventions as ./Dockerfile:
+# - NEO_LINK_MODE picks the subcommand;
+# - the config is /etc/neolink.toml;
+# - state goes in /var/lib/neolink.
+# It runs as root by default for existing root-owned 0600 configs. Set PUID/PGID to drop to
+# that user after the config is read; the state volume must then be writable by it.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+FROM docker.io/library/rust:1.90-alpine AS build
+# hadolint ignore=DL3018
+RUN apk add --no-cache musl-dev protobuf-dev perl make
+WORKDIR /usr/local/src/neolink
+COPY . .
+RUN cargo build --release --locked --no-default-features --features native-rtsp \
+ && mkdir -p /out/var/lib/neolink /out/etc/ssl/certs \
+ && cp target/release/neolink /out/neolink \
+ && /out/neolink --version
+
+FROM docker.io/library/alpine:3.20 AS certs
+# hadolint ignore=DL3018
+RUN apk add --no-cache ca-certificates
+
+FROM scratch
+ARG VERSION
+LABEL description="Neolink: Reolink cameras over RTSP, native backend (no GStreamer)"
+LABEL version="$VERSION"
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/var/lib/neolink /var/lib/neolink
+COPY --from=build /out/neolink /usr/local/bin/neolink
+ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554 NEOLINK_STATE_DIR=/var/lib/neolink NEO_IN_CONTAINER=1
+VOLUME /var/lib/neolink
+ENTRYPOINT ["/usr/local/bin/neolink"]
+CMD ["--config", "/etc/neolink.toml"]
+EXPOSE 8554
