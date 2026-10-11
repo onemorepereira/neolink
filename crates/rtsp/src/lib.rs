@@ -6,4 +6,5 @@
 pub mod codec;
 pub mod hub;
 pub mod rtp;
+pub mod rtsp;
 pub mod source;
