@@ -422,3 +422,20 @@ async fn test_100_cycles_return_to_baseline() {
     }
     assert_eq!(cam.stats().logins, 100);
 }
+
+/// A25 / P4: with demand, an unreachable camera is retried with backoff (1, 2, 4.. 60 s).
+/// Real time: tokio's paused clock races real sockets
+#[tokio::test]
+async fn test_backoff_with_demand() {
+    let cam = FakeCamera::start(FakeCameraConfig::default()).await.unwrap();
+    cam.set_unreachable(true);
+    let neocam = new_neocam(config_for(&cam, "")).await;
+    let instance = neocam.subscribe().await.unwrap();
+    let permit = instance.permit("test:demand").await.unwrap();
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    drop(permit);
+    // Each attempt is a port check plus a login connection. With backoff the attempts
+    // start at 0, 1, 3, 7, 15 and 31 s; the old 5 s cap made about 13 in 40 s
+    let attempts = cam.stats().connections / 2;
+    assert!((4..=8).contains(&attempts), "{} attempts in 40 s", attempts);
+}
