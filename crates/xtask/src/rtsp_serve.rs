@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use neolink_rtsp::hub::task::{spawn, HubConfig, HubHandle};
+use neolink_rtsp::hub::task::{spawn, HubConfig, HubHandle, ParameterSets};
 use neolink_rtsp::rtsp::auth::{Allowed, Auth, Schemes, User};
 use neolink_rtsp::rtsp::route::{aliases, MountTarget, Routes, StreamKind};
 use neolink_rtsp::rtsp::server::{Provider, Server, ServerConfig};
@@ -52,6 +52,9 @@ pub struct Opts {
     /// … for this many seconds (a camera outage)
     #[arg(long, default_value_t = 60.0)]
     stall_for: f64,
+    /// In-band parameter sets: strip, passthrough or inject
+    #[arg(long, default_value = "strip")]
+    parameter_sets: String,
     /// Linger after the last client, seconds
     #[arg(long, default_value_t = 5.0)]
     linger: f64,
@@ -98,6 +101,12 @@ pub fn run(opts: Opts) -> Result<()> {
             let mut cfg = HubConfig::new(&format!("{}/{}", opts.camera, kind.name()));
             cfg.battery = opts.battery;
             cfg.linger = Duration::from_secs_f64(opts.linger);
+            cfg.parameter_sets = match opts.parameter_sets.as_str() {
+                "strip" => ParameterSets::Strip,
+                "passthrough" => ParameterSets::Passthrough,
+                "inject" => ParameterSets::Inject,
+                o => anyhow::bail!("--parameter-sets {o}: strip, passthrough or inject"),
+            };
             let hub = spawn(cfg, source.clone());
             hubs.insert(
                 MountTarget {
