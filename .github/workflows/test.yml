@@ -100,3 +100,26 @@ jobs:
             -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -e PATH=/usr/local/cargo/bin:/usr/bin:/bin:/ffmpeg/bin \
             -e A5_SECS=300 -w /src neolink-clients sh -c \
             'cargo xtask mkfixture --standard --out fixtures/synth && cargo build --release --features native-rtsp -p neolink -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh && E2E_WORK=$(mktemp -d) SERVER=neolink sh tests/e2e/clients.sh'
+
+  container:
+    name: Native image (A13, N9)
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned ffmpeg
+        run: |
+          mkdir -p ~/ffmpeg
+          curl -sSL -o /tmp/ffmpeg.tar.xz "$FFMPEG_URL"
+          echo "$FFMPEG_SHA256  /tmp/ffmpeg.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/ffmpeg.tar.xz -C ~/ffmpeg --strip-components=1
+      - name: Images, fixtures and the scripted camera
+        run: |
+          podman build -t neolink:native -f Dockerfile.native .
+          podman build -t neolink-dev -f tests/e2e/dev/Containerfile tests/e2e/dev
+          podman volume create neolink-target
+          podman run --rm -v "$PWD:/src:z" -v neolink-target:/target -e CARGO_TARGET_DIR=/target \
+            -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -v "$HOME/ffmpeg:/ffmpeg:ro,z" -w /src neolink-dev \
+            sh -c 'cargo xtask mkfixture --standard --out fixtures/synth && cargo build --release -p xtask'
+      - name: A13 and N9
+        run: IMAGE=neolink:native FFMPEG_DIR=$HOME/ffmpeg sh tests/e2e/container-native.sh

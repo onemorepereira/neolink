@@ -22,25 +22,29 @@ i=0; until [ -e "$W/ready" ] || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
 HZ=$(getconf CLK_TCK)
 cpu_ticks() { awk '{print $14 + $15}' /proc/$SRV/stat; }
 rss() { awk '/VmRSS/ {print $2}' /proc/$SRV/status; }
-clients() { # n secs
+CLIENTS=""
+clients() { # n secs; their pids go in CLIENTS
+  CLIENTS=""
   for k in $(seq "$1"); do
     timeout $(($2 + 30)) ffmpeg -hide_banner -loglevel error -nostdin -rtsp_transport tcp \
       -i "rtsp://127.0.0.1:$PORT/argus/main" -t "$2" -c copy -f null - > "$W/client.$1.$k.log" 2>&1 &
+    CLIENTS="$CLIENTS $!"
   done
 }
+wait_clients() { for p in $CLIENTS; do wait "$p"; done; }
 FAILS=0
 # N3: 4 clients; measure after a 10 s warm-up
 clients 4 $((PERF_SECS + 15))
 sleep 10
 a=$(cpu_ticks); sleep "$PERF_SECS"; b=$(cpu_ticks)
-wait
+wait_clients
 pct=$(awk -v t=$((b - a)) -v hz="$HZ" -v s="$PERF_SECS" 'BEGIN {printf "%.2f", t * 100 / (hz * s)}')
 ok=$(awk -v p="$pct" 'BEGIN {print (p <= 5) ? 1 : 0}')
 msg="4K H.265 to 4 clients: ${pct} % of one core over ${PERF_SECS}s"
 if [ "$ok" = 1 ]; then echo "PASS N3 $msg"; else echo "FAIL N3 $msg"; FAILS=$((FAILS+1)); fi
 # N4: RSS with 1, then 5 clients
-clients 1 70; sleep 60; r1=$(rss); wait
-clients 5 70; sleep 60; r5=$(rss); wait
+clients 1 70; sleep 60; r1=$(rss); wait_clients
+clients 5 70; sleep 60; r5=$(rss); wait_clients
 per=$(awk -v a="$r1" -v b="$r5" 'BEGIN {printf "%.0f", (b - a) / 4}')
 msg="RSS $r1 KiB with 1 client, $r5 KiB with 5: ${per} KiB per added client"
 if [ "$per" -le 1024 ]; then echo "PASS N4 $msg"; else echo "FAIL N4 $msg"; FAILS=$((FAILS+1)); fi
