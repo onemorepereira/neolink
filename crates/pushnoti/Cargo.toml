@@ -19,4 +19,4 @@ regex = "1.8.1"
 serde = "1.0.163"
 tokio = { version = "1.28.1", features = ["full"] }
 toml = "0.8.2"
-validator = {version="0.18.1", features = ["derive"] }
+validator = {version="0.20.0", features = ["derive"] }

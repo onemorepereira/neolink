@@ -24,7 +24,27 @@ targets = [
 # directly. Ignore entries need a reason and are reviewed when their crate is updated.
 unmaintained = "workspace"
 yanked = "deny"
-ignore = []
+ignore = [
+  # time 0.3.36 (neolink_core). The fix (0.3.47) needs Rust 1.88, above the MSRV (1.82).
+  # Only RFC 2822 parsing is affected, which neolink does not use. Remove when the MSRV
+  # reaches 1.88 and time is updated to >= 0.3.47.
+  { id = "RUSTSEC-2026-0009", reason = "time: RFC 2822 parsing only (unused); fix needs Rust 1.88 > MSRV" },
+  # rustls-webpki 0.102.8: rumqttc 0.25.1 (latest) still depends on it, only for the
+  # TlsError::WebPki variant. MQTT certificate checks run in rustls 0.23 with the
+  # patched rustls-webpki 0.103. Remove when rumqttc drops rustls-webpki 0.102.
+  { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
+  # The `pushnoti` feature: fcm-push-listener 2.0.3 pins rustls 0.20 (and ring 0.16) and
+  # reqwest 0.11 (h2 0.3), none of which has a patched release. Only fcm-push-listener 4
+  # moves off them, and it replaces the sender-ID registration with a Firebase
+  # app/project/API-key one: a rewrite of the push listener that needs a live FCM test.
+  # Remove these when pushnoti moves to fcm-push-listener >= 4 (or is dropped).
+  { id = "RUSTSEC-2024-0336", reason = "rustls 0.20 via fcm-push-listener 2 (pushnoti); no 0.20 fix" },
+  { id = "RUSTSEC-2025-0009", reason = "ring 0.16 via fcm-push-listener 2 (pushnoti); no 0.16 fix, panics only with overflow checks" },
+  { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via reqwest 0.11 in fcm-push-listener 2 (pushnoti); fixed only in h2 0.4" },
+]
 
 [licenses]
 # neolink is AGPL-3.0-or-later; every dependency license must be compatible with it.
@@ -40,8 +60,8 @@ allow = [
   "MIT",
   "MPL-2.0",
   "OpenSSL",
+  "Unicode-3.0",
   "Unicode-DFS-2016",
-  "Zlib",
 ]
 confidence-threshold = 0.9
 # A license that leaves the tree is reported (warning), so the list stays the set in use

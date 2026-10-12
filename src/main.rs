@@ -29,6 +29,9 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+// Linked only for its `ring` feature: rustls' crypto provider for MQTT over TLS
+use rustls as _;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use env_logger::Env;
