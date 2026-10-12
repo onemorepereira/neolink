@@ -1,77 +1,106 @@
 name: Test
 
+# Every pull request (forks included) and every push to master. The long runs (the 15 and
+# 90 min A/V and Frigate runs, the soak, fuzzing, the full client gate) are in nightly.yml.
 on:
   push:
+    branches: [master]
+  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
-  # Static ffmpeg pinned for every ffmpeg-based test and for fixture generation: request
-  # shapes, error strings and encoder output differ between ffmpeg versions.
-  FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-10-13-04/ffmpeg-n8.1.3-17-gc389840894-linux64-gpl-8.1.tar.xz
-  FFMPEG_SHA256: fc332aa9e6d204ea674432c9e2c53696f75ff6d7d11de337b286bde494d7c583
+  CARGO_TERM_COLOR: always
 
 jobs:
   test:
     name: cargo test
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: apt install gstreamer and deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libgstrtspserver-1.0-dev \
             libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
-      - uses: actions/cache@v4
-        id: ffmpeg-cache
-        with:
-          path: ~/ffmpeg
-          key: ffmpeg-${{ env.FFMPEG_SHA256 }}
-      - name: Fetch pinned ffmpeg
-        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/ffmpeg
-          curl -sSL -o /tmp/ffmpeg.tar.xz "$FFMPEG_URL"
-          echo "$FFMPEG_SHA256  /tmp/ffmpeg.tar.xz" | sha256sum -c -
-          tar -xJf /tmp/ffmpeg.tar.xz -C ~/ffmpeg --strip-components=1
-      - name: Use pinned ffmpeg
-        run: |
-          echo "NEOLINK_FFMPEG=$HOME/ffmpeg/bin/ffmpeg" >> "$GITHUB_ENV"
-          echo "NEOLINK_REQUIRE_FFMPEG=1" >> "$GITHUB_ENV"
-          echo "$HOME/ffmpeg/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-ffmpeg
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Generate fixtures and check they are reproducible
         run: |
-          cp fixtures/synth/SHA256SUMS /tmp/SHA256SUMS
-          cargo xtask mkfixture --standard --out fixtures/synth --check /tmp/SHA256SUMS
+          cp fixtures/synth/SHA256SUMS "$RUNNER_TEMP/SHA256SUMS"
+          cargo xtask mkfixture --standard --out fixtures/synth --check "$RUNNER_TEMP/SHA256SUMS"
       - name: cargo test
+        env:
+          NEOLINK_REQUIRE_FFMPEG: "1"
         run: |
-          cargo test --workspace
-          cargo test --workspace --features native-rtsp
+          cargo test --locked --workspace
+          cargo test --locked --workspace --features native-rtsp
+      - name: retina client tests (A6, A17, A22; own lockfile, newest retina)
+        run: cargo test --locked --manifest-path crates/rtsp-it/Cargo.toml
+
+  e2e:
+    name: End-to-end (golden, power, A/V, Frigate bridge)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: apt install gstreamer, its plugins, mosquitto
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgstrtspserver-1.0-dev \
+            libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav mosquitto mosquitto-clients
+          # The broker is started by power.sh on its own port
+          sudo systemctl stop mosquitto || true
+      - uses: ./.github/actions/setup-ffmpeg
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Fixtures, neolink and xtask (release)
+        id: build
+        run: |
+          cargo xtask mkfixture --standard --out fixtures/synth
+          cargo build --locked --release --features native-rtsp -p neolink -p xtask
+      # Every test step runs once the build is done, so one failure does not hide the others
       - name: Golden structural diff, native server vs GStreamer (A19)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
-          cargo build --release --features native-rtsp -p neolink -p xtask
           E2E_WORK=$(mktemp -d) tests/e2e/golden-native.sh
           # Gate 4: the same through neolink and the scripted camera
           E2E_WORK=$(mktemp -d) SERVER=neolink tests/e2e/golden-native.sh
-      - name: A/V sync through the native server (A16, 5 s, 60 s and 15 min)
+      - name: GStreamer backend vs the goldens (Gate 1)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: E2E_WORK=$(mktemp -d) tests/e2e/golden-fake.sh
+      - name: Power, MQTT and no password in logs (A23-A30, Gate 1)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: E2E_WORK=$(mktemp -d) tests/e2e/power.sh
+      - name: A/V sync through the native server (A16, 5 s and 60 s)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
-          E2E_WORK=$(mktemp -d) AV_SECS="5 60 900" tests/e2e/avsync.sh
-          E2E_WORK=$(mktemp -d) AV_SECS="5 60 900" SERVER=neolink tests/e2e/avsync.sh
-      - name: Frigate presets (A3, 15 min across the wrap) and bridging tolerance
-        run: E2E_WORK=$(mktemp -d) A3_SECS=900 tests/e2e/frigate.sh
-      - name: retina client tests (A6, A17, A22; own lockfile, newest retina)
-        run: cargo test --locked --manifest-path crates/rtsp-it/Cargo.toml
+          E2E_WORK=$(mktemp -d) AV_SECS="5 60" tests/e2e/avsync.sh
+          E2E_WORK=$(mktemp -d) AV_SECS="5 60" SERVER=neolink tests/e2e/avsync.sh
+      - name: Frigate bridging tolerance (60 s stall, with and without audio)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: E2E_WORK=$(mktemp -d) TESTS=bridge tests/e2e/frigate.sh
 
   msrv:
     name: MSRV (1.82)
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust 1.82
-        run: |
-          rustup toolchain install 1.82 --profile minimal
-          rustup override set 1.82
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: "1.82.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo check
         run: |
           cargo check --locked --all-targets -p neolink_core -p neolink_rtsp -p xtask -p neolink_decoder -p mailnoti
@@ -81,45 +110,74 @@ jobs:
   clients:
     name: Client matrix (A1, A2, A2b, A4, A4b, A5, A10)
     runs-on: ubuntu-24.04
-    needs: test
+    timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v4
-      - name: Fetch pinned ffmpeg
-        run: |
-          mkdir -p ~/ffmpeg
-          curl -sSL -o /tmp/ffmpeg.tar.xz "$FFMPEG_URL"
-          echo "$FFMPEG_SHA256  /tmp/ffmpeg.tar.xz" | sha256sum -c -
-          tar -xJf /tmp/ffmpeg.tar.xz -C ~/ffmpeg --strip-components=1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ffmpeg
+        id: ffmpeg
       - name: Build the dev and client images
         run: |
-          podman build -t neolink-dev -f tests/e2e/dev/Containerfile tests/e2e/dev
-          podman build -t neolink-clients -f tests/e2e/clients/Containerfile tests/e2e/clients
-      - name: Fixtures, xtask and the client matrix
+          podman build -t localhost/neolink-dev:ci -f tests/e2e/dev/Containerfile tests/e2e/dev
+          podman build -t localhost/neolink-clients:ci --build-arg DEV_IMAGE=localhost/neolink-dev:ci \
+            -f tests/e2e/clients/Containerfile tests/e2e/clients
+      - name: Fixtures, xtask and the client matrix (short durations; nightly runs the full gate)
+        env:
+          FFMPEG_DIR: ${{ steps.ffmpeg.outputs.dir }}
         run: |
-          podman run --rm --network host -v "$PWD:/src:z" -v "$HOME/ffmpeg:/ffmpeg:ro,z" \
+          podman run --rm --network host -v "$PWD:/src:z" -v "$FFMPEG_DIR:/ffmpeg:ro,z" \
             -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -e PATH=/usr/local/cargo/bin:/usr/bin:/bin:/ffmpeg/bin \
-            -e A5_SECS=300 -w /src neolink-clients sh -c \
-            'cargo xtask mkfixture --standard --out fixtures/synth && cargo build --release --features native-rtsp -p neolink -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh && E2E_WORK=$(mktemp -d) SERVER=neolink sh tests/e2e/clients.sh'
+            -w /src localhost/neolink-clients:ci sh -c \
+            'set -e; cargo xtask mkfixture --standard --out fixtures/synth && cargo build --locked --release --features native-rtsp -p neolink -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh && E2E_WORK=$(mktemp -d) SERVER=neolink sh tests/e2e/clients.sh'
 
   container:
-    name: Native image (A13, N9)
+    name: Image ${{ matrix.image }} (entry matrix${{ matrix.image == 'native' && ', A13, N9' || '' }})
     runs-on: ubuntu-24.04
-    needs: test
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: gstreamer
+            file: Dockerfile
+          - image: native
+            file: Dockerfile.native
     steps:
-      - uses: actions/checkout@v4
-      - name: Fetch pinned ffmpeg
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ffmpeg
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Fixtures and xtask (the fake camera runs on the host)
         run: |
-          mkdir -p ~/ffmpeg
-          curl -sSL -o /tmp/ffmpeg.tar.xz "$FFMPEG_URL"
-          echo "$FFMPEG_SHA256  /tmp/ffmpeg.tar.xz" | sha256sum -c -
-          tar -xJf /tmp/ffmpeg.tar.xz -C ~/ffmpeg --strip-components=1
-      - name: Images, fixtures and the scripted camera
+          cargo xtask mkfixture --standard --out fixtures/synth
+          cargo build --locked --release -p xtask
+      - name: catatonit (podman run --init, one of the entry cases)
         run: |
-          podman build -t neolink:native -f Dockerfile.native .
-          podman build -t neolink-dev -f tests/e2e/dev/Containerfile tests/e2e/dev
-          podman volume create neolink-target
-          podman run --rm -v "$PWD:/src:z" -v neolink-target:/target -e CARGO_TARGET_DIR=/target \
-            -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -v "$HOME/ffmpeg:/ffmpeg:ro,z" -w /src neolink-dev \
-            sh -c 'cargo xtask mkfixture --standard --out fixtures/synth && cargo build --release -p xtask'
-      - name: A13 and N9
-        run: IMAGE=neolink:native FFMPEG_DIR=$HOME/ffmpeg sh tests/e2e/container-native.sh
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends catatonit
+          podman version
+      - name: Build the image
+        id: image
+        run: podman build -t localhost/neolink-test:${{ matrix.image }} -f ${{ matrix.file }} .
+      - name: Container entry matrix (command forms, signals, privileges, config errors)
+        run: IMAGE=localhost/neolink-test:${{ matrix.image }} bash tests/e2e/container-entry.sh
+      - name: A13 and N9 (a client plays from the FROM-scratch image; stop logs out)
+        if: ${{ !cancelled() && matrix.image == 'native' && steps.image.outcome == 'success' }}
+        run: IMAGE=localhost/neolink-test:native bash tests/e2e/container-native.sh
+
+  cargo-deny:
+    name: cargo-deny (licenses, bans, sources)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
+      - name: Install cargo-deny 0.20.2 (release binary, sha256-checked)
+        run: |
+          v=0.20.2; f=cargo-deny-$v-x86_64-unknown-linux-musl
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$f.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/$v/$f.tar.gz"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $RUNNER_TEMP/$f.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/$f/cargo-deny" ~/.cargo/bin/cargo-deny
+      # Advisories are checked nightly (nightly.yml): the advisory database changes
+      # without any change here, and a new advisory should not block unrelated PRs
+      - run: cargo deny --locked check licenses bans sources
