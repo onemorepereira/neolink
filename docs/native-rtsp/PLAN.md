@@ -518,7 +518,7 @@ the MediaClock; 0.7 provides fixtures). v1's "Phase 2 in parallel with Phase 1" 
 | Risk | L | I | Mitigation | Trigger |
 |---|---|---|---|---|
 | Client incompatibility found late (Blue Iris, XProtect, Synology) | M | H | Golden structural diff; client CI image from Phase 3; Phase 5 matrix | Any P1 compatibility bug |
-| Pinned ffmpeg autobuild deleted by BtbN before the first remote CI run | H | M | Mirror the tarball (sha256 in test.yml) as a release asset on the fork before enabling CI; fixtures regenerate only with the same build | First remote CI run |
+| Pinned ffmpeg autobuild deleted by BtbN before the first remote CI run | H | M | ✅ Mirrored, unmodified and with its corresponding source, on the `mirror-ffmpeg-n8.1.3-17` prerelease; `.github/actions/setup-ffmpeg` downloads it from there (sha256-checked). Fixtures regenerate only with the same build | Closed 2026-10-12 |
 | Clients that don't retry SETUP over TCP after 461 (Synology, XProtect defaults unverified) | M | H | Test them in Phase 5; UDP is first in the §4.2 backlog | A confirmed client failure → pull UDP into v1 |
 | Battery drain from testing, or from design bugs (waking on probes) | M | M | A21; hardware budget; `battery: None` fail-safe | Battery delta > 5 % per session |
 | A/V offset wrong because the arrival-skew model is wrong | M | M | 0.4 measurement before 2.4; A16 at 5 s / 60 s / 15 min / 90 min | A16 fails |
