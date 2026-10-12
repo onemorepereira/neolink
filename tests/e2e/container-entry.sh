@@ -36,8 +36,8 @@ BROKER=${BROKER:-docker.io/library/eclipse-mosquitto:2.0.20}
 # Below the ephemeral range (32768+), where outgoing connections could take a case's port
 PORT_BASE=${PORT_BASE:-18800}
 ONLY=${ONLY:-}
-# 0 skips the "camera logged out on stop" check (the native backend does not log out a
-# camera stopped while it is still learning its streams; that is not the entry path)
+# 0 skips the "camera logged out on stop" check. Both images must pass with it on: a stop
+# while the camera is still learning its streams logs it out too
 REQUIRE_LOGOUT=${REQUIRE_LOGOUT:-1}
 TAG="neolink-entry-test-$$"
 W=$(mktemp -d)
