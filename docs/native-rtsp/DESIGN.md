@@ -332,6 +332,17 @@ moves therefore never show up as RTP or NTP steps (F-cc 7).
   `congestion_h265.bcm` fixture (`cargo xtask mkfixture`; 14 s peak lag, 4.3 s longest
   gap) is harsher. At the 300 ms mains default (threshold 3.3 s) such a gap would bridge
   briefly, which is acceptable: Phase 2.6 tests both latencies on that fixture.
+  **Clients (SPEC A11b, measured 2026-10-12, two episodes per latency).** ffmpeg (`-c copy`
+  and live decode), go2rtc and Frigate's command lines keep their sessions through the
+  forward rebases (up to +13.4 s at 1500 ms, +4.4 s at 300 ms): recordings decode
+  cleanly, their timeline follows wall time (the step shows as a gap of the rebase's size),
+  and A/V offset is unchanged across it. VLC stays connected but is the most visibly
+  affected: at the underrun that starts an episode, frames come seconds late and VLC
+  raises its `pts_delay` and re-buffers (freezes of 8–14 s, with or without a rebase);
+  after a 13 s forward rebase it drops ~3 s of audio and late frames and freezes 5–8 s
+  before it plays in step again. Neither comes from how the rebase is signalled: the SR
+  mapping is linear in wire time, so an SR sent right after it would tell live555
+  nothing new.
 
 ### 4.5 WireClock and Bridge: the only source of on-wire time
 
