@@ -174,6 +174,9 @@ pub struct Subscription {
     queued: Arc<AtomicUsize>,
     /// Fires when the Hub closes this session (gen change, bridge_max, shutdown)
     pub closed: CancellationToken,
+    /// The NTP time (µs since 1900) of wire time 0: the system clock at the Hub's
+    /// creation, where its wire clock starts (SR: NTP = epoch + wire time, DESIGN §5.3)
+    pub ntp_epoch_us: u64,
 }
 
 impl Subscription {
@@ -415,6 +418,8 @@ struct Hub {
     audio_sent: bool,
     audio_channels: u8,
     epoch: Instant,
+    /// `epoch` on the system clock, as NTP µs: the SR's NTP time of wire time 0
+    ntp_epoch_us: u64,
     stats: HubStats,
 }
 
@@ -496,6 +501,7 @@ impl Hub {
             audio_sent: false,
             audio_channels: 1,
             epoch: Instant::now(),
+            ntp_epoch_us: crate::hub::wire::ntp_now_us(),
             stats: HubStats::default(),
             cfg,
             source,
@@ -647,6 +653,7 @@ impl Hub {
                     rx,
                     queued,
                     closed,
+                    ntp_epoch_us: self.ntp_epoch_us,
                 }));
             }
             Cmd::Play(id) => {
@@ -953,10 +960,13 @@ impl Hub {
                 }
                 self.need_irap = false;
                 let restarted = std::mem::take(&mut self.restarted);
+                // The pacer keeps its anchor across a discontinuity: media time stays
+                // continuous (one frame on), so this frame is due one frame after the
+                // last one queued, or on arrival if it is late (underrun). Restarting it
+                // here released the queue at once, up to the latency ahead of the wall
+                // clock, and the re-latch kept that lead on the wire for good. A stopped
+                // source's queue is cleared (and the pacer restarted) in `stop_source`
                 let t = self.clock.video(cam_us, restarted, now);
-                if restarted || t.discontinuity {
-                    self.pacer.restart();
-                }
                 if let Some(ev) = self.learner.video(codec, &nals, irap, t.media_us, now) {
                     self.desc_event(ev);
                 }
@@ -2061,5 +2071,183 @@ mod tests {
             let st = h.stats().await.unwrap();
             assert_eq!(st.guard_engaged, 0, "{latency}: {st:?}");
         }
+    }
+
+    /// Each video frame's wire time minus the Hub's wall time at its release, as (wall µs,
+    /// lead µs). `t0` is the Hub's creation (`spawn`; virtual time stands still until
+    /// something sleeps), where its wire clock starts: the lead is how far RTP time and SR
+    /// NTP time run ahead of real time
+    async fn wire_leads(sub: &mut Subscription, t0: Instant, secs: u64) -> Vec<(u64, i64)> {
+        let mut out = vec![];
+        let end = Instant::now() + Duration::from_secs(secs);
+        let mut last: Option<u64> = None;
+        loop {
+            tokio::select! {
+                f = sub.recv() => match f {
+                    Some(f) if f.track == Track::Video => {
+                        assert!(last.is_none_or(|l| f.wire_us > l), "video went backwards");
+                        last = Some(f.wire_us);
+                        let wall = (Instant::now() - t0).as_micros() as u64;
+                        out.push((wall, f.wire_us as i64 - wall as i64));
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(end) => break,
+            }
+        }
+        out
+    }
+
+    /// Camera counter resets (back to 1 s, as in reset_*.bcm) at the first IRAP arriving
+    /// at or after each of `at_us`, optionally announced by a `Restarted` (a camera stream
+    /// re-established with no gap): MediaClock discontinuities in a steady stream
+    fn with_counter_resets(
+        units: Vec<crate::source::FixtureUnit>,
+        at_us: &[u64],
+        restarted: bool,
+    ) -> Vec<crate::source::FixtureUnit> {
+        let mut out = vec![];
+        let mut next = 0;
+        let mut shift: Option<u32> = None;
+        for mut u in units {
+            if let SourceUnit::Video { cam_us, irap, .. } = &mut u.unit {
+                if next < at_us.len() && *irap && u.at_us >= at_us[next] {
+                    shift = Some(cam_us.wrapping_sub(1_000_000));
+                    next += 1;
+                    if restarted {
+                        out.push(crate::source::FixtureUnit {
+                            at_us: u.at_us,
+                            unit: SourceUnit::Restarted,
+                        });
+                    }
+                }
+                if let Some(s) = shift {
+                    *cam_us = cam_us.wrapping_sub(s);
+                }
+            }
+            out.push(u);
+        }
+        assert_eq!(next, at_us.len(), "not enough IRAPs for the resets");
+        out
+    }
+
+    /// The fixture `laps` times over with steady arrivals: each unit arrives at its
+    /// camera time less `preroll_us` (at 0 for the first `preroll_us`, like a camera's
+    /// buffered start), so the pacer holds about `preroll_us` of media from then on
+    fn steady(
+        units: &[crate::source::FixtureUnit],
+        laps: u64,
+        preroll_us: u64,
+    ) -> Vec<crate::source::FixtureUnit> {
+        let cam = |u: &crate::source::FixtureUnit| match &u.unit {
+            SourceUnit::Video { cam_us, .. } => Some(*cam_us),
+            _ => None,
+        };
+        let cam0 = units.iter().find_map(cam).unwrap();
+        // Audio keeps its arrival offset from the video frame before it
+        let mut one = vec![];
+        let mut base: Option<(u64, u64)> = None;
+        for u in units {
+            let mut u = u.clone();
+            if let Some(c) = cam(&u) {
+                base = Some((u.at_us, c.wrapping_sub(cam0) as u64));
+            }
+            u.at_us = base.map_or(0, |(at, c)| c + u.at_us.saturating_sub(at));
+            one.push(u);
+        }
+        one.sort_by_key(|u| u.at_us);
+        let span = one
+            .iter()
+            .filter_map(cam)
+            .map(|c| c.wrapping_sub(cam0) as u64)
+            .max()
+            .unwrap()
+            + 66_667;
+        let mut out = vec![];
+        for lap in 0..laps {
+            for u in &one {
+                let mut u = u.clone();
+                u.at_us = (u.at_us + lap * span).saturating_sub(preroll_us);
+                if let SourceUnit::Video { cam_us, .. } = &mut u.unit {
+                    *cam_us = cam_us.wrapping_add((lap * span) as u32);
+                }
+                out.push(u);
+            }
+        }
+        out
+    }
+
+    /// Wire time keeps tracking the Hub's wall time across MediaClock discontinuities and
+    /// viewing sessions. It used to run ahead by up to the pacing latency more at each
+    /// discontinuity, for good (1.33 s after the one reset of reset_h264.bcm): the pacer
+    /// restarted and released its whole queue at once, and the re-latch kept that lead.
+    /// The re-latch also kept a frame interval after the last audio AU (up to 67 ms more
+    /// each time)
+    #[tokio::test(start_paused = true)]
+    async fn test_wire_tracks_wall_across_discontinuities() {
+        // About 1 ms per discontinuity remains: the re-latch gap is a frame interval + 1 ms
+        const BOUND_US: i64 = 100_000;
+        let check = |name: &str, leads: &[(u64, i64)]| {
+            assert!(leads.len() > 200, "{name}: {} video frames", leads.len());
+            let (at, max) = leads.iter().copied().max_by_key(|l| l.1).unwrap();
+            assert!(
+                max <= BOUND_US,
+                "{name}: wire time {max} µs ahead of wall time at {at} µs"
+            );
+        };
+        // The A17 fixture: one counter reset
+        let t0 = Instant::now();
+        let (h, _s) = hub_with(fixture("reset_h264.bcm"), 1_500_000);
+        h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        check("reset_h264", &wire_leads(&mut sub, t0, 19).await);
+
+        // A counter reset every 4 s in 40 s of steady arrivals with 1.4 s queued (a
+        // camera's buffered start), plain and announced by `Restarted`: 30
+        // discontinuities each, over three viewing sessions with a 1 s wake each and the
+        // source stopped in between
+        for restarted in [false, true] {
+            let t0 = Instant::now();
+            let resets: Vec<u64> = (1..10).map(|k| k * 4_000_000).collect();
+            let units = with_counter_resets(
+                steady(&fixture("plain_h265.bcm"), 2, 1_400_000),
+                &resets,
+                restarted,
+            );
+            let (h, s) = hub_with(units, 1_500_000);
+            s.start_delay_ms.store(1000, Ordering::SeqCst);
+            h.describe().await.unwrap();
+            let mut leads = vec![];
+            for id in 1..=3u64 {
+                let mut sub = h.subscribe(id).await.unwrap();
+                h.play(id).await;
+                leads.extend(wire_leads(&mut sub, t0, 40).await);
+                h.unsubscribe(id).await;
+                drop(sub);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                assert_eq!(s.running.load(Ordering::SeqCst), 0, "stopped");
+            }
+            let st = h.stats().await.unwrap();
+            assert_eq!(st.guard_engaged, 0, "{st:?}");
+            check(&format!("resets, restarted={restarted}"), &leads);
+        }
+    }
+
+    /// The NTP epoch of a subscription is the system clock at the Hub's creation, where
+    /// its wire clock starts, not the server's (DESIGN §5.3)
+    #[tokio::test(start_paused = true)]
+    async fn test_subscription_ntp_epoch_is_the_hubs() {
+        let before = crate::hub::wire::ntp_now_us();
+        let (h, _s) = hub("plain_h265.bcm", false);
+        h.describe().await.unwrap();
+        let sub = h.subscribe(1).await.unwrap();
+        let after = crate::hub::wire::ntp_now_us();
+        assert!(
+            (before..=after).contains(&sub.ntp_epoch_us),
+            "{before} ≤ {} ≤ {after}",
+            sub.ntp_epoch_us
+        );
     }
 }

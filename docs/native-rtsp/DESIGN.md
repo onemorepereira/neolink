@@ -277,6 +277,12 @@ moves therefore never show up as RTP or NTP steps (F-cc 7).
 - **First frame after (re)start** is released immediately. It is an IRAP, because the
   ingest gate drops video until the first IRAP. The anchor is set so this frame is due now,
   which gives clients data at once (F-cc 11). Subsequent frames are spaced by media time.
+  A "start" is a source start after `stop_source`, which empties the queue.
+- **MediaClock discontinuity** (counter jump, `Restarted`): the anchor is kept. Media time
+  stays continuous (one frame on), so the frame is due one frame after the last one
+  queued, or on arrival if it is late (an underrun). Restarting the anchor here would
+  release every queued frame at once, up to `latency` ahead of its time, and the
+  re-latch (§4.5) would keep that lead on the wire for good, more at each discontinuity.
 - **Underrun** (`arrival > due + 1 frame`): the anchor moves forward so the frame is due on
   arrival. Delivery latency grows; timestamps are unaffected.
 - **Excess latency recovery (F-cc 8)**:
@@ -319,6 +325,12 @@ There is one wire clock per Hub, in µs, monotonic, shared by all tracks and ses
 | Bridge engaged, then live resumes | `offset = virtual_now − media_us(first live frame)`, where `virtual_now = last_wire_out + (now − last_wire_out_wall)`. Applied to all tracks. Live video is dropped until the next IRAP (that IRAP *is* the "first live frame"). |
 | MediaClock discontinuity flag | Same formula as resume |
 | Otherwise | unchanged |
+
+A re-latch also keeps the frame at least one frame interval + 1 ms after the last *video*
+frame (and after a late joiner's restamp), so a client counting in frame ticks never sees
+two video frames at the same time. Not after the last audio AU: that one was usually sent
+moments before, and the step would push wire time ahead of wall time at every
+discontinuity. Live audio that would not follow its last AU is dropped.
 
 **Monotonic guard.** Per track, `wire_ts = max(wire_ts, last_out + 1 tick)`. This is
 enforced after the offset is applied. The guard is a safety net; any time it engages it is

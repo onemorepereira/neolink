@@ -5,11 +5,16 @@
 mod common;
 
 use common::*;
-use neolink_rtsp::rtsp::auth::{Schemes, User};
-use neolink_rtsp::rtsp::server::ServerConfig;
+use neolink_rtsp::hub::task::{spawn, HubConfig, HubHandle};
+use neolink_rtsp::rtsp::auth::{Allowed, Auth, Schemes, User};
+use neolink_rtsp::rtsp::route::{aliases, MountTarget, Routes, StreamKind};
+use neolink_rtsp::rtsp::server::{Provider, Server, ServerConfig};
+use neolink_rtsp::source::FixtureSource;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_raw_session_play_pause_play_teardown() {
@@ -423,4 +428,81 @@ async fn test_ffmpeg_digest() {
         .unwrap();
     assert_eq!(v, 0);
     assert!(err.contains("401"), "{err}");
+}
+
+/// Serves the Hubs put in it after the server started (a camera added, or its Hubs
+/// recreated after a config change)
+struct LateProvider(std::sync::Mutex<std::collections::HashMap<MountTarget, HubHandle>>);
+
+impl Provider for LateProvider {
+    fn hub(&self, target: &MountTarget) -> Option<HubHandle> {
+        self.0.lock().unwrap().get(target).cloned()
+    }
+    fn allowed(&self, _camera: &str) -> Allowed {
+        Allowed::from_config(None, false)
+    }
+}
+
+/// SR NTP times are real time, also for a Hub created long after the server: NTP is
+/// the Hub's epoch plus wire time, and wire time starts at the Hub's creation. It used to
+/// be the server's epoch plus wire time, behind real time by the Hub's age difference
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sr_ntp_is_real_time_for_a_late_hub() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let provider = Arc::new(LateProvider(Default::default()));
+    let routes = Routes::default();
+    routes.set(aliases("argus", &[StreamKind::Main]));
+    let server = Server::new(
+        ServerConfig::default(),
+        routes,
+        Auth::new(vec![], Schemes::Both),
+        provider.clone(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    tokio::spawn(server.serve(listener, cancel.clone()));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let source = Arc::new(FixtureSource::new(
+        fixture("plain_h265.bcm"),
+        1.0,
+        Some(false),
+    ));
+    let mut hc = HubConfig::new("main");
+    hc.battery = false;
+    provider.0.lock().unwrap().insert(
+        MountTarget {
+            camera: "argus".into(),
+            kind: StreamKind::Main,
+        },
+        spawn(hc, source),
+    );
+    let mut c = Client::connect(addr).await;
+    c.play(&format!("rtsp://{addr}/argus/main"), None).await;
+    c.collect(Duration::from_millis(4500)).await;
+    let (now_i, now_s) = (std::time::Instant::now(), std::time::SystemTime::now());
+    let mut srs = 0;
+    for ((ch, p), at) in c.packets.iter().zip(&c.arrivals) {
+        if ch % 2 == 0 || p.len() < 16 || p[1] != 200 {
+            continue;
+        }
+        srs += 1;
+        let secs = u32::from_be_bytes(p[8..12].try_into().unwrap()) as u64;
+        let frac = u32::from_be_bytes(p[12..16].try_into().unwrap()) as u64;
+        let ntp_us = secs * 1_000_000 + ((frac * 1_000_000) >> 32);
+        let unix_us = (now_s - now_i.duration_since(*at))
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let real_us = unix_us + 2_208_988_800 * 1_000_000;
+        let diff = ntp_us as i64 - real_us as i64;
+        // An SR maps the last frame sent: at most a frame interval or so old
+        assert!(
+            diff.abs() < 300_000,
+            "SR on channel {ch}: NTP {diff} µs from real time"
+        );
+    }
+    assert!(srs >= 2, "{srs} SRs");
+    cancel.cancel();
 }

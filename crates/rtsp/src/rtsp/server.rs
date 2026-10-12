@@ -84,14 +84,10 @@ pub struct Server {
     unauth_total: AtomicUsize,
     failed_auth: Mutex<HashMap<IpAddr, FailedAuth>>,
     next_session: AtomicU64,
-    /// Fixed at creation: NTP = ntp_epoch + wire time (DESIGN §5.3)
-    ntp_epoch_us: u64,
 }
 
 const PUBLIC: &str =
     "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER, SET_PARAMETER";
-/// Seconds between 1900 (NTP) and 1970
-const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
 
 impl Server {
     pub fn new(
@@ -100,10 +96,6 @@ impl Server {
         auth: Auth,
         provider: Arc<dyn Provider>,
     ) -> Arc<Self> {
-        let unix_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
         Arc::new(Self {
             config,
             routes,
@@ -114,7 +106,6 @@ impl Server {
             unauth_total: AtomicUsize::new(0),
             failed_auth: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(rand::random::<u32>() as u64),
-            ntp_epoch_us: unix_us + NTP_UNIX_OFFSET * 1_000_000,
         })
     }
 
@@ -243,13 +234,9 @@ impl Server {
         let writer_done = CancellationToken::new();
         let writer = tokio::spawn({
             let (done, cancel) = (writer_done.clone(), writer_cancel.clone());
-            let (stall, sr, epoch) = (
-                self.config.write_stall_timeout,
-                self.config.rtcp_sr,
-                self.ntp_epoch_us,
-            );
+            let (stall, sr) = (self.config.write_stall_timeout, self.config.rtcp_sr);
             async move {
-                writer(write, ctl_rx, cancel, stall, sr, epoch).await;
+                writer(write, ctl_rx, cancel, stall, sr).await;
                 done.cancel();
             }
         });
@@ -919,9 +906,10 @@ async fn writer(
     cancel: CancellationToken,
     stall: Duration,
     rtcp_sr: bool,
-    ntp_epoch_us: u64,
 ) {
     let mut sub: Option<Subscription> = None;
+    // NTP = the Hub's NTP epoch + wire time (DESIGN §5.3), from the subscription at PLAY
+    let mut ntp_epoch_us = 0u64;
     let mut tracks: HashMap<Track, WriterTrack> = HashMap::new();
     let mut sr = tokio::time::interval(Duration::from_secs(2));
     let mut last_wire_seen = 0u64;
@@ -951,6 +939,7 @@ async fn writer(
                 done,
                 reply,
             }) => {
+                ntp_epoch_us = s.ntp_epoch_us;
                 tracks = t
                     .into_iter()
                     .map(|(k, state)| {
