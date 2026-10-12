@@ -504,10 +504,35 @@ docker run --network host --volume=$PWD/config.toml:/etc/neolink.toml quantument
 
 #### Environmental Variables
 
-There are currently 2 environmental variables available as part of the container:
+- `NEO_LINK_MODE`: defaults to `"rtsp"` if not set, other options are "mqtt" or
+  "mqtt-rtsp". It is used when the command has no subcommand of its own.
+- `NEO_LINK_PORT`: `8554`. It only documents the port the image exposes: the RTSP port
+  is `bind_port` in the config.
+- `NEOLINK_STATE_DIR`: `/var/lib/neolink`, a volume. Mount it to keep what neolink learns
+  about each camera (streams, battery, last snapshot) across restarts.
+- `PUID`/`PGID`: when set, neolink reads the config as root, hands the state directory
+  to that user and group and then runs as them. Without them it runs as root, as before.
+  With `--user`, the state directory must be writable by that user (neolink logs an
+  error at startup when it isn't).
 
-- `NEO_LINK_MODE`: defaults to `"rtsp"` if not set, other options are "mqtt" or "mqtt-rtsp".
-- `NEO_LINK_PORT`: defaults to `8554`, set this to your required port value.
+#### The container's command
+
+neolink is the image's entrypoint and runs as PID 1, so `docker stop` reaches it: it logs
+the cameras out and exits within a second (before, the stop waited 10 s and killed it).
+The command can be either form:
+
+- neolink's arguments: `--config /etc/neolink.toml` (the default), `rtsp --config
+  /etc/neolink.toml`, or with `neolink` first as in older compose files
+  (`neolink mqtt --config /etc/neolink.toml`);
+- any other program, run in neolink's place as the old `/entrypoint.sh` did:
+  `sh -c "cp /config/neolink.toml /etc/neolink.toml && exec neolink rtsp --config
+  /etc/neolink.toml"`, a script, `bash -lc ...`. End a shell command with `exec neolink
+  ...`: otherwise the shell is PID 1, it does not pass `docker stop`'s SIGTERM on, and
+  the container is killed after the timeout without logging the cameras out. If your
+  command leaves background processes behind, add `--init` (compose: `init: true`).
+
+A neolink subcommand wins over a program of the same name (`users`). `/entrypoint.sh` is
+still in the image and does the same. The native image (`Dockerfile.native`) has no shell.
 
 ### Image
 
