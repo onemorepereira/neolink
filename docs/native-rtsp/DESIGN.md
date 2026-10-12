@@ -458,7 +458,7 @@ IRAP, and the session's sender registration.
 
 ## 5. Media to RTP
 
-### 5.1 Packetizers (ported from bairelay `codec/*`, checked against gortsplib vectors)
+### 5.1 Packetizers (written from the RFCs, behaviour modelled on bairelay `codec/*`, checked against gortsplib vectors)
 
 - **H.264** (RFC 6184): single NAL if `len ≤ mtu − 12`, else FU-A. The marker goes on the
   last packet of the AU.
@@ -560,7 +560,7 @@ Deltas from GStreamer (listed in spec §5):
 
 - **Own parser** for `METHOD SP URI SP RTSP/1.0` plus headers. Header names are
   case-insensitive, values are trimmed, and the head is limited to 8 KiB.
-- **Tolerant headers**, ported from bairelay `rtsp/transport.rs`:
+- **Tolerant headers**, with the tolerance modelled on bairelay `rtsp/transport.rs`:
   - **Transport**: a list of specs, case-insensitive. **The first acceptable TCP spec is
     chosen and exactly one is echoed**, with `RTP/AVP/TCP;unicast;interleaved=a-b;ssrc=X;mode="PLAY"`
     as GStreamer does. If the list has no TCP spec, the reply is 461 (R4).
