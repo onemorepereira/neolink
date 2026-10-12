@@ -104,9 +104,10 @@ RUST_LOG=trace "$BIN/neolink" battery --fresh --config "$W/neolink.toml" fake > 
 check "debug log has content" '[ $(wc -l < "$W/trace.log") -gt 5 ]'
 check "no password in trace logs" '! grep -q "fakepass" "$W/trace.log"'
 
-# --- A28: unreachable camera, a query arrives: it fails at its deadline, no retry after
+# --- A28: unreachable camera, a query that may wake it (`fresh`; a plain query is
+# answered from the state file) arrives: it fails at its deadline, no retry after
 kill -USR2 "$(pgrep -f 'xtask fakecam')"
-mosquitto_pub -p 18883 -t neolink/fake/query/battery -m ""
+mosquitto_pub -p 18883 -t neolink/fake/query/pir -m fresh
 sleep 2
 check "A28 query caused attempts" '[ "$(stat connections)" -gt "$BEFORE" ]'
 sleep 65
