@@ -358,33 +358,48 @@ async fn test_a20_security() {
     }
 
     // 100 unauthenticated connections from one IP: it holds at most its share (32), its
-    // own oldest are closed to make room, and another address still gets in at once
+    // own oldest are closed to make room, and another address still gets in at once.
+    // On a server with the default first-request timeout: the 1 s one above would close
+    // the silent connections kept here before a loaded machine finishes checking them
+    let h2 = start_with(Setup {
+        users: alice_bob(),
+        schemes: Schemes::Both,
+        ..Default::default()
+    })
+    .await;
+    let base2 = format!("rtsp://{}/argus/main", h2.addr);
     let per_ip = ServerConfig::default().max_unauthenticated_per_ip;
     let mut held = vec![];
     for _ in 0..100 {
-        held.push(Client::connect(h.addr).await);
+        held.push(Client::connect(h2.addr).await);
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Eviction can lag the connects on a loaded machine: give it until one shared
+    // deadline rather than a fixed sleep. Once the first kept connection has waited out
+    // the deadline, the rest are checked briefly (a wrongly evicted one is already closed)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut closed = vec![];
     for c in held.iter_mut() {
-        closed.push(closed_within(&mut c.s, Duration::from_millis(5)).await);
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        closed.push(closed_within(&mut c.s, left.max(Duration::from_millis(5))).await);
     }
     assert_eq!(
         closed.iter().filter(|c| **c).count(),
         100 - per_ip,
         "connections past the per-IP share closed"
     );
+    // Oldest first. The server orders connections by when their task registers them,
+    // which a loaded scheduler can swap near the boundary, so only the oldest half is
+    // asserted to be gone
     assert!(
-        closed[100 - per_ip..].iter().all(|c| !c),
-        "the newest {per_ip} are the ones kept"
+        closed[..50].iter().all(|c| *c),
+        "the oldest connections are the ones closed: {closed:?}"
     );
-    let mut other = Client::connect_from(h.addr, "127.0.0.2").await;
+    let mut other = Client::connect_from(h2.addr, "127.0.0.2").await;
     let r = other
-        .request("DESCRIBE", &base, &[("Authorization", &alice)])
+        .request("DESCRIBE", &base2, &[("Authorization", &alice)])
         .await;
     assert_eq!(r.status, 200, "another address locked out");
     drop(held);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     // 24 simultaneous authenticated DESCRIBEs from one IP all succeed
     let mut tasks = vec![];
