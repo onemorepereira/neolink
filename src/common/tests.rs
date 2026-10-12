@@ -20,7 +20,12 @@ pub(crate) fn config_for(cam: &FakeCamera, extra: &str) -> CameraConfig {
 pub(crate) async fn new_neocam(config: CameraConfig) -> NeoCam {
     #[cfg(feature = "pushnoti")]
     let neocam = {
-        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        // The camera's push requests must be answered (its command loop ends when the
+        // channel is closed); the test build of the thread never reaches FCM
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let mut pn = PushNotiThread::new().await.unwrap();
+        let pn_tx = tx.clone();
+        tokio::spawn(async move { pn.run(&pn_tx, &mut rx).await });
         NeoCam::new(config, tx).await.unwrap()
     };
     #[cfg(not(feature = "pushnoti"))]

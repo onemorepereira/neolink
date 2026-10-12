@@ -208,14 +208,29 @@ fn save_registration(token_path: Option<&Path>, registration: &Registration) {
     }
 }
 
+/// Where the registration is saved: `<config dir>/neolink`
+#[cfg(not(test))]
+fn token_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("neolink"))
+}
+
+// The test build never looks up the user's config directory
+#[cfg(test)]
+use dirs as _;
+
+/// Tests write only to their per-process temporary directory, never the user's config
+#[cfg(test)]
+fn token_dir() -> Option<PathBuf> {
+    Some(super::state_dir())
+}
+
 /// `<config dir>/neolink/neolink_token.toml`, or `None` (registration kept in memory
 /// only) when there is no config directory or it can't be created
 fn token_path() -> Option<PathBuf> {
-    let Some(mut dir) = dirs::config_dir() else {
+    let Some(mut dir) = token_dir() else {
         log::warn!("No config directory: the push notification registration is not saved");
         return None;
     };
-    dir.push("neolink");
     if let Err(e) = fs::create_dir_all(&dir) {
         log::warn!(
             "Unable to create {dir:?} for the push notification registration, which is not saved: {e}"
@@ -263,7 +278,43 @@ impl PushNotiThread {
         })
     }
 
+    /// Registers with FCM, hands the token to the cameras and listens for pushes, while
+    /// serving the cameras' requests
+    #[cfg(not(test))]
     pub(crate) async fn run(
+        &mut self,
+        sender: &MpscSender<PnRequest>,
+        pn_request_rx: &mut MpscReceiver<PnRequest>,
+    ) -> AnyResult<()> {
+        self.run_fcm(sender, pn_request_rx).await
+    }
+
+    /// Tests never reach FCM: the cameras' requests are served (a camera whose requests go
+    /// unanswered stops working) and pushes come only from `pn_watcher`
+    #[cfg(test)]
+    pub(crate) async fn run(
+        &mut self,
+        _sender: &MpscSender<PnRequest>,
+        pn_request_rx: &mut MpscReceiver<PnRequest>,
+    ) -> AnyResult<()> {
+        while let Some(msg) = pn_request_rx.recv().await {
+            match msg {
+                PnRequest::Get { sender } => {
+                    let _ = sender.send(self.pn_watcher.subscribe());
+                }
+                PnRequest::Activate { sender, .. } => {
+                    let _ = sender.send(Ok(()));
+                }
+                PnRequest::AddPushID { id } => {
+                    self.received_ids.write().await.insert(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    async fn run_fcm(
         &mut self,
         sender: &MpscSender<PnRequest>,
         pn_request_rx: &mut MpscReceiver<PnRequest>,
@@ -502,6 +553,38 @@ mod tests {
         assert_eq!(a.keys.public_key, b.keys.public_key);
         assert_eq!(a.keys.private_key, b.keys.private_key);
         assert_eq!(a.keys.auth_secret, b.keys.auth_secret);
+    }
+
+    #[test]
+    fn test_token_path_is_temporary_in_tests() {
+        let path = token_path().unwrap();
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "{path:?} is outside {:?}",
+            std::env::temp_dir()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_requests_answered_without_fcm() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let mut pn = PushNotiThread::new().await.unwrap();
+        let watcher = pn.pn_watcher.clone();
+        let thread_tx = tx.clone();
+        let task = tokio::spawn(async move { pn.run(&thread_tx, &mut rx).await });
+
+        let (get_tx, get_rx) = tokio::sync::oneshot::channel();
+        tx.send(PnRequest::Get { sender: get_tx }).await.unwrap();
+        let mut pushes = get_rx.await.unwrap();
+        let push = PushNoti {
+            message: "{}".to_owned(),
+            id: None,
+        };
+        watcher.send_replace(Some(push.clone()));
+        assert_eq!(*pushes.borrow_and_update(), Some(push));
+
+        // The thread holds a sender of its own, so it runs until stopped
+        task.abort();
     }
 
     #[test]
