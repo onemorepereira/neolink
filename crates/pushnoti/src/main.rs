@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use fcm_push_listener::*;
+use fcm_push_listener::{new_heartbeat_ack, Message, MessageStream, Registration};
 use log::*;
 use std::{fs, path::PathBuf};
+use tokio::io::AsyncWriteExt;
+use tokio_stream::StreamExt;
 use validator::Validate;
 
 mod config;
@@ -32,45 +34,40 @@ async fn main() -> Result<()> {
 
     let camera = find_and_connect(&config, &opt.camera).await?;
 
-    // 696841269229 is the reo_iphone FCM Sender_ID
-    // let registration = fcm_push_listener::register("696841269229").await?;
-    // 743639030586 is the reo_fcm FCM Sender_ID
-    // 263684512460 is my test Sender_ID
-    // let registration = fcm_push_listener::register("743639030586").await?
-    // I have confirmed that I can recieve test messages with this SenderID
-    // into this program
-    // let registration = fcm_push_listener::register("263684512460").await?;
+    // The Firebase app of Reolink's Android app (see README.md). fcm-push-listener >= 3
+    // registers with a Firebase app instead of a sender ID (743639030586 for Android,
+    // 696841269229 for iOS), which Google no longer serves.
+    let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
+    let firebase_project_id = "reolink-login";
+    let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
 
-    // let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
-    // let firebase_project_id = "reolink-login";
-    // let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
-    // let vapid_key = "";
-
-    let sender_id = "743639030586"; // andriod
-
-    // let sender_id = "696841269229"; // ios
-
-    // let sender_id = "263684512460"; // test
-
-    let token_path = PathBuf::from("./token.toml");
-    let registration = if let Ok(Ok(registration)) =
-        fs::read_to_string(&token_path).map(|v| toml::from_str::<Registration>(&v))
-    {
-        info!("Loaded token");
-        registration
-    } else {
-        info!("Registering new token");
-        let registration = fcm_push_listener::register(sender_id).await?;
-        // let registration = fcm_push_listener::register(
-        //     firebase_app_id,
-        //     firebase_project_id,
-        //     firebase_api_key,
-        //     vapid_key,
-        // )
-        // .await?;
-        let new_token = toml::to_string(&registration)?;
-        fs::write(token_path, new_token)?;
-        registration
+    let http = reqwest::Client::new();
+    // JSON: fcm-push-listener 4 reads its keys as borrowed strings, which toml cannot give
+    let token_path = PathBuf::from("./token.json");
+    let registration = match fs::read_to_string(&token_path) {
+        Ok(text) => {
+            let registration: Registration = serde_json::from_str(&text).with_context(|| {
+                format!("Failed to parse {token_path:?}; delete it to register again")
+            })?;
+            info!("Loaded token");
+            registration
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("Registering new token");
+            let registration = fcm_push_listener::register(
+                &http,
+                firebase_app_id,
+                firebase_project_id,
+                firebase_api_key,
+                None,
+            )
+            .await?;
+            let new_token = serde_json::to_string_pretty(&registration)?;
+            fs::write(&token_path, new_token)
+                .with_context(|| format!("Failed to write {token_path:?}"))?;
+            registration
+        }
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {token_path:?}")),
     };
 
     // Send registration.fcm_token to the server to allow it to send push messages to you.
@@ -81,14 +78,53 @@ async fn main() -> Result<()> {
         .await?;
 
     info!("Listening");
-    let mut listener = FcmPushListener::create(
-        registration,
-        |message: FcmMessage| {
-            info!("Message JSON: {}", message.payload_json);
-            info!("Persistent ID: {:?}", message.persistent_id);
-        },
-        vec![],
-    );
-    listener.connect().await?;
+    let session = registration.gcm.checkin(&http).await?;
+    let connection = session.new_connection(vec![]).await?;
+    let mut stream = MessageStream::wrap(connection, &registration.keys);
+    while let Some(message) = stream.next().await {
+        match message? {
+            Message::Data(data) => {
+                info!("Message JSON: {}", String::from_utf8_lossy(&data.body));
+                info!("Persistent ID: {:?}", data.persistent_id);
+            }
+            Message::HeartbeatPing => {
+                // Unacknowledged heartbeats stop the pushes within the hour
+                stream
+                    .write_all(&new_heartbeat_ack())
+                    .await
+                    .context("Failed to acknowledge a heartbeat")?;
+            }
+            Message::Other(tag, _) => debug!("Server message with tag {tag}"),
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use fcm_push_listener::{Registration, Session, WebPushKeys};
+
+    #[test]
+    fn test_token_json_round_trip() {
+        let registration = Registration {
+            fcm_token: "token".to_owned(),
+            gcm: Session {
+                android_id: 4_611_686_018_427_387_905,
+                security_token: 18_446_744_073_709_551_615,
+            },
+            keys: WebPushKeys {
+                public_key: vec![4, 1, 2],
+                private_key: vec![9, 8],
+                auth_secret: vec![0, 255],
+            },
+        };
+        let text = serde_json::to_string_pretty(&registration).unwrap();
+        let parsed: Registration = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.fcm_token, registration.fcm_token);
+        assert_eq!(parsed.gcm.android_id, registration.gcm.android_id);
+        assert_eq!(parsed.gcm.security_token, registration.gcm.security_token);
+        assert_eq!(parsed.keys.public_key, registration.keys.public_key);
+        assert_eq!(parsed.keys.private_key, registration.keys.private_key);
+        assert_eq!(parsed.keys.auth_secret, registration.keys.auth_secret);
+    }
 }

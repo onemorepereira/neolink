@@ -530,7 +530,8 @@ mod tests {
     #[test]
     fn test_rustls_has_a_crypto_provider() {
         // rumqttc builds the MQTT TLS config with `ClientConfig::builder()`, which panics
-        // when rustls has no crypto provider compiled in (Cargo.toml: rustls with ring)
+        // when rustls has no process-wide crypto provider: main installs ring
+        crate::install_crypto_provider();
         let _ = rustls::ClientConfig::builder();
     }
 

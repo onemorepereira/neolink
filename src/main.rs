@@ -29,9 +29,6 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-// Linked only for its `ring` feature: rustls' crypto provider for MQTT over TLS
-use rustls as _;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use env_logger::Env;
@@ -81,9 +78,23 @@ fn main() -> Result<()> {
     }
 }
 
+/// Makes ring rustls' process-wide crypto provider (MQTT over TLS, push notifications).
+/// rustls picks one by itself only when exactly one is built in; the `pushnoti` feature
+/// also builds aws-lc-rs (reqwest's default, through fcm-push-listener).
+pub(crate) fn install_crypto_provider() {
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        // Only the first call installs one; a later call (tests) changes nothing
+        debug!("rustls crypto provider already installed");
+    }
+}
+
 #[tokio::main]
 async fn neolink_main(args: Vec<OsString>) -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    install_crypto_provider();
 
     info!(
         "Neolink {} {}",

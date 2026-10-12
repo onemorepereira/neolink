@@ -19,7 +19,7 @@ concurrency:
 
 env:
   # The cross builds use the MSRV, as upstream did
-  rust_version: "1.82.0"
+  rust_version: "1.88.0"
   CARGO_TERM_COLOR: always
 
 jobs:
