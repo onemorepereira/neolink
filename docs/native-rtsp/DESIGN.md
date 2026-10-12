@@ -246,6 +246,16 @@ The MediaClock is per Hub and lives as long as the Hub, **across Idle** (F-cc 16
   recorded for the *next* DESCRIBE and existing sessions are not touched.
 - **Codec / resolution / params change**: `gen += 1`. Sessions on the old gen are closed via
   their cancel token (BYE, then close).
+- **Changes are debounced; learning is not.** The first desc is learned at once (readiness
+  above). After that, a new video identity is adopted only when **2 IRAPs in a row** carry
+  it, and a new audio ASC only after **8 ADTS frames in a row**. One corrupt or odd frame
+  never closes every session. Until a new video identity is confirmed, video is held back
+  (sessions on the current desc never decode the new parameter sets with the old ones), and
+  audio frames with an unconfirmed config are dropped and don't touch the audio clock. An
+  ADTS frame is validated in full (length, blocks) before its header is learned from. A real
+  change costs one GOP (video) or 8 AUs (audio) of delay.
+- NALs with a corrupt header (`forbidden_zero_bit` set, or H.265 `nuh_temporal_id_plus1 =
+  0`) fail the R2 whitelist.
 
 **Cache** (`{state_dir}/cache/{sha256(camera)[..16]}-{kind}`; the same file name rule
 everywhere, F-int R11)
