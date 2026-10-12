@@ -18,6 +18,33 @@ podman logs -f neolink-native     # the wake ledger and battery readings are log
 neolink battery --fresh --config ~/.config/neolink/argus.toml   # before/after (one wake)
 ```
 
+## Results so far
+
+**Session 1, 2026-10-12 00:17 UTC** (battery 50 %, 3687 mV, −847 mA, not charging):
+- **A1:** main H.265 3840×2160 at 15 fps with AAC; sub H.264 896×512 at 15 fps with AAC.
+  Both measured 15.2 fps.
+- **A2:**
+  - sub: 60 s, 901 frames, 0 decode errors;
+  - main: 120 s, 1801 frames, 0 decode errors, no `RTP: missed` or `PPS id`, audio and
+    video start together.
+- **A7:**
+  - the two main clients that opened during the first wake ever (no cache) got 503
+    `Retry-After: 10`, as R11 says. The camera took 6 s to wake from deep sleep, more than
+    DESCRIBE's 2 s;
+  - the later main clients and the sub client played; sub learned in the same wake.
+- **Power:** one wake per part (108 s and 138 s awake); asleep 10 s after the last client.
+- **N1 asleep** (desc cached): first live frame 4.2 s after DESCRIBE.
+
+**Session 2, 2026-10-12 00:42 UTC** (battery 49 %, 3677 mV):
+- **A5:** VLC 300 s, 4337 frames displayed, 0 lost, 0 "picture is too late", audio decoded.
+- **5.1:** Frigate's preset-rtsp-generic for 290 s: exit 0, 29 of 29 segments. The only
+  message is the startup note "Non-monotonic DTS; previous: 0, current: 0", the same as on
+  fixtures; GStreamer is not compared on hardware yet.
+- **A4:** go2rtc frame.jpeg from main (689 KB) and sub.
+- **A4b:** the re-publish path returns a JPEG.
+- **Power:** one wake, 350 s awake for a 5.7 min session.
+- **Cache:** the persisted keyframe loaded (228 KB) and went to the first client.
+
 ## Session 1 (day 1): A1, A2, A7, on main and sub
 
 1. A1:
