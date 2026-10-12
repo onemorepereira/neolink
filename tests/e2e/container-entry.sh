@@ -49,7 +49,7 @@ CASE_N=0
 cleanup() {
   local ids
   ids=$(podman ps -aq --filter "label=$TAG" 2>/dev/null || true)
-  [ -n "$ids" ] && podman rm -f -t 0 $ids >/dev/null 2>&1 || true
+  [ -n "$ids" ] && podman rm -f -v -t 0 $ids >/dev/null 2>&1 || true
   ids=$(podman volume ls -q --filter "label=$TAG" 2>/dev/null || true)
   [ -n "$ids" ] && podman volume rm -f $ids >/dev/null 2>&1 || true
   [ -n "$FAKECAM_PID" ] && kill "$FAKECAM_PID" 2>/dev/null || true
@@ -113,7 +113,7 @@ run_exit() {
   shift 4
   local out rc=0
   out=$(timeout -k 10 60 podman run --name "$CNAME" --label "$TAG" --network host "$@" 2>&1) || rc=$?
-  podman rm -f "$CNAME" >/dev/null 2>&1 || true
+  podman rm -f -v "$CNAME" >/dev/null 2>&1 || true
   local why=""
   [ "$rc" = "$want_code" ] || why="exit code $rc, want $want_code; "
   if [ -n "$want" ] && ! grep -qE -- "$want" <<<"$out"; then why+="no /$want/; "; fi
@@ -140,7 +140,7 @@ serve() {
   logouts0=$(stat_of logouts)
   local err
   if ! err=$(podman run -d --name "$CNAME" --label "$TAG" --network host "$@" 2>&1); then
-    podman rm -f "$CNAME" >/dev/null 2>&1 || true
+    podman rm -f -v "$CNAME" >/dev/null 2>&1 || true
     fail "$NAME: podman run failed: $(tail -1 <<<"$err")"
     return 0
   fi
@@ -184,7 +184,7 @@ serve() {
     why+="camera not logged out ($((logins - logins0)) logins, $((logouts - logouts0)) logouts); "
   fi
   logs=$(podman logs "$CNAME" 2>&1 || true)
-  podman rm -f "$CNAME" >/dev/null 2>&1 || true
+  podman rm -f -v "$CNAME" >/dev/null 2>&1 || true
   if [ -z "$why" ]; then
     pass "$NAME (stopped in $ms ms, exit $code)"
   else
@@ -315,7 +315,7 @@ else
     else
       fail "$NAME"
     fi
-    podman rm -f "$CNAME" >/dev/null
+    podman rm -f -v "$CNAME" >/dev/null
   fi
 fi
 
