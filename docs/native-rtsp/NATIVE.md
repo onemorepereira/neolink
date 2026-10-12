@@ -36,8 +36,11 @@ podman run -d --network host -v ./neolink.toml:/etc/neolink.toml:ro \
 It keeps the old image's conventions: `NEO_LINK_MODE` (`rtsp`, `mqtt`, `mqtt-rtsp`, …), the
 config at `/etc/neolink.toml`, and state in `/var/lib/neolink`. Differences from the
 GStreamer image:
-- **No shell, no `/entrypoint.sh`.** neolink is PID 1 and stops cleanly on `docker stop`
-  (BYE to clients, camera logout, under 1 s).
+- **No shell, no `/entrypoint.sh`.** In both images neolink is PID 1 and stops cleanly on
+  `docker stop` (BYE to clients, camera logout, under 1 s), but only the GStreamer image can
+  run another program as its command (`sh -c "..."`, a script). Here the command must be
+  neolink's own arguments (`rtsp --config /etc/neolink.toml`, `neolink mqtt ...`); a shell
+  command fails at startup with "no program of that name in PATH".
 - **Runs as root by default**, so existing root-owned `0600` configs still work. Set
   `PUID`/`PGID` to drop to that user once the config is read:
   - neolink first hands the state directory to that user;
