@@ -1187,9 +1187,16 @@ async fn writer(
                 }
             }
         };
-        if res.is_err() {
-            log::info!("rtsp: write failed or stalled; closing");
-            break;
+        match res {
+            Ok(()) => {}
+            Err(WriteFail::Stalled(d)) => {
+                log::info!("rtsp: client took no data for {d:?}; closing");
+                break;
+            }
+            Err(WriteFail::Closed(e)) => {
+                log::debug!("rtsp: client closed the connection: {e}");
+                break;
+            }
         }
     }
     // BYE for each track still set up (the server is ending the session), then
@@ -1227,11 +1234,22 @@ async fn recv_sub(sub: &mut Option<Subscription>) -> Option<Arc<Frame>> {
 async fn timed<F: std::future::Future<Output = std::io::Result<()>>>(
     d: Duration,
     f: F,
-) -> Result<(), ()> {
+) -> Result<(), WriteFail> {
     match tokio::time::timeout(d, f).await {
         Ok(Ok(())) => Ok(()),
-        _ => Err(()),
+        Ok(Err(e)) => Err(WriteFail::Closed(e)),
+        Err(_) => Err(WriteFail::Stalled(d)),
     }
+}
+
+/// Why the writer stopped writing
+#[derive(Debug)]
+enum WriteFail {
+    /// The client did not take the bytes for this long
+    Stalled(Duration),
+    /// The socket is gone: usually the client closed it, as ffmpeg does right after
+    /// sending TEARDOWN without waiting for the reply
+    Closed(std::io::Error),
 }
 
 fn interleave(out: &mut BytesMut, channel: u8, packet: &[u8]) {
@@ -1247,7 +1265,7 @@ async fn send_frame(
     tracks: &mut HashMap<Track, WriterTrack>,
     f: &Frame,
     stall: Duration,
-) -> Result<(), ()> {
+) -> Result<(), WriteFail> {
     let Some(t) = tracks.get_mut(&f.track) else {
         return Ok(()); // track not set up
     };
@@ -1313,7 +1331,7 @@ async fn send_sr(
     wire_now: u64,
     ntp_epoch_us: u64,
     stall: Duration,
-) -> Result<(), ()> {
+) -> Result<(), WriteFail> {
     let mut out = BytesMut::new();
     // An SR maps a wire time the client has seen media for
     for t in tracks.values().filter(|t| t.state.packets > 0) {
@@ -1340,7 +1358,7 @@ async fn send_rr(
     w: &mut tokio::net::tcp::OwnedWriteHalf,
     tracks: &HashMap<Track, WriterTrack>,
     stall: Duration,
-) -> Result<(), ()> {
+) -> Result<(), WriteFail> {
     let mut out = BytesMut::new();
     for t in tracks.values() {
         let mut p = BytesMut::new();
@@ -1356,6 +1374,19 @@ async fn send_rr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_hang_up_is_not_a_stall() {
+        let d = Duration::from_secs(5);
+        let gone = async { Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)) };
+        assert!(matches!(timed(d, gone).await, Err(WriteFail::Closed(_))));
+        let blocked = std::future::pending::<std::io::Result<()>>();
+        assert!(matches!(
+            timed(d, blocked).await,
+            Err(WriteFail::Stalled(_))
+        ));
+        assert!(timed(d, async { Ok(()) }).await.is_ok());
+    }
 
     #[test]
     fn test_content_base() {

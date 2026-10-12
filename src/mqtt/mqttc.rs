@@ -376,10 +376,24 @@ async fn handle_notification(
             // battery cameras or undo settings (SPEC P14)
             let stale = published_message.retain && is_command_topic(&published_message.topic);
             if stale {
-                log::warn!(
-                    "Ignoring retained MQTT message on {}; publish commands without retain",
-                    published_message.topic
+                // neolink retains its own config on neolink/config, and gets it back on
+                // every connection: only someone else's retained message is worth a warning
+                let ours = is_own_retained(
+                    &*retained.lock().await,
+                    &published_message.topic,
+                    published_message.payload.as_ref(),
                 );
+                if ours {
+                    log::debug!(
+                        "Ignoring our own retained MQTT message on {}",
+                        published_message.topic
+                    );
+                } else {
+                    log::warn!(
+                        "Ignoring retained MQTT message on {}; publish commands without retain",
+                        published_message.topic
+                    );
+                }
             }
             if let Some(sub_topic) = published_message
                 .topic
@@ -461,6 +475,12 @@ async fn republish_retained(client: &AsyncClient, retained: &RetainedCache) -> A
     Ok(())
 }
 
+/// Whether a retained message is the last one neolink itself retained on that topic
+fn is_own_retained(sent: &HashMap<String, Arc<String>>, topic: &str, payload: &[u8]) -> bool {
+    sent.get(topic)
+        .is_some_and(|message| message.as_bytes() == payload)
+}
+
 /// Topics that make neolink act: `neolink/config`, `neolink/<cam>/control/..`,
 /// `neolink/<cam>/query/..`
 fn is_command_topic(topic: &str) -> bool {
@@ -485,6 +505,26 @@ mod tests {
         assert!(!is_command_topic("neolink/argus/status/battery_level"));
         assert!(!is_command_topic("neolink/status"));
         assert!(!is_command_topic("other/argus/control/x"));
+    }
+
+    #[test]
+    fn test_own_retained_config_is_recognised() {
+        use super::is_own_retained;
+        use std::{collections::HashMap, sync::Arc};
+        let mut sent = HashMap::new();
+        assert!(!is_own_retained(&sent, "neolink/config", b"bind = 1"));
+        sent.insert(
+            "neolink/config".to_string(),
+            Arc::new("bind = 1".to_string()),
+        );
+        assert!(is_own_retained(&sent, "neolink/config", b"bind = 1"));
+        // Someone else's config, or ours from before it changed
+        assert!(!is_own_retained(&sent, "neolink/config", b"bind = 2"));
+        assert!(!is_own_retained(
+            &sent,
+            "neolink/cam/control/ir",
+            b"bind = 1"
+        ));
     }
 
     #[test]
