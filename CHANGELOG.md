@@ -122,6 +122,9 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
   running deaf to `docker stop`.
 - The kubernetes example ends its `sh -c` with `exec`.
 - `tests/e2e/container-entry.sh` runs these cases against a built image.
+- **Native image base.** `Dockerfile.native` takes its CA certificates from Alpine 3.24.2
+  (was 3.20, end of life) and builds with Rust 1.91.0 on Alpine 3.22 (was 1.90.0 on 3.20);
+  the native release binaries build with Rust 1.91.0 too.
 
 ### Added
 
