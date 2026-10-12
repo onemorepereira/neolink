@@ -26,8 +26,11 @@ unmaintained = "workspace"
 yanked = "deny"
 ignore = [
   # rustls-webpki 0.102.8: rumqttc 0.25.1 (latest) still depends on it, only for the
-  # TlsError::WebPki variant. MQTT certificate checks run in rustls 0.23 with the
-  # patched rustls-webpki 0.103. Remove when rumqttc drops rustls-webpki 0.102.
+  # TlsError::WebPki variant (rumqttc calls no rustls-webpki code). MQTT certificate
+  # checks run in rustls 0.23 with the patched rustls-webpki 0.103. Every fix is in 0.103,
+  # so a [patch] of 0.102 cannot apply, and rumqttc's main branch (checked 2026-10-12)
+  # still requires ^0.102.8: the bump, bytebeamio/rumqtt PR #1037, is open and unmerged
+  # (issues #1046, #1067). Remove when a rumqttc release drops rustls-webpki 0.102.
   { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
   { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
   { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
