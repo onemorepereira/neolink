@@ -24,7 +24,8 @@ the spec; "F#" in margins refers to review findings this design answers.
 **Crate facts**
 - `crates/rtsp` is independent of Baichuan and neolink. Its only input is `StreamSource`.
 - It is a workspace member through the existing `members = ["crates/*"]`.
-- Edition 2021, `rust-version = "1.82"`, and it logs with `log`.
+- Edition 2021, `rust-version = "1.88"` (the workspace MSRV; 1.82 until the `time`
+  advisory fix), and it logs with `log`.
 
 **Dependencies, pinned for MSRV 1.82 (F-int 9)**
 - `tokio` ≥ 1.39, so `RuntimeMetrics::num_alive_tasks` is stable. This bumps the workspace

@@ -3,7 +3,7 @@ name = "xtask"
 description = "Development tasks for neolink: fixture generation and golden transcripts"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 publish = false
 

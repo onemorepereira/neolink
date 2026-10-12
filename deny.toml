@@ -25,10 +25,6 @@ targets = [
 unmaintained = "workspace"
 yanked = "deny"
 ignore = [
-  # time 0.3.36 (neolink_core). The fix (0.3.47) needs Rust 1.88, above the MSRV (1.82).
-  # Only RFC 2822 parsing is affected, which neolink does not use. Remove when the MSRV
-  # reaches 1.88 and time is updated to >= 0.3.47.
-  { id = "RUSTSEC-2026-0009", reason = "time: RFC 2822 parsing only (unused); fix needs Rust 1.88 > MSRV" },
   # rustls-webpki 0.102.8: rumqttc 0.25.1 (latest) still depends on it, only for the
   # TlsError::WebPki variant. MQTT certificate checks run in rustls 0.23 with the
   # patched rustls-webpki 0.103. Remove when rumqttc drops rustls-webpki 0.102.

@@ -622,7 +622,7 @@ mod tests {
                         wall += rng.below(200_000);
                         media += 66_667;
                         gop += 1;
-                        let irap = gop % 30 == 0;
+                        let irap = gop.is_multiple_of(30);
                         if bridge.active() {
                             if !irap {
                                 continue;

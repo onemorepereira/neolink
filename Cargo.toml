@@ -4,7 +4,7 @@ description = "A standards-compliant bridge to Reolink IP cameras"
 version = "0.6.3-rc.3"
 authors = ["George Hilliard <thirtythreeforty@gmail.com>", "Andrew King <sheepchaan@gmail.com>"]
 edition = "2018"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 
 [workspace]

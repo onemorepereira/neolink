@@ -3,7 +3,7 @@ description: >-
   Installs a pinned Rust toolchain with rustup (preinstalled on the hosted runners) and
   makes it the default. The stable version CI builds, tests and lints with is the default
   of `toolchain` below: bump it here (and in the Dockerfile and tests/e2e/dev/Containerfile
-  base images) in one change. The MSRV jobs pass `toolchain: 1.82.0`.
+  base images) in one change. The MSRV jobs pass `toolchain: 1.88.0`.
 inputs:
   toolchain:
     description: A rustup toolchain name (an exact version, or a dated nightly)

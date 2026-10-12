@@ -126,6 +126,13 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
   (was 3.20, end of life) and builds with Rust 1.91.0 on Alpine 3.22 (was 1.90.0 on 3.20);
   the native release binaries build with Rust 1.91.0 too.
 
+### Building from source
+
+- **Rust 1.88 or newer** is needed to build neolink (was 1.82): the fix for the `time`
+  advisory RUSTSEC-2026-0009 (time 0.3.47) needs it. The Docker images and release
+  binaries already build with Rust 1.91.0; the CI MSRV job and the cross builds now use
+  1.88.0.
+
 ### Added
 
 - **Snapshot endpoint** (both backends, `rtsp` and `mqtt-rtsp` modes):
@@ -198,6 +205,9 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
 - Dependency updates for RustSec advisories: openssl, h2, rustls, ring, bytes,
   crossbeam-channel, anyhow, rand and url/idna (lock file); quick-xml 0.41, rumqttc 0.25
   and validator 0.20 (manifest). MQTT over TLS now uses rustls 0.23 with the ring
-  provider. Advisories with no fix usable here (time needs Rust 1.88; the `pushnoti`
-  feature's fcm-push-listener 2 TLS/HTTP stack; rumqttc's leftover rustls-webpki 0.102)
-  are ignored in `deny.toml`, each with the condition for removing it.
+  provider. Advisories with no fix usable here (the `pushnoti` feature's
+  fcm-push-listener 2 TLS/HTTP stack; rumqttc's leftover rustls-webpki 0.102) are
+  ignored in `deny.toml`, each with the condition for removing it.
+- time 0.3.55 (RUSTSEC-2026-0009, RFC 2822 parsing, which neolink does not use); this
+  raises the MSRV to 1.88. The ICU and zeroize crates, held back for Rust 1.82, move to
+  their newest Rust 1.88 compatible releases.

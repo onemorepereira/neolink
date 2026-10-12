@@ -92,14 +92,14 @@ jobs:
         run: E2E_WORK=$(mktemp -d) TESTS=bridge tests/e2e/frigate.sh
 
   msrv:
-    name: MSRV (1.82)
+    name: MSRV (1.88)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust
         with:
-          toolchain: "1.82.0"
+          toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo check
         run: |
