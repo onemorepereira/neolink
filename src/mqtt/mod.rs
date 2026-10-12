@@ -71,11 +71,11 @@ use tokio::{
 };
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use tokio_util::sync::CancellationToken;
-use validator::Validate;
 
 use neolink_core::bc_protocol::{Direction as BcDirection, LightState};
 
 mod cmdline;
+mod configwrite;
 mod discovery;
 mod mqttc;
 mod power;
@@ -84,7 +84,6 @@ mod tests;
 
 use crate::{
     common::{unix_now, BatteryReading, MdState, NeoInstance, NeoReactor, StateFile},
-    config::Config,
     AnyResult,
 };
 use anyhow::{anyhow, Context, Result};
@@ -94,6 +93,7 @@ use log::*;
 use mqttc::{Mqtt, MqttReplyRef};
 
 use self::{
+    configwrite::{prepare_config_write, ConfigWrite},
     discovery::enable_discovery,
     mqttc::{MqttInstance, MqttReply},
     power::{wants_fresh, CamPower, FRESH_MAX_AGE_S},
@@ -102,17 +102,6 @@ use self::{
 /// Entry point for the mqtt subcommand
 ///
 /// Opt is the command line options
-/// A config parse error without the quoted source line (SPEC R25)
-fn redacted_parse_error(text: &str, e: &toml::de::Error) -> String {
-    let line = e
-        .span()
-        .map(|s| text[..s.start.min(text.len())].matches('\n').count() + 1);
-    match line {
-        Some(l) => format!("Failed to parse the config at line {l}: {}", e.message()),
-        None => format!("Failed to parse the config: {}", e.message()),
-    }
-}
-
 pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
     let global_cancel = CancellationToken::new();
@@ -220,6 +209,9 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
 
     // This threads checks for config changes on the mqtt
     let thread_config = config.clone();
+    // Only the config file sets power settings: MQTT is the only other writer, and this
+    // copy is taken before it can write (SPEC P14)
+    let file_config = config.borrow().clone();
     let mut thread_instance = mqtt.subscribe("").await?;
     let thread_reactor = reactor.clone();
     let thread_cancel = global_cancel.clone();
@@ -241,72 +233,15 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                                 .await?;
                             continue;
                         }
-                        crate::config::warn_unknown_keys(&msg.message, "MQTT neolink/config");
-                        let config = match toml::from_str::<Config>(&msg.message) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                // The parse error quotes the offending line, which may hold
-                                // a password: report only the message and the line
-                                thread_instance
-                                    .send_message("config/status", &redacted_parse_error(&msg.message, &e), false)
-                                    .await?;
+                        let current = thread_config.borrow().clone();
+                        let config = match prepare_config_write(&msg.message, &file_config, &current) {
+                            ConfigWrite::Unchanged => continue,
+                            ConfigWrite::Refused(why) => {
+                                thread_instance.send_message("config/status", &why, false).await?;
                                 continue;
                             }
+                            ConfigWrite::Apply(config) => *config,
                         };
-                        let curr_config = thread_config.borrow().clone();
-                        let mut config = config;
-
-                        // Fill in skipped passwords, but only for the same broker and the same
-                        // camera address: a write that points elsewhere must not receive the
-                        // current secrets
-                        if let (Some(mqtt), Some(curr_mqtt)) = (config.mqtt.as_mut(), curr_config.mqtt.as_ref()) {
-                            let same_broker = mqtt.broker_addr == curr_mqtt.broker_addr && mqtt.port == curr_mqtt.port;
-                            if mqtt.credentials.is_none() && same_broker {
-                                mqtt.credentials = curr_mqtt.credentials.clone();
-                            }
-                            if mqtt.ca.is_none() && same_broker {
-                                mqtt.ca = curr_mqtt.ca.clone();
-                            }
-                            if mqtt.client_auth.is_none() && same_broker {
-                                mqtt.client_auth = curr_mqtt.client_auth.clone();
-                            }
-                        }
-                        for cam in config.cameras.iter_mut() {
-                            let name = cam.name.clone();
-                            let cur_cam = curr_config.cameras.iter().find(|c| c.name == name);
-                            if let Some(cur_cam) = cur_cam.as_ref() {
-                                let same_camera = cam.camera_addr == cur_cam.camera_addr
-                                    && cam.camera_uid == cur_cam.camera_uid;
-                                if cam.password.is_none() && same_camera {
-                                    cam.password = cur_cam.password.clone();
-                                }
-                            }
-                        }
-                        for user in config.users.iter_mut() {
-                            let name = user.name.clone();
-                            let cur_user = curr_config.users.iter().find(|c| c.name == name);
-                            if let Some(cur_user) = cur_user.as_ref() {
-                                if user.pass.is_none() {
-                                    user.pass = cur_user.pass.clone();
-                                }
-                            }
-                        }
-                        // Passwords should now be restored if they were not set
-
-                        let validate = config.validate().with_context(|| {
-                            format!("Failed to validate the MQTT {:?} config file", msg.topic)
-                        });
-                        if let Err(e) = validate {
-                            thread_instance
-                                .send_message("config/status", &format!("{:?}", e), false)
-                                .await?;
-                            continue;
-                        }
-
-                        if (*thread_config.borrow()) == config {
-                            continue;
-                        }
-
                         let result = thread_reactor.update_config(config).await;
                         thread_instance
                             .send_message("config/status", &format!("{:?}", result), false)
@@ -1483,19 +1418,5 @@ async fn wait_for_state(updated: impl Fn() -> bool) {
             return;
         }
         sleep(Duration::from_millis(500)).await;
-    }
-}
-
-#[cfg(test)]
-mod redaction_tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_error_does_not_echo_the_line() {
-        let text = "bind = \"0.0.0.0\"\n[[cameras]]\nname = \"a\"\npassword = \"s3cret\" oops\n";
-        let e = toml::from_str::<Config>(text).unwrap_err();
-        let msg = redacted_parse_error(text, &e);
-        assert!(!msg.contains("s3cret"), "{}", msg);
-        assert!(msg.contains("line 4"), "{}", msg);
     }
 }

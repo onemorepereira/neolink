@@ -389,3 +389,291 @@ async fn test_ledger_published() {
     })
     .await;
 }
+
+// --- neolink/config writes: power settings come from the config file (SPEC P14)
+
+const FILE_CONFIG: &str = r#"
+[mqtt]
+broker_addr = "127.0.0.1"
+port = 1883
+
+[[cameras]]
+name = "garden"
+username = "admin"
+password = "camsecret"
+address = "192.168.1.10:9000"
+battery = true
+idle_grace_s = 15
+
+[[cameras]]
+name = "porch"
+username = "admin"
+password = "camsecret"
+address = "192.168.1.11:9000"
+
+[[cameras]]
+name = "attic"
+username = "admin"
+password = "camsecret"
+address = "192.168.1.12:9000"
+battery = false
+enabled = false
+"#;
+
+fn file_config() -> crate::config::Config {
+    toml::from_str(FILE_CONFIG).unwrap()
+}
+
+/// What an MQTT client would write: the config neolink publishes on `neolink/config`
+/// (no passwords), edited by `edit`
+fn edited_write(edit: impl FnOnce(&mut toml::Table)) -> String {
+    let published = toml::to_string(&file_config()).unwrap();
+    let mut table: toml::Table = published.parse().unwrap();
+    edit(&mut table);
+    toml::to_string(&table).unwrap()
+}
+
+fn camera<'a>(table: &'a mut toml::Table, name: &str) -> &'a mut toml::Table {
+    table["cameras"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .map(|c| c.as_table_mut().unwrap())
+        .find(|c| c["name"].as_str() == Some(name))
+        .unwrap()
+}
+
+fn write(text: &str) -> ConfigWrite {
+    let file = file_config();
+    prepare_config_write(text, &file, &file)
+}
+
+/// The write is refused whole, naming each camera and key, without echoing secrets
+fn assert_refused(text: &str, cameras_keys: &[(&str, &str)]) {
+    match write(text) {
+        ConfigWrite::Refused(why) => {
+            assert!(why.starts_with("FAIL:"), "{}", why);
+            for (cam, key) in cameras_keys {
+                assert!(
+                    why.contains(cam) && why.contains(key),
+                    "{}/{}: {}",
+                    cam,
+                    key,
+                    why
+                );
+            }
+            assert!(!why.contains("secret"), "{}", why);
+        }
+        other => panic!("not refused: {:?}", other),
+    }
+}
+
+fn applied(text: &str) -> crate::config::Config {
+    match write(text) {
+        ConfigWrite::Apply(c) => *c,
+        other => panic!("not applied: {:?}", other),
+    }
+}
+
+#[test]
+fn test_config_write_cannot_clear_battery() {
+    assert_refused(
+        &edited_write(|t| {
+            camera(t, "garden").insert("battery".into(), false.into());
+        }),
+        &[("garden", "battery")],
+    );
+    // Unset sleeps like battery = true, but it is still not the file's value
+    assert_refused(
+        &edited_write(|t| {
+            camera(t, "garden").remove("battery");
+        }),
+        &[("garden", "battery")],
+    );
+    assert_refused(
+        &edited_write(|t| {
+            camera(t, "porch").insert("battery".into(), false.into());
+        }),
+        &[("porch", "battery")],
+    );
+}
+
+#[test]
+fn test_config_write_cannot_set_idle_disconnect() {
+    for key in ["idle_disconnect", "idle", "idle_disc"] {
+        for value in [false, true] {
+            assert_refused(
+                &edited_write(|t| {
+                    camera(t, "garden").insert(key.into(), value.into());
+                }),
+                &[("garden", "idle_disconnect")],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_config_write_cannot_change_wake_settings() {
+    for (key, value) in [
+        ("idle_grace_s", toml::Value::from(600)),
+        ("idle_grace_s", toml::Value::from(0)),
+        ("motion_hold_max_s", toml::Value::from(86400)),
+        ("snapshot_fresh", toml::Value::from(true)),
+    ] {
+        assert_refused(
+            &edited_write(|t| {
+                camera(t, "porch").insert(key.into(), value);
+            }),
+            &[("porch", key)],
+        );
+    }
+    // Removing idle_grace_s = 15 changes it to the default
+    assert_refused(
+        &edited_write(|t| {
+            camera(t, "garden").remove("idle_grace_s");
+        }),
+        &[("garden", "idle_grace_s")],
+    );
+}
+
+#[test]
+fn test_config_write_cannot_add_pause_on_motion() {
+    assert_refused(
+        &edited_write(|t| {
+            camera(t, "garden")["pause"]
+                .as_table_mut()
+                .unwrap()
+                .insert("on_motion".into(), true.into());
+        }),
+        &[("garden", "pause.on_motion")],
+    );
+}
+
+#[test]
+fn test_config_write_cannot_enable_a_disabled_camera() {
+    assert_refused(
+        &edited_write(|t| {
+            camera(t, "attic").insert("enabled".into(), true.into());
+        }),
+        &[("attic", "enabled")],
+    );
+    // Disabling one is allowed: it only means fewer wakes
+    let c = applied(&edited_write(|t| {
+        camera(t, "porch").insert("enabled".into(), false.into());
+    }));
+    assert!(
+        !c.cameras
+            .iter()
+            .find(|c| c.name == "porch")
+            .unwrap()
+            .enabled
+    );
+}
+
+#[test]
+fn test_config_write_refuses_whole_write() {
+    // Several cameras and keys, mixed with an allowed change: nothing is applied
+    assert_refused(
+        &edited_write(|t| {
+            let g = camera(t, "garden");
+            g.insert("battery".into(), false.into());
+            g.insert("idle_disconnect".into(), false.into());
+            let p = camera(t, "porch");
+            p["mqtt"]
+                .as_table_mut()
+                .unwrap()
+                .insert("enable_motion".into(), false.into());
+            p.insert("snapshot_fresh".into(), true.into());
+        }),
+        &[
+            ("garden", "battery"),
+            ("garden", "idle_disconnect"),
+            ("porch", "snapshot_fresh"),
+        ],
+    );
+}
+
+#[test]
+fn test_config_write_new_camera_takes_default_power() {
+    let new_camera = |extra: &[(&str, toml::Value)]| {
+        edited_write(|t| {
+            let mut cam = toml::Table::new();
+            cam.insert("name".into(), "shed".into());
+            cam.insert("username".into(), "admin".into());
+            cam.insert("password".into(), "newsecret".into());
+            cam.insert("address".into(), "192.168.1.13:9000".into());
+            for (k, v) in extra {
+                cam.insert(k.to_string(), v.clone());
+            }
+            t["cameras"]
+                .as_array_mut()
+                .unwrap()
+                .push(toml::Value::Table(cam));
+        })
+    };
+    assert_refused(
+        &new_camera(&[("battery", false.into())]),
+        &[("shed", "battery")],
+    );
+    assert_refused(
+        &new_camera(&[("idle", false.into()), ("idle_grace_s", 3600.into())]),
+        &[("shed", "idle_disconnect"), ("shed", "idle_grace_s")],
+    );
+    // Without power keys it is added, and sleeps
+    let c = applied(&new_camera(&[]));
+    let shed = c.cameras.iter().find(|c| c.name == "shed").unwrap();
+    assert!(shed.sleeps());
+}
+
+#[test]
+fn test_config_write_cannot_launder_power_through_removal() {
+    // garden is in the config file: removed by one write and added back by another, it
+    // still has the file's power settings
+    let file = file_config();
+    let mut running = file.clone();
+    running.cameras.retain(|c| c.name != "garden");
+    let readd = edited_write(|t| {
+        camera(t, "garden").insert("battery".into(), false.into());
+    });
+    match prepare_config_write(&readd, &file, &running) {
+        ConfigWrite::Refused(why) => assert!(why.contains("garden"), "{}", why),
+        other => panic!("not refused: {:?}", other),
+    }
+}
+
+#[test]
+fn test_config_write_other_changes_apply() {
+    // What Home Assistant does: toggle an MQTT feature
+    let c = applied(&edited_write(|t| {
+        camera(t, "garden")["mqtt"]
+            .as_table_mut()
+            .unwrap()
+            .insert("enable_motion".into(), false.into());
+    }));
+    let garden = c.cameras.iter().find(|c| c.name == "garden").unwrap();
+    assert!(!garden.mqtt.enable_motion);
+    assert_eq!(garden.battery, Some(true));
+    assert_eq!(garden.idle_grace_s, 15);
+    // The password was restored: same camera address
+    assert_eq!(garden.password.as_deref(), Some("camsecret"));
+
+    // The same power values, written explicitly (one through an alias), with another change
+    let c = applied(&edited_write(|t| {
+        let p = camera(t, "porch");
+        p.insert("idle_grace_s".into(), 10.into());
+        p.insert("motion_hold_max_s".into(), 120.into());
+        p.insert("snapshot_fresh".into(), false.into());
+        p.insert("stream".into(), "Main".into());
+        let a = camera(t, "attic");
+        a.remove("enabled");
+        a.insert("enable".into(), false.into());
+    }));
+    let porch = c.cameras.iter().find(|c| c.name == "porch").unwrap();
+    assert_eq!(porch.stream, crate::config::StreamConfig::Main);
+}
+
+#[test]
+fn test_config_write_same_config_is_unchanged() {
+    let text = edited_write(|_| {});
+    assert!(matches!(write(&text), ConfigWrite::Unchanged));
+}

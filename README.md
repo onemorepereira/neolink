@@ -370,6 +370,22 @@ Setting a value of `None` will disable the stream
   enabled = false
 ```
 
+**Power settings come only from the config file.** A config published to
+`neolink/config` must leave each camera's `battery`, `idle_disconnect` (or its aliases
+`idle`, `idle_disc`), `idle_grace_s`, `motion_hold_max_s`, `snapshot_fresh` and
+`pause.on_motion` as the config file has them, and may not enable a camera that the
+file disables (disabling one is allowed). Leaving a key out counts as changing it when
+the file sets it. A camera that the file doesn't have may be added, but with
+those keys unset: it sleeps, with the default timings. A write that breaks this is
+refused whole, with nothing applied: `neolink/config/status` gets
+`FAIL: power settings can only be changed in the config file, and this write changes
+<camera> (<keys>); ...` and neolink logs a warning per camera. Edit the config file and
+restart neolink to change them. So anyone who can publish to the broker can't keep a
+battery camera awake. Writes that keep these values, such as toggling
+`[cameras.mqtt]` features, apply as before. The rest of the config (users,
+`permitted_users`, addresses, streams) can still be rewritten unless
+`mqtt_config_writes = false`.
+
 ### MQTT Disable Features
 
 Certain features like preview and motion detection may not be desired
@@ -639,10 +655,10 @@ camera sending data stops until the next wake:
 | `snapshot_fresh` | camera | `false` | Allow `?fresh=1` on the snapshot endpoint, which wakes the camera |
 | `snapshot_port` | top level | `bind_port + 1` | The snapshot endpoint; `0` turns it off |
 
-A config published to `neolink/config` over MQTT can change `battery`, `idle_disconnect`
-and `idle_grace_s` while neolink runs; the camera switches between sleeping and always-on
-at once. The MQTT preview and battery-level publishing (timed, or once per wake) only
-follows such a switch after a restart or a change to that camera's `[cameras.mqtt]`.
+These keys, and `pause.on_motion`, come only from the config file: a config published to
+`neolink/config` over MQTT that changes them (or enables a camera the file disables) is
+refused whole (see [Controlling RTSP from MQTT](#controlling-rtsp-from-mqtt)). To change
+them, edit the file and restart neolink.
 
 #### What neolink logs about it
 
