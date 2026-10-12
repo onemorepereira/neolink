@@ -12,7 +12,7 @@ use futures::{
 };
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use std::collections::BTreeMap;
-use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::io::{Error as IoError, Result as IoResult};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -684,7 +684,7 @@ impl UdpPayloadSource {
                                 // Pass error up
                                 let _ = payload_inner
                                     .thread_stream
-                                    .send(Err(IoError::new(ErrorKind::Other, e.clone())))
+                                    .send(Err(IoError::other(e.clone())))
                                     .await;
                                 return Result::<()>::Err(e);
                             }
@@ -730,13 +730,13 @@ impl Sink<Vec<u8>> for UdpPayloadSource {
         self.get_mut()
             .inner_sink
             .poll_ready_unpin(cx)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))
+            .map_err(IoError::other)
     }
     fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> std::result::Result<(), Self::Error> {
         self.get_mut()
             .inner_sink
             .start_send_unpin(item)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))
+            .map_err(IoError::other)
     }
     fn poll_flush(
         self: Pin<&mut Self>,
@@ -745,7 +745,7 @@ impl Sink<Vec<u8>> for UdpPayloadSource {
         self.get_mut()
             .inner_sink
             .poll_flush_unpin(cx)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))
+            .map_err(IoError::other)
     }
 
     fn poll_close(
@@ -755,7 +755,7 @@ impl Sink<Vec<u8>> for UdpPayloadSource {
         self.get_mut()
             .inner_sink
             .poll_close_unpin(cx)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))
+            .map_err(IoError::other)
     }
 }
 

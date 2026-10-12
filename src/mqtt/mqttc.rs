@@ -579,7 +579,7 @@ pub(crate) struct MqttReply {
 }
 
 impl MqttReply {
-    pub(crate) fn as_ref(&self) -> MqttReplyRef {
+    pub(crate) fn as_ref(&self) -> MqttReplyRef<'_> {
         MqttReplyRef {
             topic: &self.topic,
             message: &self.message,

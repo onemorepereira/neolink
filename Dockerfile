@@ -4,7 +4,9 @@
 #                    Miroslav Šedivý
 # SPDX-License-Identifier: AGPL-3.0-only
 
-FROM docker.io/rust:slim-bookworm AS build
+# Base images pinned by version and digest (multi-arch index); bump them together with
+# the CI toolchain (.github/actions/setup-rust)
+FROM docker.io/library/rust:1.91.0-slim-bookworm@sha256:81c97592d519ba7397e8adccb0345fb5a91965c0a44b82af83bd1ef06c36cef5 AS build
 ARG TARGETPLATFORM
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -42,11 +44,11 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
           protobuf-compiler \
           libglib2.0-dev && \
         apt-get clean -y && rm -rf /var/lib/apt/lists/* ; \
-    cargo build --release; \
+    cargo build --release --locked; \
   fi
 
 # Create the release container. Match the base OS used to build
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-20261005-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 ARG TARGETPLATFORM
 ARG REPO
 ARG VERSION

@@ -2,9 +2,14 @@
 # Adds VLC 3 (cvlc) and a pinned go2rtc release to neolink-dev (Debian bookworm, Rust,
 # mosquitto, curl). The pinned static ffmpeg/ffprobe is mounted at /ffmpeg at run time,
 # as with neolink-dev, and go2rtc is pointed at /ffmpeg/bin/ffmpeg by its config.
-#   podman build -t neolink-clients -f tests/e2e/clients/Containerfile tests/e2e/clients
+#   podman build -t localhost/neolink-dev:ci -f tests/e2e/dev/Containerfile tests/e2e/dev
+#   podman build -t localhost/neolink-clients:ci --build-arg DEV_IMAGE=localhost/neolink-dev:ci \
+#     -f tests/e2e/clients/Containerfile tests/e2e/clients
 # VLC refuses to run as root, so clients.sh runs cvlc as the `vlc` user created here.
-FROM localhost/neolink-dev:latest
+# The dev image to build on, by an explicit tag (no default: a floating "latest" would be
+# whatever was built last)
+ARG DEV_IMAGE
+FROM ${DEV_IMAGE}
 
 # Debian's own VLC is built without live555, so it has no RTSP client. deb-multimedia's
 # bookworm build has it (liblive555_plugin.so); its keyring package is pinned by sha256.

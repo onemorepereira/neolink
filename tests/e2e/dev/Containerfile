@@ -1,5 +1,5 @@
 # The dev image (neolink-dev): Rust, GStreamer dev packages, mosquitto, curl. The client image
 # (tests/e2e/clients/Containerfile) builds on it.
-#   podman build -t neolink-dev -f tests/e2e/dev/Containerfile tests/e2e/dev
-FROM docker.io/rust:slim-bookworm
+#   podman build -t localhost/neolink-dev:ci -f tests/e2e/dev/Containerfile tests/e2e/dev
+FROM docker.io/library/rust:1.91.0-slim-bookworm@sha256:81c97592d519ba7397e8adccb0345fb5a91965c0a44b82af83bd1ef06c36cef5
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential openssl libssl-dev ca-certificates libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libglib2.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav pkg-config mosquitto mosquitto-clients curl procps && rm -rf /var/lib/apt/lists/* && rustup component add rustfmt clippy

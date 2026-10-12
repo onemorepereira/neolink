@@ -1,73 +1,94 @@
 name: Style
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  pre_job:
-    # continue-on-error: true # Uncomment once integration is finished
-    runs-on: ubuntu-latest
-    # Map a step output to a job output
-    outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }}
-    steps:
-      - id: skip_check
-        uses: fkirc/skip-duplicate-actions@v5
-        with:
-          # All of these options are optional, so you can remove them if you are happy with the defaults
-          concurrent_skipping: "same_content_newer"
-          skip_after_successful_duplicate: "false"
-
   check_clippy:
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'
     name: Clippy
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: apt install gstreamer and deps
         run: |
-          sudo apt update
-          sudo apt install -y aptitude
-          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler
-      - name: Install nightly rust
-        run: |
-          rustup toolchain install nightly --component clippy
-          rustup override set nightly
-      - name: Run clippy manually
-        run: |
-          echo "All Features"
-          cargo +nightly clippy --workspace --all-targets --all-features || exit 1
-          echo "No Features"
-          cargo +nightly clippy --workspace --all-targets --no-default-features || exit 1
-          echo "Gstreamer Only"
-          cargo +nightly clippy --workspace --all-targets --no-default-features --features=gstreamer || exit 1
-          echo "Pushnoti Only"
-          cargo +nightly clippy --workspace --all-targets --no-default-features --features=pushnoti || exit 1
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgstrtspserver-1.0-dev \
+            libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
+      # The pinned stable toolchain: new lints arrive with a deliberate toolchain bump,
+      # not with whatever the runner image or nightly ships that day
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The configurations that build an RTSP server. A build with no backend at all
+      # (--no-default-features alone, or with only pushnoti) leaves the server code unused
+      # by design; the MSRV job still compiles it.
+      - name: All features
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Default (GStreamer)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Native backend only
+        run: cargo clippy --locked --workspace --all-targets --no-default-features --features native-rtsp -- -D warnings
+      - name: Native backend and push notifications
+        run: cargo clippy --locked --workspace --all-targets --no-default-features --features native-rtsp,pushnoti -- -D warnings
 
   check_fmt:
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'
     name: Rust-fmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Install nightly rust
-        run: |
-          rustup toolchain install nightly --component rustfmt
-          rustup override set nightly
-      - name: rustfmt
-        run: |
-          cargo +nightly fmt --all -- --check
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
   check_lua:
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'
     name: Luacheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run luacheck
-        uses: nebularg/actions-luacheck@v1
+        uses: nebularg/actions-luacheck@d4137dd840545b28521ed21931e06913d93c0bc1 # v1.1.2
         with:
           files: "dissector/baichuan.lua"
           args: --globals Dissector Proto ProtoField base ByteArray DESEGMENT_ONE_MORE_SEGMENT DissectorTable Pref
+
+  check_ci:
+    name: actionlint and shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install actionlint 1.7.12 and shellcheck 0.11.0 (release binaries, sha256-checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/al.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/al.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/al.tar.gz" -C "$RUNNER_TEMP/bin" actionlint
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/sc.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $RUNNER_TEMP/sc.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/sc.tar.xz" -C "$RUNNER_TEMP" shellcheck-v0.11.0/shellcheck
+          mv "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" "$RUNNER_TEMP/bin/"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: actionlint (runs shellcheck on every run step)
+        run: actionlint -shellcheck="$RUNNER_TEMP/bin/shellcheck"
+      - name: shellcheck the scripts
+        run: shellcheck -S warning -x -P SCRIPTDIR tests/e2e/*.sh docker/entrypoint.sh docs/native-rtsp/*.sh

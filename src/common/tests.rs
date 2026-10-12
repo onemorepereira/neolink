@@ -458,7 +458,7 @@ async fn test_motion_permit_released_on_disconnect() {
     let instance = neocam.subscribe().await.unwrap();
     let permit = instance.permit("test:wake").await.unwrap();
     // Wait until the motion listener has subscribed (MSG_ID_MOTION_REQUEST)
-    wait_stats(&cam, 10, |s| s.messages.get(&31).is_some()).await;
+    wait_stats(&cam, 10, |s| s.messages.contains_key(&31)).await;
     drop(permit);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while neocam.use_count() != 0 {

@@ -49,7 +49,7 @@ enum GoldenCmd {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
-    /// Structural diff of two transcripts; exits 1 when they differ
+    /// Structural diff of two transcripts; exits 1 when they differ, 2 on an error
     Diff {
         a: PathBuf,
         b: PathBuf,
@@ -65,7 +65,19 @@ fn read(p: &PathBuf) -> anyhow::Result<Vec<golden::Entry>> {
     golden::parse(&text).with_context(|| p.display().to_string())
 }
 
-fn main() -> anyhow::Result<()> {
+/// Exit codes: 0 success, 1 `golden diff` found differences, 2 an error (as diff(1) does,
+/// so scripts can tell "differs" from "could not compare").
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     match Cli::parse().command {
         Cmd::Mkfixture(opts) => mkfixture::run(opts),
         Cmd::Fakecam(opts) => fakecam::run(opts),

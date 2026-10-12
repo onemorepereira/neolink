@@ -1,0 +1,32 @@
+name: Pinned Rust toolchain
+description: >-
+  Installs a pinned Rust toolchain with rustup (preinstalled on the hosted runners) and
+  makes it the default. The stable version CI builds, tests and lints with is the default
+  of `toolchain` below: bump it here (and in the Dockerfile and tests/e2e/dev/Containerfile
+  base images) in one change. The MSRV jobs pass `toolchain: 1.82.0`.
+inputs:
+  toolchain:
+    description: A rustup toolchain name (an exact version, or a dated nightly)
+    default: "1.91.0"
+  components:
+    description: Extra components, comma-separated (clippy, rustfmt, ...)
+    default: ""
+  targets:
+    description: Extra targets, comma-separated
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+        COMPONENTS: ${{ inputs.components }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        args=(--profile minimal --no-self-update)
+        [ -n "$COMPONENTS" ] && args+=(--component "$COMPONENTS")
+        [ -n "$TARGETS" ] && args+=(--target "$TARGETS")
+        rustup toolchain install "$TOOLCHAIN" "${args[@]}"
+        rustup default "$TOOLCHAIN"
+        rustc --version
+        cargo --version
