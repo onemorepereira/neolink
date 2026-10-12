@@ -109,7 +109,8 @@ impl AddressOrUid {
     }
 }
 
-pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<BcCamera> {
+/// Find the camera and open its connection, without logging in (see [`login`])
+pub(crate) async fn connect(camera_config: &CameraConfig) -> Result<BcCamera> {
     let camera_addr = AddressOrUid::new(
         &camera_config.camera_addr,
         &camera_config.camera_uid,
@@ -130,7 +131,11 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
                 camera_config.name, camera_addr, camera_config.channel_id
             )
         })?;
+    Ok(camera)
+}
 
+/// Log in on a connection from [`connect`] (≤ 15 s)
+pub(crate) async fn login(camera: &BcCamera, camera_config: &CameraConfig) -> Result<()> {
     let max_encryption = match camera_config.max_encryption.to_lowercase().as_str() {
         "none" => MaxEncryption::None,
         "bcencrypt" => MaxEncryption::BcEncrypt,
@@ -143,6 +148,5 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
         .with_context(|| format!("Failed to login to {}", camera_config.name))??;
 
     info!("{}: Connected and logged in", camera_config.name);
-
-    Ok(camera)
+    Ok(())
 }

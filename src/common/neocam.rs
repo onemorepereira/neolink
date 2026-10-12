@@ -470,7 +470,8 @@ impl NeoCam {
         self.ledger.clone()
     }
 
-    /// Stop every task, logging the camera out if it is connected (PLAN 1.5)
+    /// Stop every task, logging the camera out if it is connected or logging in (PLAN 1.5);
+    /// ≤ 5 s (the camera thread's own bound is 4.5 s)
     pub(crate) async fn shutdown(&mut self) {
         self.cancel.cancel();
         let set = &mut self.set;
