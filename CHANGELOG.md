@@ -79,6 +79,15 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
   - `status/motion` is published `off` when the camera sleeps or drops mid-motion,
     instead of staying `on`.
   - MQTT wakes are recorded as `mqtt:<topic>` in the wake ledger.
+  - **Power settings come only from the config file.** A config published to
+    `neolink/config` that changes a camera's `battery`, `idle_disconnect` (`idle`,
+    `idle_disc`), `idle_grace_s`, `motion_hold_max_s`, `snapshot_fresh` or
+    `pause.on_motion`, or that enables a camera the file disables, is refused whole with
+    `FAIL: ...` on `neolink/config/status` naming the cameras and keys, and a warning in
+    the log. Leaving out a key the file sets counts as a change. A camera added over MQTT
+    must leave those keys unset, so it sleeps. Before, any MQTT client could set
+    `battery = false` or `idle_disconnect = false` and keep a battery camera awake. Other
+    config writes (such as `[cameras.mqtt]` toggles) work as before.
 - **CLI `battery` and `image`** print what was saved at the camera's last wake, without
   waking it; `--fresh` wakes the camera (`image --use-stream` always does).
 - **Config.** Unknown keys (for example a misspelt `idle_disconect`) are reported with a
