@@ -61,7 +61,7 @@ neolink battery --fresh --config ~/.config/neolink/argus.toml   # before/after (
   held throughout (no new login), and it slept 10 s after the last cycle.
 - **Power:** one wake, 469 s awake.
 - **Next time:** for a full outage, also drop input from the camera:
-  `sudo nft add chain inet a11 i '{ type filter hook input priority 0; }'; sudo nft add rule inet a11 i ip saddr 192.168.86.34 drop`.
+  `sudo nft add chain inet a11 i '{ type filter hook input priority 0; }'; sudo nft add rule inet a11 i ip saddr <camera-ip> drop`.
 
 **Session 4, 2026-10-12 01:15 UTC** (battery 45 %, 3644 mV; the camera stayed connected
 with `pause.on_motion`):
@@ -117,7 +117,7 @@ with `pause.on_motion`):
 
 1. Play main with ffmpeg (`-c copy` to a file), VLC and go2rtc together.
 2. After 2 min, drop the camera for 60 s on the neolink host. This needs root, so you run
-   it: `sudo nft add table inet a11; sudo nft add chain inet a11 o '{ type filter hook output priority 0; }'; sudo nft add rule inet a11 o ip daddr 192.168.86.34 drop`.
+   it: `sudo nft add table inet a11; sudo nft add chain inet a11 o '{ type filter hook output priority 0; }'; sudo nft add rule inet a11 o ip daddr <camera-ip> drop`.
    After 60 s: `sudo nft delete table inet a11`.
 3. Expect:
    - every client keeps its session (bridged frames during the outage);
