@@ -575,13 +575,16 @@ async fn test_wake_reads_survive_a_failing_read() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     loop {
         let s = state.load();
-        if s.snapshot_at.is_some() && s.last_battery.is_some() && !s.supported_streams.is_empty()
-        {
+        if s.snapshot_at.is_some() && s.last_battery.is_some() && !s.supported_streams.is_empty() {
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "state: {:?}", s);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(state.load().uid, None);
-    assert_eq!(cam.stats().logins, 1, "the reads must not cause another wake");
+    assert_eq!(
+        cam.stats().logins,
+        1,
+        "the reads must not cause another wake"
+    );
 }

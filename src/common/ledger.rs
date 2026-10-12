@@ -98,10 +98,7 @@ impl WakeLedger {
         }
         let mut by_reason: Vec<_> = by_reason.into_iter().collect();
         by_reason.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        let reasons: Vec<String> = by_reason
-            .iter()
-            .map(|(r, n)| format!("{r} x{n}"))
-            .collect();
+        let reasons: Vec<String> = by_reason.iter().map(|(r, n)| format!("{r} x{n}")).collect();
         let warning = format!(
             "woken {} times in the last hour ({}); a battery camera woken this often will drain. \
              Check what sends these requests",
@@ -199,7 +196,11 @@ mod tests {
             .wake_at("rtsp:x:/a/main".to_string(), at(13))
             .expect("the 13th wake within the hour warns");
         assert!(w.contains("13 times"), "{}", w);
-        assert!(w.contains("mqtt:control/pir x12, rtsp:x:/a/main x1"), "{}", w);
+        assert!(
+            w.contains("mqtt:control/pir x12, rtsp:x:/a/main x1"),
+            "{}",
+            w
+        );
         // Not again within the hour
         assert!(l.wake_at("x".to_string(), at(14)).is_none());
         // Spread out wakes never warn

@@ -161,10 +161,7 @@ mod tests {
             .save_snapshot(b"saved jpeg")
             .unwrap();
         let reactor = NeoReactor::new(config).await;
-        let dir = std::env::temp_dir().join(format!(
-            "neolink-image-test-{}",
-            cam.addr().port()
-        ));
+        let dir = std::env::temp_dir().join(format!("neolink-image-test-{}", cam.addr().port()));
         std::fs::create_dir_all(&dir).unwrap();
         let opt = |fresh| Opt {
             camera: "imgcli".to_string(),

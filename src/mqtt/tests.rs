@@ -223,9 +223,17 @@ async fn test_battery_query_answers_from_state() {
     let (_, xml, _) = h
         .wait_published(5, |(t, _, _)| t == "neolink/fake/status/battery")
         .await;
-    assert!(xml.contains("<batteryPercent>55</batteryPercent>"), "{}", xml);
+    assert!(
+        xml.contains("<batteryPercent>55</batteryPercent>"),
+        "{}",
+        xml
+    );
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(h.cam.stats().connections, 0, "a battery query woke the camera");
+    assert_eq!(
+        h.cam.stats().connections,
+        0,
+        "a battery query woke the camera"
+    );
 }
 
 /// With nothing saved yet the query fails rather than waking the camera
@@ -253,7 +261,11 @@ async fn test_fresh_battery_queries_coalesce() {
     let (_, xml, _) = h
         .wait_published(5, |(t, _, _)| t == "neolink/fake/status/battery")
         .await;
-    assert!(xml.contains("<batteryPercent>80</batteryPercent>"), "{}", xml);
+    assert!(
+        xml.contains("<batteryPercent>80</batteryPercent>"),
+        "{}",
+        xml
+    );
     assert_eq!(h.cam.stats().logins, 1);
     // One read for the queries; the wake's own reads add at most one more
     let reads = h
@@ -321,7 +333,11 @@ async fn test_always_on_queries_are_live() {
     let (_, xml, _) = h
         .wait_published(5, |(t, _, _)| t == "neolink/fake/status/battery")
         .await;
-    assert!(xml.contains("<batteryPercent>80</batteryPercent>"), "{}", xml);
+    assert!(
+        xml.contains("<batteryPercent>80</batteryPercent>"),
+        "{}",
+        xml
+    );
 }
 
 // --- status topics
@@ -333,14 +349,21 @@ async fn test_motion_off_after_disconnect() {
     let mut h = Harness::start(FakeCameraConfig::default(), "idle_grace_s = 1").await;
     let instance = h.neocam.subscribe().await.unwrap();
     let permit = instance.permit("test:wake").await.unwrap();
-    wait_stats(&h.cam, 10, |s| s.messages.contains_key(&MSG_ID_MOTION_REQUEST)).await;
+    wait_stats(&h.cam, 10, |s| {
+        s.messages.contains_key(&MSG_ID_MOTION_REQUEST)
+    })
+    .await;
     h.cam.motion(true);
-    h.wait_published(5, |(t, m, _)| t == "neolink/fake/status/motion" && m == "on")
-        .await;
+    h.wait_published(5, |(t, m, _)| {
+        t == "neolink/fake/status/motion" && m == "on"
+    })
+    .await;
     drop(permit);
     h.cam.drop_connections();
-    h.wait_published(10, |(t, m, _)| t == "neolink/fake/status/motion" && m == "off")
-        .await;
+    h.wait_published(10, |(t, m, _)| {
+        t == "neolink/fake/status/motion" && m == "off"
+    })
+    .await;
 }
 
 /// P6: the wake ledger is published (retained) on every wake and sleep
@@ -355,7 +378,11 @@ async fn test_ledger_published() {
         })
         .await;
     assert!(retained);
-    assert!(json.contains("\"reason\":\"mqtt:control/wakeup\""), "{}", json);
+    assert!(
+        json.contains("\"reason\":\"mqtt:control/wakeup\""),
+        "{}",
+        json
+    );
     h.send("control/wakeup", "0");
     h.wait_published(10, |(t, m, _)| {
         t == "neolink/fake/status/wakes" && m.contains("\"awake\":false")

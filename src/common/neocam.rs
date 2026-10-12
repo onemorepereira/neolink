@@ -20,8 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    LedgerStatus, LockGuard, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance,
-    Permit, StateFile, UseCounter, WakeLedger,
+    LedgerStatus, LockGuard, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState,
+    NeoInstance, Permit, StateFile, UseCounter, WakeLedger,
 };
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
@@ -525,7 +525,9 @@ impl WakeReads {
     /// A failed read: warn the first time, then only at debug (it is tried every wake)
     fn failed(&mut self, name: &str, what: &'static str, e: &anyhow::Error) {
         if self.warned.insert(what) {
-            log::warn!("{name}: could not read the {what} while awake (tried again on later wakes): {e:#}");
+            log::warn!(
+                "{name}: could not read the {what} while awake (tried again on later wakes): {e:#}"
+            );
         } else {
             log::debug!("{name}: could not read the {what}: {e:#}");
         }

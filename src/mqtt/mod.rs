@@ -1326,7 +1326,8 @@ async fn live_query<T, F>(
 where
     F: for<'a> Fn(
         &'a neolink_core::bc_protocol::BcCamera,
-    ) -> std::pin::Pin<Box<dyn futures::Future<Output = AnyResult<T>> + Send + 'a>>,
+    )
+        -> std::pin::Pin<Box<dyn futures::Future<Output = AnyResult<T>> + Send + 'a>>,
 {
     let sleeps = match camera.config().await {
         Ok(c) => c.borrow().sleeps(),
@@ -1343,8 +1344,7 @@ where
             ));
         }
         // Awake for something else: read without holding it awake
-        match tokio::time::timeout(Duration::from_secs(10), camera.run_passive_task(task)).await
-        {
+        match tokio::time::timeout(Duration::from_secs(10), camera.run_passive_task(task)).await {
             Ok(r) => r,
             Err(_) => Err(anyhow!("the camera went to sleep before answering")),
         }
@@ -1468,7 +1468,9 @@ fn saved_reply(published: String, age: u64, fresh: bool) -> String {
     if published != "OK" {
         published
     } else if fresh {
-        format!("OK: saved {age} s ago (fresh queries reuse a reading up to {FRESH_MAX_AGE_S} s old)")
+        format!(
+            "OK: saved {age} s ago (fresh queries reuse a reading up to {FRESH_MAX_AGE_S} s old)"
+        )
     } else {
         format!("OK: saved {age} s ago (send `fresh` to wake the camera for a new one)")
     }
