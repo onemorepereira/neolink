@@ -667,7 +667,7 @@ The initial no-credentials 401 does not.
 | `pacing_latency_ms` | camera | 0–3000, auto (§4.4) | |
 | `parameter_sets` | camera | `"strip"\|"passthrough"\|"inject"`, `"strip"` (A4b, Gate 3) | |
 | `bridge_fps` | camera | 0.1–2, `0.2` | |
-| `battery` | camera | bool, auto-detected (`None` → battery) | Overrides detection |
+| `battery` | camera | bool, unset (`None` → battery) | Not auto-detected: the state file records a successful battery read, but only the config decides whether a camera sleeps. `false` makes the camera always-on unless `idle_disconnect = true` |
 | `rtcp_sr` | camera | bool, `true` | |
 | `bridge_max_s` | camera | 10–3600, `120` | |
 | `persist_irap` | camera | bool, `true` | |
@@ -759,7 +759,8 @@ backends.
   drop, not only after the first use. This fixes `neocam.rs:357-366`.
 - `idle_disconnect` keeps its meaning but changes its default:
   - unset and battery/unknown → sleep;
-  - unset and mains → always-on, as today;
+  - unset and mains (`battery = false` in the config; mains is never detected) →
+    always-on, as today;
   - explicitly `false` → always-on, with a warning on battery cameras.
 
 **Passive tasks (P3)**

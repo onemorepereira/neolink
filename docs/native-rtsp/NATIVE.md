@@ -93,19 +93,28 @@ A config sent there with `certificate` or `tls_client_auth` is refused as a whol
 is not supported yet. Otherwise, edit the file and restart (`docker restart` takes under
 a second).
 
-**Settings from before the native backend that matter here:**
+**Power and snapshot settings.** These are shared with the GStreamer backend (see the
+README's [Power section](../../README.md#power-sleeping-and-always-on-cameras)):
 
 | Key | Where | Default | What |
 |---|---|---|---|
-| `idle_grace_s` | camera | 10 | How long the camera stays connected after the last use |
-| `battery` | camera | auto | `false` marks a mains camera (it may then stay connected) |
-| `idle_disconnect` | camera | sleep if battery or unknown | Force sleeping or always-on |
+| `battery` | camera | unset, treated as battery | `false` marks a mains camera, which then stays connected. Not detected automatically |
+| `idle_disconnect` | camera | unset: follows `battery` | `true` forces sleeping, `false` forces always-on (with a warning unless `battery = false`) |
+| `idle_grace_s` | camera | 10 | How long a sleeping camera stays connected after the last use |
 | `motion_hold_max_s` | camera | 120 | Longest a motion event keeps the camera awake |
 | `snapshot_port` | top | `bind_port + 1` | The snapshot endpoint (below); `0` turns it off |
 | `snapshot_fresh` | camera | `false` | Allow `?fresh=1`, which wakes the camera for a new picture |
 
-**The snapshot endpoint.** It is on by default at `http://<bind>:<bind_port+1>/<camera>/snapshot.jpg`.
-- It serves the last picture taken at a wake, without waking a sleeping camera.
+**A camera with neither `battery` nor `idle_disconnect` set sleeps**, whatever its real
+power source, with either backend. Before this work every camera stayed connected. Set
+`battery = false` on mains, PoE and NVR-channel cameras to keep that behaviour.
+
+**The snapshot endpoint.** It is on by default at `http://<bind>:<bind_port+1>/<camera>/snapshot.jpg`,
+in `rtsp` and `mqtt-rtsp` modes, with either backend.
+- It serves the last picture taken at a wake, without waking a sleeping camera. Until the
+  first wake it serves a grey placeholder (HTTP 200).
+- `?fresh=1` takes a new picture, waking the camera: only with `snapshot_fresh = true`
+  (otherwise 403), and at most once a minute per camera.
 - With no `[[users]]`, anyone who can reach the port may fetch it. With users, it takes
   HTTP Basic only, even when `rtsp_auth` is digest-only. Failed logins are paced like
   RTSP's.
@@ -114,7 +123,10 @@ a second).
 
 ## Battery cameras
 
-The native backend is built for cameras that must sleep:
+A camera sleeps when `idle_disconnect = true`, or when `idle_disconnect` is unset and
+`battery` is not `false`, so **by default**. Sleeping itself (no contact at boot, release
+after `idle_grace_s`) is the same with both backends. The native backend adds what keeps
+probes from waking the camera:
 - **No contact at boot.** A sleeping camera is not contacted until a client plays.
 - **Probes don't wake it.** After the first time, `DESCRIBE` (health checks, Home
   Assistant probes) is answered from a cache in the state directory.
@@ -124,15 +136,19 @@ The native backend is built for cameras that must sleep:
 - **It sleeps again soon.** The camera is released `idle_grace_s` after the last viewer
   leaves.
 - **One wake per 10 minutes for learning.** A stream that has never been seen is learned
-  at most once per camera per 10 minutes. One wake teaches every stream kind.
-- `battery` unknown is treated as battery.
+  at most once per camera per 10 minutes. One wake teaches every stream kind. A camera
+  that is already connected is not limited, and neither is an always-on camera.
+- `battery` unknown is treated as battery: neolink never decides on its own that a camera
+  is on mains power.
 
 `pause.on_motion` needs motion events, and a camera sends those only over an open
 connection. **On a sleeping camera, `pause.on_motion` cannot start the stream on motion.**
-The native build has no push notifications, which would go through Google's and
-Reolink's cloud. Neolink warns about this at startup. Use it only on a camera that stays
-connected (`idle_disconnect = false`, which costs battery), or let clients wake the camera
-by playing.
+The native build has no push notifications (the optional `pushnoti` feature is not in
+it), which would go through Google's and Reolink's cloud. Neolink warns about this at
+startup. Use it only on a camera that stays connected (`battery = false` on mains, or
+`idle_disconnect = false`, which costs battery), or let clients wake the camera by
+playing. The same holds for MQTT motion and floodlight status: they are reported only
+while the camera is awake.
 
 ## What behaves differently from the GStreamer backend
 
@@ -160,7 +176,8 @@ These are the SPEC §5 deltas:
 
 ## Privacy and trust
 
-- **`irap.bin`** (in the state directory, one per camera stream) holds the last keyframe:
+- **`irap.bin`** (in the state directory as `cache/<hash>-<stream>/irap.bin`, one per
+  camera stream) holds the last keyframe:
   an image of what the camera last saw. Set `persist_irap = false` to keep it only in
   memory, and protect the state directory like the config.
 - **MQTT.** The `neolink/config` topic can rewrite the whole config, including users,
@@ -170,8 +187,9 @@ These are the SPEC §5 deltas:
     when the camera's address (and UID) and the MQTT broker are unchanged. A config that
     points a camera or the broker elsewhere doesn't get the current secrets.
   - A malformed config is answered with the line number only, never the line's text.
-- **Snapshots.** `<camera>.jpg` in the state directory is the last picture of each camera;
-  treat it like `irap.bin`.
+- **Snapshots.** `camera/<name>-<hash>.jpg` in the state directory (next to that camera's
+  `<name>-<hash>.json` state file) is the last picture of each camera; treat it like
+  `irap.bin`.
 - **Logs** never contain passwords, `Authorization` headers or `user:pass@` URLs, at any
   level.
 - **Bridged media during outages is synthetic** (a repeated keyframe and silence). A
