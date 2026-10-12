@@ -23,6 +23,21 @@ async fn fake() -> FakeCamera {
     .unwrap()
 }
 
+/// Camera name → a delay at the start of its `camera_main`: a camera slow to set up
+static START_DELAYS: std::sync::Mutex<Vec<(String, Duration)>> = std::sync::Mutex::new(Vec::new());
+
+pub(super) async fn start_delay(name: &str) {
+    let d = START_DELAYS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, d)| *d);
+    if let Some(d) = d {
+        tokio::time::sleep(d).await;
+    }
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -74,12 +89,17 @@ async fn run(config: Config) -> Running {
     let _ = env_logger::builder().is_test(true).try_init();
     let port = config.bind_port;
     let reactor = NeoReactor::new(config).await;
-    let task = tokio::spawn(main(reactor.clone()));
+    let mut task = tokio::spawn(main(reactor.clone()));
     for _ in 0..100 {
         if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // free_port() gave the port up: another process may have taken it since, and the
+    // connect above then reached that process's server
+    if task.is_finished() {
+        panic!("the server ended at start: {:?}", (&mut task).await);
     }
     Running {
         reactor,
@@ -611,6 +631,29 @@ async fn test_native_cold_main_and_sub_describe_together() {
         assert_eq!(t.await.unwrap(), 200);
     }
     assert_eq!(cam.stats().logins, 1, "one wake");
+}
+
+/// A client that connects as soon as the port opens gets the configured camera, even when
+/// that camera is slow to set up: the server accepts nobody before the cameras configured
+/// at start have their mounts (a 404 there flaked test_native_cold_main_and_sub_describe_together)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_no_404_before_mounts() {
+    START_DELAYS
+        .lock()
+        .unwrap()
+        .push(("native-slowstart".to_string(), Duration::from_millis(500)));
+    let cam = fake().await;
+    let port = free_port();
+    let r = run(config(&cam, port, "native-slowstart", "", "", "")).await;
+    let mut c = Client::connect(r.port).await;
+    let d = c
+        .request(
+            "DESCRIBE",
+            &format!("rtsp://127.0.0.1:{}/native-slowstart/main", port),
+            &[],
+        )
+        .await;
+    assert_eq!(d.status, 200, "{}", d.head);
 }
 
 /// An always-connected camera serves its mounts from the start, not only once it has

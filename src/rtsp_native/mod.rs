@@ -365,14 +365,21 @@ async fn run(reactor: NeoReactor, cancel: CancellationToken) -> Result<()> {
         });
     }
 
-    // Cameras added and removed; a camera whose task ended is started again
+    // Cameras added and removed; a camera whose task ended is started again. The cameras
+    // configured at start report once their mounts are set (`mounted`), so the server
+    // accepts no client before then: a DESCRIBE right after startup must not get 404 for
+    // a configured camera
+    let (mounted_tx, mounted_rx) = tokio::sync::oneshot::channel::<()>();
     {
         let (provider, cancel, reactor) = (provider.clone(), cancel.clone(), reactor.clone());
         let mut rx = reactor.config().await?;
         set.spawn(async move {
             let mut running: HashMap<String, CancellationToken> = HashMap::new();
             let mut tasks: JoinSet<String> = JoinSet::new();
+            let mut mounted_tx = Some(mounted_tx);
             loop {
+                // Only the first pass's cameras hold the server back
+                let mut starting = vec![];
                 let config = rx.borrow_and_update().clone();
                 let wanted: HashSet<String> = config
                     .cameras
@@ -396,8 +403,14 @@ async fn run(reactor: NeoReactor, cancel: CancellationToken) -> Result<()> {
                     let token = cancel.child_token();
                     running.insert(name.clone(), token.clone());
                     let (provider, reactor) = (provider.clone(), reactor.clone());
+                    let ready = mounted_tx.is_some().then(|| {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        starting.push(rx);
+                        tx
+                    });
                     tasks.spawn(async move {
-                        let ended = camera_main(&name, reactor, provider, token.clone()).await;
+                        let ended =
+                            camera_main(&name, reactor, provider, token.clone(), ready).await;
                         if let Err(e) = ended {
                             log::error!("{name}: RTSP stopped: {e:#}; restarting in 5 s");
                             tokio::select! {
@@ -406,6 +419,15 @@ async fn run(reactor: NeoReactor, cancel: CancellationToken) -> Result<()> {
                             }
                         }
                         name
+                    });
+                }
+                if let Some(tx) = mounted_tx.take() {
+                    // A camera that fails before mounting drops its sender: it counts as done
+                    tokio::spawn(async move {
+                        for rx in starting {
+                            let _ = rx.await;
+                        }
+                        let _ = tx.send(());
                     });
                 }
                 tokio::select! {
@@ -442,6 +464,17 @@ async fn run(reactor: NeoReactor, cancel: CancellationToken) -> Result<()> {
     {
         let (server, cancel) = (server.clone(), cancel.clone());
         set.spawn(async move {
+            // Bound already (a taken port fails at once); clients that connect meanwhile
+            // wait in the backlog. Setting mounts takes milliseconds: the bound only keeps
+            // a stuck camera from holding back the others
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                r = tokio::time::timeout(Duration::from_secs(10), mounted_rx) => {
+                    if r.is_err() {
+                        log::warn!("RTSP: cameras still setting up after 10 s; serving anyway");
+                    }
+                }
+            }
             server.serve(listener, cancel).await;
             Ok(())
         });
@@ -472,7 +505,10 @@ async fn camera_main(
     reactor: NeoReactor,
     provider: Arc<NativeProvider>,
     cancel: CancellationToken,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
+    #[cfg(test)]
+    tests::start_delay(name).await;
     let gen = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
     let instance = reactor.get(name).await?;
     let mut config_rx = instance.config().await?;
@@ -559,6 +595,9 @@ async fn camera_main(
                     .map(|k| kind_of(*k))
                     .collect();
                 provider.set_mounts(name, gen, aliases(name, &kinds));
+                if let Some(tx) = ready.take() {
+                    let _ = tx.send(());
+                }
                 let _ = availability_tx.send_replace(Availability {
                     supported: Some(true),
                     battery: Some(config.sleeps()),

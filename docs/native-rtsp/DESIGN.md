@@ -631,6 +631,9 @@ The connection task owns the read half. A writer task owns the write half.
 - **Track resolution**: by suffix, or by an absolute URI equal to `Content-Base` + control.
 - **Unknown path**: 404.
 - **Configured but unsupported stream**: 404 (F-int 8).
+- **Startup**: the listener is bound first, but no connection is accepted until every
+  camera configured at start has set its mounts (bounded at 10 s); until then clients wait
+  in the backlog, so a configured camera never answers 404 just after startup.
 
 ### 6.5 Auth (R6), matching golden behaviour
 
