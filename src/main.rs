@@ -33,6 +33,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use env_logger::Env;
 use log::*;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use validator::Validate;
 
@@ -66,8 +67,19 @@ use config::Config;
 
 pub(crate) type AnyResult<T> = Result<T, anyhow::Error>;
 
+fn main() -> Result<()> {
+    // Before anything else (no logger, no runtime): the container image runs neolink as its
+    // entrypoint, so its command line may be neolink's arguments or a whole other command
+    raise_fd_limit();
+    let args = std::env::args_os().collect();
+    match entry(args, std::env::var_os("NEO_LINK_MODE"), &is_program) {
+        Entry::Exec(argv) => exec_command(argv),
+        Entry::Neolink(args) => neolink_main(args),
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn neolink_main(args: Vec<OsString>) -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     info!(
@@ -76,8 +88,11 @@ async fn main() -> Result<()> {
         env!("NEOLINK_PROFILE")
     );
 
-    raise_fd_limit();
-    let opt = Opt::parse_from(args_with_mode(std::env::args_os().collect()));
+    let opt = Opt::parse_from(args);
+    // Fail now, not on the first `docker stop`, if SIGTERM/SIGINT can't be caught: as PID 1
+    // without a handler neolink would ignore SIGTERM and be killed without logging out
+    let mut signals =
+        ShutdownSignals::new().context("Could not install the SIGTERM/SIGINT handlers")?;
 
     let conf_path = opt.config.context("Must supply --config file")?;
     let config_text = fs::read_to_string(&conf_path)
@@ -92,6 +107,7 @@ async fn main() -> Result<()> {
     config::warn_feature_mismatches(&config, &config_text);
     // The config is read (as root, if the image runs so): now become PUID/PGID if asked
     drop_privileges()?;
+    check_state_dir();
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
 
@@ -185,7 +201,7 @@ async fn main() -> Result<()> {
     }
     let result = tokio::select! {
         v = run => v,
-        sig = shutdown_signal() => {
+        sig = signals.recv() => {
             info!("Received {sig}, shutting down");
             Ok(())
         }
@@ -205,69 +221,171 @@ async fn main() -> Result<()> {
     std::process::exit(code)
 }
 
-/// SIGTERM (podman/docker stop) or SIGINT (Ctrl-C)
-async fn shutdown_signal() -> &'static str {
+/// SIGTERM (podman/docker stop) and SIGINT (Ctrl-C), registered up front so that a
+/// failure to register them stops neolink at startup instead of leaving it deaf to them
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) {
-            (Ok(mut term), Ok(mut int)) => tokio::select! {
-                _ = term.recv() => "SIGTERM",
-                _ = int.recv() => "SIGINT",
-            },
-            _ => std::future::pending().await,
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    int: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                term: signal(SignalKind::terminate())?,
+                int: signal(SignalKind::interrupt())?,
+            })
         }
+        #[cfg(not(unix))]
+        Ok(Self {})
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        "Ctrl-C"
+
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.term.recv() => "SIGTERM",
+                _ = self.int.recv() => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "Ctrl-C"
+        }
     }
 }
 
-/// `NEO_LINK_MODE` (the container's mode variable) supplies the subcommand when the
-/// command line has none, so the image can use exec-form CMD with neolink as PID 1 and
-/// still let users pick the mode with an environment variable (PLAN 1.9)
-fn args_with_mode(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
-    use clap::CommandFactory;
-    // Compose files written for the old shell entrypoint pass the binary itself first
-    // (`command: /usr/local/bin/neolink mqtt ...`); with neolink as the entrypoint that
-    // would be argv[1]
+/// What the command line asks for
+#[derive(Debug, PartialEq)]
+enum Entry {
+    /// Run neolink with these arguments (argv\[0\] first)
+    Neolink(Vec<OsString>),
+    /// Replace neolink with this command (the program first)
+    Exec(Vec<OsString>),
+}
+
+/// Reads the command line the way the container image needs it. neolink is the image's
+/// entrypoint (exec form, so it is PID 1 and gets `docker stop`'s SIGTERM), which means its
+/// command line is the container's command. That command can be:
+/// - neolink's arguments (`--config /etc/neolink.toml`, `rtsp --config ...`). Without a
+///   subcommand, `NEO_LINK_MODE` supplies one;
+/// - neolink itself, as compose files written for the old shell entrypoint have it
+///   (`neolink mqtt --config ...`, `/usr/local/bin/neolink rtsp ...`): it is dropped;
+/// - any other program (`sh -c "..."`, `/custom/script.sh`), as the old entrypoint ran
+///   them: neolink hands over to it ([`Entry::Exec`]). A neolink subcommand always wins
+///   over a program of the same name (`users`).
+///
+/// `is_program` tells whether a bare name is an executable in `PATH`.
+fn entry(
+    mut args: Vec<OsString>,
+    mode: Option<OsString>,
+    is_program: &dyn Fn(&OsStr) -> bool,
+) -> Entry {
     if args
         .get(1)
-        .and_then(|a| a.to_str())
-        .is_some_and(|a| a == "neolink" || a.ends_with("/neolink"))
+        .is_some_and(|a| std::path::Path::new(a).file_name() == Some(OsStr::new("neolink")))
     {
         args.remove(1);
     }
-    if args.iter().skip(1).any(|a| {
-        matches!(
-            a.to_str(),
-            Some("-h" | "--help" | "-V" | "--version" | "help")
-        )
-    }) {
-        return args;
+    let Some(first) = args.get(1) else {
+        return Entry::Neolink(with_mode(args, mode));
+    };
+    let first_text = first.to_string_lossy();
+    if first_text.starts_with('-') {
+        return Entry::Neolink(with_mode(args, mode));
     }
-    let Some(mode) = std::env::var_os("NEO_LINK_MODE").filter(|m| !m.is_empty()) else {
+    if is_subcommand(first) {
+        return Entry::Neolink(args);
+    }
+    if first_text.contains('/') || is_program(first) {
+        return Entry::Exec(args.split_off(1));
+    }
+    // Not neolink's and not a program: clap reports the unknown subcommand after this
+    eprintln!(
+        "neolink: {first_text:?} is not a neolink subcommand, and there is no program of \
+         that name in PATH (the native image has no shell)"
+    );
+    Entry::Neolink(args)
+}
+
+/// Adds `NEO_LINK_MODE` as the subcommand when the arguments parse and have none. Parsing
+/// (rather than looking for a subcommand's name) keeps option values such as
+/// `--config rtsp` from being taken for one.
+fn with_mode(mut args: Vec<OsString>, mode: Option<OsString>) -> Vec<OsString> {
+    let Some(mode) = mode.filter(|m| !m.is_empty()) else {
         return args;
     };
-    let command = Opt::command();
-    let has_subcommand = args.iter().skip(1).any(|a| {
-        command
-            .get_subcommands()
-            .any(|c| a.to_str() == Some(c.get_name()))
-    });
-    if !has_subcommand {
+    // Errors (bad arguments, --help, --version) are left for the real parse to report
+    if let Ok(Opt { cmd: None, .. }) = Opt::try_parse_from(&args) {
         args.insert(1.min(args.len()), mode);
     }
     args
 }
 
-/// Raise the open-file soft limit to the hard limit (the entrypoint's `ulimit -n` did
-/// this before); each RTSP client and camera connection needs descriptors
+fn is_subcommand(name: &OsStr) -> bool {
+    use clap::CommandFactory;
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name == "help" || Opt::command().find_subcommand(name).is_some()
+}
+
+/// An executable file of this name in `PATH`
+fn is_program(name: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if name.is_empty() {
+            return false;
+        }
+        let path = std::env::var_os("PATH").unwrap_or_else(|| {
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
+        });
+        std::env::split_paths(&path).any(|dir| {
+            fs::metadata(dir.join(name))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// Becomes the given command, as the old `/entrypoint.sh` ran it: same process (so PID 1
+/// stays PID 1), same environment, with the raised open-file limit. `PUID`/`PGID` are left
+/// to the neolink that the command starts, after it has read its config.
+fn exec_command(argv: Vec<OsString>) -> Result<()> {
+    let program = &argv[0];
+    eprintln!("neolink: running {program:?} (not a neolink subcommand)");
+    let mut command = std::process::Command::new(program);
+    command.args(&argv[1..]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = command.exec();
+        eprintln!("neolink: could not run {program:?}: {err}");
+        std::process::exit(if err.kind() == std::io::ErrorKind::NotFound {
+            127
+        } else {
+            126
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command
+            .status()
+            .with_context(|| format!("could not run {program:?}"))?;
+        std::process::exit(status.code().unwrap_or(1))
+    }
+}
+
 /// `PUID`/`PGID` (the container convention): switch to that user and group after reading
 /// the config, when running as root (DESIGN §3.3). Nothing happens without `PUID`.
 fn drop_privileges() -> Result<()> {
@@ -281,32 +399,20 @@ fn drop_privileges() -> Result<()> {
             Some(g) => g.parse().context("PGID must be a number")?,
             None => uid as libc::gid_t,
         };
+        // SAFETY: geteuid has no preconditions
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            if euid != uid {
+                warn!("PUID={uid} ignored: not running as root");
+            }
+            return Ok(());
+        }
+        // The state directory (desc cache, learning gate, snapshots) must stay writable,
+        // or every restart forgets them and a battery camera is woken more often
+        hand_over_state_dir(&crate::common::state_dir(), uid, gid);
+        let groups = [gid];
         // SAFETY: plain syscalls on integers; the group list is one valid gid
         unsafe {
-            if libc::geteuid() != 0 {
-                if libc::geteuid() != uid {
-                    warn!("PUID={uid} ignored: not running as root");
-                }
-                return Ok(());
-            }
-            // The state directory (desc cache, learning gate, snapshots) must stay writable,
-            // or every restart forgets them and a battery camera is woken more often
-            let dir = crate::common::state_dir();
-            let _ = std::fs::create_dir_all(&dir);
-            if let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) {
-                let mut st: libc::stat = std::mem::zeroed();
-                if libc::stat(c.as_ptr(), &mut st) == 0
-                    && st.st_uid == 0
-                    && libc::chown(c.as_ptr(), uid, gid) != 0
-                {
-                    warn!(
-                        "could not hand the state directory {} to PUID={uid}: {}",
-                        dir.display(),
-                        std::io::Error::last_os_error()
-                    );
-                }
-            }
-            let groups = [gid];
             if libc::setgroups(1, groups.as_ptr()) != 0
                 || libc::setgid(gid) != 0
                 || libc::setuid(uid) != 0
@@ -318,22 +424,108 @@ fn drop_privileges() -> Result<()> {
             }
         }
         info!("Running as uid {uid}, gid {gid}");
-        let probe = crate::common::state_dir().join(".neolink-write-test");
-        match std::fs::write(&probe, b"ok") {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&probe);
-            }
-            Err(e) => log::error!(
-                "The state directory {} is not writable by PUID={uid} ({e}): the stream cache, \
-                 the learning-start limit and snapshots will not survive a restart, so a \
-                 battery camera is woken more often. Make it writable by that user",
-                crate::common::state_dir().display()
-            ),
-        }
     }
     Ok(())
 }
 
+/// What neolink writes in the state directory, besides the directory itself: `camera/`
+/// (state files, snapshots, locks), `cache/<camera>-<stream>/` (stream descriptions) and
+/// `learn-<camera>.txt`. Nothing else is listed, so a state directory pointed at a shared
+/// path is not handed over wholesale.
+#[cfg(unix)]
+fn state_dir_entries(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(p: std::path::PathBuf, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+        // symlink_metadata: a symlink is listed but never followed
+        let is_dir = fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir());
+        out.push(p.clone());
+        if is_dir && depth > 0 {
+            for e in fs::read_dir(&p).into_iter().flatten().flatten() {
+                walk(e.path(), depth - 1, out);
+            }
+        }
+    }
+    let mut out = vec![];
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name == "camera" || name == "cache" || name.starts_with("learn-") {
+            walk(e.path(), 2, &mut out);
+        }
+    }
+    out
+}
+
+/// Gives the state directory, and the root-owned parts of it that neolink writes, to
+/// `uid`/`gid`: a volume first used by a root neolink holds root-owned `camera/` files
+/// that the dropped user could not replace. Symlinks inside it are not followed.
+#[cfg(unix)]
+fn hand_over_state_dir(dir: &std::path::Path, uid: u32, gid: u32) {
+    use std::os::unix::fs::MetadataExt;
+    if dir.parent().is_none() {
+        warn!(
+            "The state directory is {}: not changing its owner",
+            dir.display()
+        );
+        return;
+    }
+    let _ = fs::create_dir_all(dir.join("camera"));
+    let give = |p: &std::path::Path, top: bool| {
+        let meta = if top {
+            fs::metadata(p)
+        } else {
+            fs::symlink_metadata(p)
+        };
+        let Ok(meta) = meta else { return };
+        if meta.uid() != 0 || meta.file_type().is_symlink() {
+            return;
+        }
+        let res = if top {
+            std::os::unix::fs::chown(p, Some(uid), Some(gid))
+        } else {
+            std::os::unix::fs::lchown(p, Some(uid), Some(gid))
+        };
+        if let Err(e) = res {
+            warn!("could not hand {} to PUID={uid}: {e}", p.display());
+        }
+    };
+    give(dir, true);
+    for p in state_dir_entries(dir) {
+        give(&p, false);
+    }
+}
+
+/// Logs an error when the state directory or its `camera/` subdirectory can't be written:
+/// the stream cache, the learning-start limit and snapshots would then be lost on every
+/// restart, so a battery camera is woken more often
+fn check_state_dir() {
+    let dir = crate::common::state_dir();
+    for d in [dir.clone(), dir.join("camera")] {
+        let probe = d.join(".neolink-write-test");
+        match fs::create_dir_all(&d).and_then(|()| fs::write(&probe, b"ok")) {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+            }
+            Err(e) => {
+                #[cfg(unix)]
+                // SAFETY: geteuid/getegid have no preconditions
+                let who = unsafe { format!("uid {}, gid {}", libc::geteuid(), libc::getegid()) };
+                #[cfg(not(unix))]
+                let who = "this user".to_string();
+                error!(
+                    "The state directory {} is not writable by {who} ({e}): the stream cache, \
+                     the learning-start limit and snapshots will not survive a restart, so a \
+                     battery camera is woken more often. Make it writable by that user, or \
+                     run as root with PUID/PGID so that neolink hands it over",
+                    d.display()
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Raise the open-file soft limit to the hard limit (the old entrypoint's `ulimit -n` did
+/// this); each RTSP client and camera connection needs descriptors
 fn raise_fd_limit() {
     #[cfg(unix)]
     // SAFETY: getrlimit/setrlimit only read and write the struct we pass
@@ -353,36 +545,191 @@ fn raise_fd_limit() {
 mod main_tests {
     use super::*;
 
+    fn args(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    /// `sh`, `bash` and `users` are programs; nothing else is
+    fn programs(name: &OsStr) -> bool {
+        matches!(name.to_str(), Some("sh" | "bash" | "users"))
+    }
+
+    fn run(v: &[&str], mode: Option<&str>) -> Entry {
+        entry(args(v), mode.map(OsString::from), &programs)
+    }
+
+    fn neolink(v: &[&str]) -> Entry {
+        Entry::Neolink(args(v))
+    }
+
     #[test]
-    fn test_args_with_mode() {
-        let args = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
-        std::env::set_var("NEO_LINK_MODE", "mqtt");
+    fn test_mode_supplies_the_subcommand() {
+        let m = Some("mqtt");
+        // The image's CMD
         assert_eq!(
-            args_with_mode(args(&["neolink", "--config", "/etc/neolink.toml"])),
-            args(&["neolink", "mqtt", "--config", "/etc/neolink.toml"])
+            run(&["neolink", "--config", "/etc/neolink.toml"], m),
+            neolink(&["neolink", "mqtt", "--config", "/etc/neolink.toml"])
         );
         assert_eq!(
-            args_with_mode(args(&["neolink", "battery", "--config", "c", "cam"])),
-            args(&["neolink", "battery", "--config", "c", "cam"])
+            run(
+                &["neolink", "--config=/etc/neolink.toml"],
+                Some("mqtt-rtsp")
+            ),
+            neolink(&["neolink", "mqtt-rtsp", "--config=/etc/neolink.toml"])
+        );
+        // A subcommand on the command line wins
+        assert_eq!(
+            run(&["neolink", "battery", "--config", "c", "cam"], m),
+            neolink(&["neolink", "battery", "--config", "c", "cam"])
         );
         assert_eq!(
-            args_with_mode(args(&["neolink", "--version"])),
-            args(&["neolink", "--version"])
+            run(&["neolink", "--config", "c", "rtsp"], m),
+            neolink(&["neolink", "--config", "c", "rtsp"])
+        );
+        // No mode, or an empty one: unchanged
+        assert_eq!(
+            run(&["neolink", "--config", "c"], None),
+            neolink(&["neolink", "--config", "c"])
         );
         assert_eq!(
-            args_with_mode(args(&[
-                "neolink",
-                "/usr/local/bin/neolink",
-                "mqtt",
-                "--config",
-                "c"
-            ])),
-            args(&["neolink", "mqtt", "--config", "c"])
+            run(&["neolink", "--config", "c"], Some("")),
+            neolink(&["neolink", "--config", "c"])
         );
-        std::env::remove_var("NEO_LINK_MODE");
+    }
+
+    #[test]
+    fn test_option_values_are_not_subcommands() {
+        // A config file named like a subcommand, or a path containing one
+        for v in [
+            &["neolink", "--config", "rtsp"][..],
+            &["neolink", "-c", "mqtt"],
+            &["neolink", "--config=rtsp"],
+            &["neolink", "--config", "/etc/neolink/rtsp"],
+            &["neolink", "--config", "/my neolink dir/neolink.toml"],
+        ] {
+            let mut want = args(v);
+            want.insert(1, "mqtt".into());
+            assert_eq!(run(v, Some("mqtt")), Entry::Neolink(want), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn test_help_and_version_are_left_alone() {
+        for v in [
+            &["neolink", "--help"][..],
+            &["neolink", "-h"],
+            &["neolink", "--version"],
+            &["neolink", "-V"],
+            &["neolink", "help"],
+            &["neolink", "rtsp", "--help"],
+            &["neolink"],
+        ] {
+            assert_eq!(run(v, Some("rtsp")), neolink(v), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn test_neolink_itself_is_dropped() {
         assert_eq!(
-            args_with_mode(args(&["neolink", "--config", "c"])),
-            args(&["neolink", "--config", "c"])
+            run(
+                &["neolink", "/usr/local/bin/neolink", "mqtt", "--config", "c"],
+                None
+            ),
+            neolink(&["neolink", "mqtt", "--config", "c"])
         );
+        assert_eq!(
+            run(
+                &["neolink", "neolink", "rtsp", "--config=/etc/neolink.toml"],
+                Some("mqtt")
+            ),
+            neolink(&["neolink", "rtsp", "--config=/etc/neolink.toml"])
+        );
+        // Then NEO_LINK_MODE applies as usual
+        assert_eq!(
+            run(&["neolink", "neolink", "--config", "c"], Some("mqtt")),
+            neolink(&["neolink", "mqtt", "--config", "c"])
+        );
+    }
+
+    #[test]
+    fn test_other_commands_are_executed() {
+        assert_eq!(
+            run(
+                &["neolink", "sh", "-c", "echo hi; neolink rtsp"],
+                Some("rtsp")
+            ),
+            Entry::Exec(args(&["sh", "-c", "echo hi; neolink rtsp"]))
+        );
+        assert_eq!(
+            run(&["neolink", "bash", "-lc", "true"], None),
+            Entry::Exec(args(&["bash", "-lc", "true"]))
+        );
+        // Paths are always programs (a missing one fails at exec with a clear error)
+        assert_eq!(
+            run(&["neolink", "/bin/sh", "/custom/script.sh"], None),
+            Entry::Exec(args(&["/bin/sh", "/custom/script.sh"]))
+        );
+        assert_eq!(
+            run(&["neolink", "./run.sh"], None),
+            Entry::Exec(args(&["./run.sh"]))
+        );
+        // A file whose name merely contains "neolink"
+        assert_eq!(
+            run(
+                &["neolink", "/opt/neolink-wrapper.sh", "--config", "c"],
+                None
+            ),
+            Entry::Exec(args(&["/opt/neolink-wrapper.sh", "--config", "c"]))
+        );
+    }
+
+    #[test]
+    fn test_subcommands_win_over_programs() {
+        // coreutils has a `users` program; neolink has a `users` subcommand
+        assert_eq!(
+            run(
+                &["neolink", "users", "--config", "c", "cam", "list"],
+                Some("rtsp")
+            ),
+            neolink(&["neolink", "users", "--config", "c", "cam", "list"])
+        );
+        // Unknown words go to clap, which reports them
+        assert_eq!(
+            run(&["neolink", "rstp", "--config", "c"], Some("rtsp")),
+            neolink(&["neolink", "rstp", "--config", "c"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_state_dir_entries() {
+        let dir = std::env::temp_dir().join(format!("neolink-state-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("camera")).unwrap();
+        fs::create_dir_all(dir.join("cache/cam-main")).unwrap();
+        fs::create_dir_all(dir.join("unrelated/deep")).unwrap();
+        fs::write(dir.join("camera/cam.json"), b"{}").unwrap();
+        fs::write(dir.join("cache/cam-main/desc.json"), b"{}").unwrap();
+        fs::write(dir.join("learn-cam.txt"), b"").unwrap();
+        fs::write(dir.join("other.txt"), b"").unwrap();
+        std::os::unix::fs::symlink("/etc", dir.join("camera/link")).unwrap();
+        let mut got: Vec<_> = state_dir_entries(&dir)
+            .into_iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().display().to_string())
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "cache",
+                "cache/cam-main",
+                "cache/cam-main/desc.json",
+                "camera",
+                "camera/cam.json",
+                "camera/link",
+                "learn-cam.txt",
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
