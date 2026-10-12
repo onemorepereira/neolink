@@ -94,16 +94,39 @@ impl LearnGate {
     /// `SHARED_WAKE` of the one that took it belong to the same wake and are allowed too:
     /// clients open main and sub together, while the camera is still waking
     pub fn try_take(&self) -> bool {
-        const SHARED_WAKE: Duration = Duration::from_secs(30);
-        let now = std::time::SystemTime::now();
         let mut last = self.last.lock().unwrap();
+        // Read under the lock: takes are ordered, so a later take never holds an earlier
+        // time than the stored one (main and sub race here on every cold wake)
+        let now = std::time::SystemTime::now();
+        self.take_at(&mut last, now)
+    }
+
+    /// [`LearnGate::try_take`] at an injected time
+    #[cfg(test)]
+    fn try_take_at(&self, now: std::time::SystemTime) -> bool {
+        let mut last = self.last.lock().unwrap();
+        self.take_at(&mut last, now)
+    }
+
+    fn take_at(
+        &self,
+        last: &mut Option<std::time::SystemTime>,
+        now: std::time::SystemTime,
+    ) -> bool {
+        const SHARED_WAKE: Duration = Duration::from_secs(30);
         if let Some(t) = *last {
             match now.duration_since(t) {
                 Ok(d) if d < SHARED_WAKE => return true,
                 Ok(d) if d < self.interval => return false,
                 Ok(_) => {}
-                // A clock that went back counts as recent
-                Err(_) => return false,
+                // The wall clock is behind the stored take. A little (a step or slew
+                // back) is still the same wake. A lot means the clock was wrong when it
+                // was stored (e.g. before NTP on a device without an RTC): counting that
+                // as recent would block learning until the clock caught up, possibly for
+                // days, so the start is taken and the limit restarts from now. That costs
+                // at most one extra learning start per large clock step.
+                Err(e) if e.duration() < SHARED_WAKE => return true,
+                Err(_) => {}
             }
         }
         *last = Some(now);
@@ -2001,6 +2024,53 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(short.try_take());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review: main and sub take the gate at once. One reads the clock, the other reads it
+    /// later but locks first and stores the later time; the first then sees `now < last`,
+    /// which counted as "recent", and its DESCRIBE got 503
+    #[test]
+    fn test_learn_gate_clock_behind_last() {
+        let t = std::time::SystemTime::now();
+        let g = LearnGate::standard(None);
+        assert!(g.try_take_at(t));
+        assert!(
+            g.try_take_at(t - Duration::from_micros(1)),
+            "a take that read the clock just before the stored one is the same wake"
+        );
+        assert!(!g.try_take_at(t + Duration::from_secs(60)), "rate limited");
+        // A clock stepped back far (e.g. a wrong clock fixed by NTP) must not block
+        // learning until it catches up: the start is taken and the limit restarts there
+        let g = LearnGate::standard(None);
+        assert!(g.try_take_at(t));
+        let back = t - Duration::from_secs(3600 * 24);
+        assert!(g.try_take_at(back));
+        assert!(
+            !g.try_take_at(back + Duration::from_secs(60)),
+            "rate limited"
+        );
+    }
+
+    /// The same race through the real clock: threads released together all belong to one
+    /// wake
+    #[test]
+    fn test_learn_gate_concurrent_takes() {
+        for _ in 0..2000 {
+            let g = Arc::new(LearnGate::standard(None));
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let (g, b) = (g.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        b.wait();
+                        g.try_take()
+                    })
+                })
+                .collect();
+            for h in handles {
+                assert!(h.join().unwrap(), "a concurrent take was refused");
+            }
+        }
     }
 
     /// A spinning Hub never lets paused time advance, so these tests would hang: fail
