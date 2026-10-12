@@ -14,7 +14,7 @@ use super::clock::{AudioTime, MediaClock};
 use super::desc::{DescCache, DescEvent, DescLearner, IrapWritePolicy, StreamDesc};
 use super::pacer::{Paced, Pacer};
 use super::wire::{eos_nal, Bridge, BridgeOut, SessionGuard, SourceState, Track, WireClock};
-use crate::codec::aac::{adts_access_units, silent_au, AdtsHeader};
+use crate::codec::aac::{adts_access_units, silent_au};
 use crate::codec::annexb::{is_irap, param_kind, split_nals, NalFilter, VideoCodec};
 use crate::rtp::packetize::{self, RtpChunk};
 use crate::source::{SourceUnit, StartMode, StartResult, StreamSource};
@@ -94,16 +94,39 @@ impl LearnGate {
     /// `SHARED_WAKE` of the one that took it belong to the same wake and are allowed too:
     /// clients open main and sub together, while the camera is still waking
     pub fn try_take(&self) -> bool {
-        const SHARED_WAKE: Duration = Duration::from_secs(30);
-        let now = std::time::SystemTime::now();
         let mut last = self.last.lock().unwrap();
+        // Read under the lock: takes are ordered, so a later take never holds an earlier
+        // time than the stored one (main and sub race here on every cold wake)
+        let now = std::time::SystemTime::now();
+        self.take_at(&mut last, now)
+    }
+
+    /// [`LearnGate::try_take`] at an injected time
+    #[cfg(test)]
+    fn try_take_at(&self, now: std::time::SystemTime) -> bool {
+        let mut last = self.last.lock().unwrap();
+        self.take_at(&mut last, now)
+    }
+
+    fn take_at(
+        &self,
+        last: &mut Option<std::time::SystemTime>,
+        now: std::time::SystemTime,
+    ) -> bool {
+        const SHARED_WAKE: Duration = Duration::from_secs(30);
         if let Some(t) = *last {
             match now.duration_since(t) {
                 Ok(d) if d < SHARED_WAKE => return true,
                 Ok(d) if d < self.interval => return false,
                 Ok(_) => {}
-                // A clock that went back counts as recent
-                Err(_) => return false,
+                // The wall clock is behind the stored take. A little (a step or slew
+                // back) is still the same wake. A lot means the clock was wrong when it
+                // was stored (e.g. before NTP on a device without an RTC): counting that
+                // as recent would block learning until the clock caught up, possibly for
+                // days, so the start is taken and the limit restarts from now. That costs
+                // at most one extra learning start per large clock step.
+                Err(e) if e.duration() < SHARED_WAKE => return true,
+                Err(_) => {}
             }
         }
         *last = Some(now);
@@ -957,8 +980,32 @@ impl Hub {
                 if restarted || t.discontinuity {
                     self.pacer.restart();
                 }
+                let was_held = self.learner.video_held();
                 if let Some(ev) = self.learner.video(codec, &nals, irap, t.media_us, now) {
                     self.desc_event(ev);
+                }
+                if let Some(why) = self.learner.take_hold_end() {
+                    log::info!(
+                        "{}: new parameter sets not confirmed ({why:?}): a glitch, video resumes",
+                        self.cfg.name
+                    );
+                }
+                if self.learner.video_held() {
+                    if !was_held {
+                        log::info!(
+                            "{}: new parameter sets on an IRAP: video held until the next \
+                             IRAP confirms them",
+                            self.cfg.name
+                        );
+                    }
+                    // Sessions of the current desc must not decode this GOP with the old
+                    // parameter sets
+                    return;
+                }
+                if was_held && !irap {
+                    // The hold expired mid-GOP: resume at the next IRAP
+                    self.need_irap = true;
+                    return;
                 }
                 let nals = self.apply_parameter_sets(codec, irap, nals);
                 if nals.is_empty() {
@@ -979,19 +1026,28 @@ impl Hub {
                 if !self.cfg.audio {
                     return;
                 }
-                let Ok(header) = AdtsHeader::parse(&adts) else {
-                    return;
-                };
-                self.audio_channels = header.channel_config.max(1);
-                self.clock.set_sample_rate(header.sample_rate());
-                self.bridge.set_au_us(self.clock.au_us());
-                if let Some(ev) = self.learner.audio(&header, now) {
-                    self.desc_event(ev);
-                }
-                let Ok((_, aus)) = adts_access_units(&adts) else {
+                // Validate the whole frame before anything learns from its header: a
+                // corrupt one that merely syncs must not change the desc
+                let Ok((header, aus)) = adts_access_units(&adts) else {
                     log::debug!("{}: unusable ADTS frame dropped", self.cfg.name);
                     return;
                 };
+                if let Some(ev) = self.learner.audio(&header, now) {
+                    self.desc_event(ev);
+                }
+                // Only the adopted config drives the clock; other frames are a glitch or
+                // a change not confirmed yet, and clients would decode them wrongly
+                let asc = header.audio_specific_config();
+                if self.learner.audio_config().map(|a| &a.asc[..]) != Some(&asc[..]) {
+                    log::debug!(
+                        "{}: ADTS frame with an unconfirmed config dropped",
+                        self.cfg.name
+                    );
+                    return;
+                }
+                self.audio_channels = header.channel_config.max(1);
+                self.clock.set_sample_rate(header.sample_rate());
+                self.bridge.set_au_us(self.clock.au_us());
                 for au in aus {
                     if let AudioTime::Send { media_us, .. } = self.clock.audio(now, self.audio_sent)
                     {
@@ -1970,6 +2026,53 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Review: main and sub take the gate at once. One reads the clock, the other reads it
+    /// later but locks first and stores the later time; the first then sees `now < last`,
+    /// which counted as "recent", and its DESCRIBE got 503
+    #[test]
+    fn test_learn_gate_clock_behind_last() {
+        let t = std::time::SystemTime::now();
+        let g = LearnGate::standard(None);
+        assert!(g.try_take_at(t));
+        assert!(
+            g.try_take_at(t - Duration::from_micros(1)),
+            "a take that read the clock just before the stored one is the same wake"
+        );
+        assert!(!g.try_take_at(t + Duration::from_secs(60)), "rate limited");
+        // A clock stepped back far (e.g. a wrong clock fixed by NTP) must not block
+        // learning until it catches up: the start is taken and the limit restarts there
+        let g = LearnGate::standard(None);
+        assert!(g.try_take_at(t));
+        let back = t - Duration::from_secs(3600 * 24);
+        assert!(g.try_take_at(back));
+        assert!(
+            !g.try_take_at(back + Duration::from_secs(60)),
+            "rate limited"
+        );
+    }
+
+    /// The same race through the real clock: threads released together all belong to one
+    /// wake
+    #[test]
+    fn test_learn_gate_concurrent_takes() {
+        for _ in 0..2000 {
+            let g = Arc::new(LearnGate::standard(None));
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let (g, b) = (g.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        b.wait();
+                        g.try_take()
+                    })
+                })
+                .collect();
+            for h in handles {
+                assert!(h.join().unwrap(), "a concurrent take was refused");
+            }
+        }
+    }
+
     /// A spinning Hub never lets paused time advance, so these tests would hang: fail
     /// loudly instead after a real-time limit
     fn spin_watchdog(name: &'static str) -> Arc<std::sync::atomic::AtomicBool> {
@@ -2061,5 +2164,370 @@ mod tests {
             let st = h.stats().await.unwrap();
             assert_eq!(st.guard_engaged, 0, "{latency}: {st:?}");
         }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // One bad frame must not change the stream: corrupt or glitching ADTS headers and
+    // parameter sets (review: a single corrupt-but-syncing frame disconnected everyone)
+
+    /// When the glitches go in: well after learning, with a session playing
+    const GLITCH_AT_US: u64 = 8_000_000;
+
+    struct GlitchRun {
+        learned: StreamDesc,
+        frames: Vec<Arc<Frame>>,
+        closed: bool,
+        after: StreamDesc,
+        persisted: Option<StreamDesc>,
+        stats: HubStats,
+    }
+
+    /// Learn, play one session for `secs`, then report what the session and the cache saw
+    async fn glitch_run(units: Vec<crate::source::FixtureUnit>, secs: u64) -> GlitchRun {
+        let dir = std::env::temp_dir().join(format!(
+            "neolink-glitch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = DescCache::new(&dir, "argus", "main");
+        let source = Arc::new(FixtureSource::new(units, 1.0, Some(false)));
+        let mut cfg = HubConfig::new("glitch");
+        cfg.battery = false;
+        cfg.cache = Some(cache.clone());
+        let h = spawn(cfg, source);
+        let learned = h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        let frames = drain(&mut sub, secs).await;
+        let closed = sub.closed.is_cancelled();
+        let after = h.describe().await.unwrap();
+        // Cache writes run on the blocking pool, outside virtual time
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            tokio::task::yield_now().await;
+        }
+        let persisted = cache.load_desc();
+        let stats = h.stats().await.unwrap();
+        h.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        GlitchRun {
+            learned,
+            frames,
+            closed,
+            after,
+            persisted,
+            stats,
+        }
+    }
+
+    impl GlitchRun {
+        /// Nothing changed: the session stayed, every frame is gen 0, the desc (live and
+        /// persisted) is the learned one, and audio kept its 16 kHz cadence
+        fn assert_unchanged(&self) {
+            assert!(!self.closed, "the session was closed");
+            assert_eq!(self.learned.gen, 0);
+            assert_eq!(self.after, self.learned, "the live desc changed");
+            assert_eq!(
+                self.persisted.as_ref(),
+                Some(&self.learned),
+                "the persisted desc changed"
+            );
+            assert!(
+                self.frames.iter().all(|f| f.gen == 0),
+                "a frame of a new gen"
+            );
+            let audio: Vec<u64> = self
+                .frames
+                .iter()
+                .filter(|f| f.track == Track::Audio)
+                .map(|f| f.wire_us)
+                .collect();
+            let video = self
+                .frames
+                .iter()
+                .filter(|f| f.track == Track::Video)
+                .count();
+            // Both tracks run on past the glitch, which is mid-drain
+            assert!(audio.len() > 150, "{} audio frames", audio.len());
+            assert!(video > 150, "{video} video frames");
+            // 16 kHz: one AU per 64 ms. A 48 kHz clock (21.3 ms) or a re-anchor shows here
+            let mut deltas: Vec<u64> = audio.windows(2).map(|w| w[1] - w[0]).collect();
+            deltas.sort_unstable();
+            let median = deltas[deltas.len() / 2];
+            assert!((63_000..=65_000).contains(&median), "median {median} µs");
+            let short = deltas.iter().filter(|&&d| d < 40_000).count();
+            assert!(short <= 1, "{short} audio steps under 40 ms: {deltas:?}");
+        }
+    }
+
+    /// `units` with `extra` arriving at `at_us` (after the units already there)
+    fn insert_at(
+        mut units: Vec<crate::source::FixtureUnit>,
+        at_us: u64,
+        extra: Vec<SourceUnit>,
+    ) -> Vec<crate::source::FixtureUnit> {
+        let pos = units.iter().position(|u| u.at_us > at_us).unwrap();
+        for (k, unit) in extra.into_iter().enumerate() {
+            units.insert(pos + k, crate::source::FixtureUnit { at_us, unit });
+        }
+        units
+    }
+
+    fn first_adts_after(units: &[crate::source::FixtureUnit], at_us: u64) -> Vec<u8> {
+        units
+            .iter()
+            .find_map(|u| match &u.unit {
+                SourceUnit::Aac { adts } if u.at_us >= at_us => Some(adts.to_vec()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// The ADTS frame with another sampling frequency index (3: 48 kHz)
+    fn with_rate_index(adts: &[u8], index: u8) -> Vec<u8> {
+        let mut a = adts.to_vec();
+        a[2] = (a[2] & !0x3c) | (index << 2);
+        a
+    }
+
+    /// The reported payload: syncs, 48 kHz, frame_length 8 > its 7 bytes
+    #[tokio::test(start_paused = true)]
+    async fn test_corrupt_adts_header_changes_nothing() {
+        let units = fixture("plain_h264.bcm");
+        let adts = Bytes::from_static(&[0xff, 0xf1, 0x4c, 0x80, 0x01, 0x00, 0xfc]);
+        let units = insert_at(units, GLITCH_AT_US, vec![SourceUnit::Aac { adts }]);
+        glitch_run(units, 14).await.assert_unchanged();
+    }
+
+    /// A complete, valid ADTS frame with another config, once: a glitch, not a change
+    #[tokio::test(start_paused = true)]
+    async fn test_single_adts_config_glitch_changes_nothing() {
+        let units = fixture("plain_h264.bcm");
+        let adts = Bytes::from(with_rate_index(&first_adts_after(&units, GLITCH_AT_US), 3));
+        let units = insert_at(units, GLITCH_AT_US, vec![SourceUnit::Aac { adts }]);
+        glitch_run(units, 14).await.assert_unchanged();
+    }
+
+    /// The camera's audio really changes (16 → 48 kHz) and stays changed: one new gen
+    #[tokio::test(start_paused = true)]
+    async fn test_audio_config_change_is_adopted() {
+        let units: Vec<_> = fixture("plain_h264.bcm")
+            .into_iter()
+            .map(|mut u| {
+                if let SourceUnit::Aac { adts } = &u.unit {
+                    if u.at_us >= GLITCH_AT_US {
+                        u.unit = SourceUnit::Aac {
+                            adts: Bytes::from(with_rate_index(adts, 3)),
+                        };
+                    }
+                }
+                u
+            })
+            .collect();
+        let r = glitch_run(units, 14).await;
+        assert!(r.closed, "sessions on the old config are closed");
+        assert_eq!(r.after.gen, 1);
+        assert_eq!(r.after.audio.as_ref().unwrap().sample_rate, 48000);
+        assert_eq!(r.after.video, r.learned.video);
+        assert_eq!(r.persisted.as_ref(), Some(&r.after));
+    }
+
+    /// The first IRAP at or after `at_us` with its SPS changed by `f`
+    fn mutate_sps(
+        units: Vec<crate::source::FixtureUnit>,
+        at_us: u64,
+        f: impl Fn(&mut Vec<u8>),
+    ) -> Vec<crate::source::FixtureUnit> {
+        let mut done = false;
+        units
+            .into_iter()
+            .map(|mut u| {
+                if let SourceUnit::Video {
+                    codec,
+                    irap: true,
+                    cam_us,
+                    annexb,
+                } = &u.unit
+                {
+                    if !done && u.at_us >= at_us {
+                        done = true;
+                        let mut out = vec![];
+                        for nal in split_nals(annexb) {
+                            let mut nal = nal.to_vec();
+                            if param_kind(*codec, &nal)
+                                == Some(crate::codec::annexb::ParamKind::Sps)
+                            {
+                                f(&mut nal);
+                            }
+                            out.extend_from_slice(&[0, 0, 0, 1]);
+                            out.extend_from_slice(&nal);
+                        }
+                        u.unit = SourceUnit::Video {
+                            codec: *codec,
+                            irap: true,
+                            cam_us: *cam_us,
+                            annexb: Bytes::from(out),
+                        };
+                    }
+                }
+                u
+            })
+            .collect()
+    }
+
+    /// An SPS with the H.264 forbidden_zero_bit set is corrupt: it is not a new stream
+    #[tokio::test(start_paused = true)]
+    async fn test_forbidden_bit_sps_changes_nothing() {
+        let units = mutate_sps(fixture("plain_h264.bcm"), GLITCH_AT_US, |n| n[0] |= 0x80);
+        let r = glitch_run(units, 14).await;
+        r.assert_unchanged();
+        // The whitelist drops the corrupt SPS itself, so the GOP is not held back either
+        let video: Vec<u64> = r
+            .frames
+            .iter()
+            .filter(|f| f.track == Track::Video)
+            .map(|f| f.wire_us)
+            .collect();
+        // From the first live frame on (the first is the cached IRAP, up to a GOP earlier)
+        let max_gap = video[1..].windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(max_gap < 200_000, "video stalled for {max_gap} µs");
+    }
+
+    /// An SPS that parses (same size) but differs (level_idc), in one IRAP only: a glitch
+    #[tokio::test(start_paused = true)]
+    async fn test_single_sps_glitch_changes_nothing() {
+        let units = mutate_sps(fixture("plain_h264.bcm"), GLITCH_AT_US, |n| n[3] ^= 0x01);
+        glitch_run(units, 14).await.assert_unchanged();
+    }
+
+    /// The same for H.265, with the glitch in the SPS's general_level_idc
+    #[tokio::test(start_paused = true)]
+    async fn test_single_sps_glitch_changes_nothing_h265() {
+        // 42 01 | 01 | 01 60 00 00 03 00 90 00 00 03 00 00 03 00 | 3f: level 2.1 (escaped)
+        let units = mutate_sps(fixture("plain_h265.bcm"), GLITCH_AT_US, |n| {
+            assert_eq!(n[17], 0x3f, "general_level_idc");
+            n[17] = 0x5d; // level 3.1
+        });
+        glitch_run(units, 14).await.assert_unchanged();
+    }
+
+    /// A real resolution change still closes the session and is adopted (A18)
+    #[tokio::test(start_paused = true)]
+    async fn test_resolution_change_is_adopted() {
+        let r = glitch_run(fixture("reschange_h264.bcm"), 18).await;
+        assert!(r.closed, "sessions on the old resolution are closed");
+        assert_eq!((r.learned.video.width, r.learned.video.height), (640, 360));
+        assert_eq!((r.after.video.width, r.after.video.height), (896, 512));
+        assert_eq!(r.after.gen, 1);
+        assert_eq!(r.persisted.as_ref(), Some(&r.after));
+    }
+
+    impl GlitchRun {
+        /// The longest wire gap between live video frames (the first frame, the cached
+        /// IRAP, can be up to a GOP before the first live one)
+        fn max_live_video_gap(&self) -> u64 {
+            let video: Vec<u64> = self
+                .frames
+                .iter()
+                .filter(|f| f.track == Track::Video)
+                .map(|f| f.wire_us)
+                .collect();
+            video[1..].windows(2).map(|w| w[1] - w[0]).max().unwrap()
+        }
+    }
+
+    /// The IRAPs after `after_us`: dropped (`None`), or with their NALs rewritten
+    fn map_iraps_after(
+        units: Vec<crate::source::FixtureUnit>,
+        after_us: u64,
+        f: impl Fn(u64, Vec<Bytes>) -> Option<Vec<Bytes>>,
+    ) -> Vec<crate::source::FixtureUnit> {
+        units
+            .into_iter()
+            .filter_map(|mut u| {
+                if let SourceUnit::Video {
+                    codec,
+                    irap: true,
+                    cam_us,
+                    annexb,
+                } = &u.unit
+                {
+                    if u.at_us > after_us {
+                        let nals = f(u.at_us, split_nals(annexb))?;
+                        let mut out = vec![];
+                        for nal in nals {
+                            out.extend_from_slice(&[0, 0, 0, 1]);
+                            out.extend_from_slice(&nal);
+                        }
+                        u.unit = SourceUnit::Video {
+                            codec: *codec,
+                            irap: true,
+                            cam_us: *cam_us,
+                            annexb: Bytes::from(out),
+                        };
+                    }
+                }
+                Some(u)
+            })
+            .collect()
+    }
+
+    /// A glitch IRAP, then IRAPs without in-band parameter sets: nothing can confirm the
+    /// glitch, so the next IRAP ends the hold and video resumes there
+    #[tokio::test(start_paused = true)]
+    async fn test_video_hold_ends_at_an_irap_without_params() {
+        let units = mutate_sps(fixture("plain_h264.bcm"), GLITCH_AT_US, |n| n[3] ^= 0x01);
+        // The glitch IRAP is the first at or after GLITCH_AT_US; strip the ones after it
+        let units = map_iraps_after(units, GLITCH_AT_US + 100_000, |_, nals| {
+            Some(
+                nals.into_iter()
+                    .filter(|n| param_kind(VideoCodec::H264, n).is_none())
+                    .collect(),
+            )
+        });
+        let r = glitch_run(units, 14).await;
+        r.assert_unchanged();
+        // One GOP (2 s) held, then live again
+        let gap = r.max_live_video_gap();
+        assert!(gap <= 2_200_000, "video stalled for {gap} µs");
+    }
+
+    /// The hold outlasts the bridge threshold (two IRAPs lost after the glitch IRAP): the
+    /// bridge covers it with the current stream's cached IRAP, the session stays, and
+    /// live video resumes at the next IRAP
+    #[tokio::test(start_paused = true)]
+    async fn test_video_hold_is_bridged() {
+        let units = mutate_sps(fixture("plain_h264.bcm"), GLITCH_AT_US, |n| n[3] ^= 0x01);
+        let lost = GLITCH_AT_US + 100_000..GLITCH_AT_US + 4_100_000;
+        let units = map_iraps_after(units, GLITCH_AT_US + 100_000, |at, nals| {
+            (!lost.contains(&at)).then_some(nals)
+        });
+        let r = glitch_run(units, 16).await;
+        assert!(!r.closed, "the session was closed");
+        assert_eq!(r.after, r.learned, "the live desc changed");
+        assert_eq!(r.persisted.as_ref(), Some(&r.learned));
+        assert!(r.frames.iter().all(|f| f.gen == 0));
+        assert!(r.stats.bridged_us > 0, "{:?}", r.stats);
+        assert_eq!(r.stats.guard_engaged, 0, "{:?}", r.stats);
+        // Bridged frames keep the gap under the bridge's 5 s interval, and live video (a
+        // GOP of P-frames) follows the bridge
+        let gap = r.max_live_video_gap();
+        assert!(gap < 5_000_000, "video stalled for {gap} µs");
+        let video: Vec<&Arc<Frame>> = r
+            .frames
+            .iter()
+            .filter(|f| f.track == Track::Video)
+            .collect();
+        let longest = (1..video.len())
+            .max_by_key(|&i| video[i].wire_us - video[i - 1].wire_us)
+            .unwrap();
+        let live_after = video[longest..].iter().filter(|f| !f.irap).count();
+        assert!(
+            live_after > 25,
+            "live P-frames after the bridge: {live_after}"
+        );
     }
 }

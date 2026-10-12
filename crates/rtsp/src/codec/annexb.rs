@@ -55,9 +55,21 @@ pub fn nal_type(codec: VideoCodec, nal: &[u8]) -> Option<(u8, u8)> {
     }
 }
 
+/// Whether the NAL header is one a conforming encoder can produce: `forbidden_zero_bit`
+/// clear, and for H.265 `nuh_temporal_id_plus1` non-zero. Anything else is corruption.
+fn header_valid(codec: VideoCodec, nal: &[u8]) -> bool {
+    match codec {
+        VideoCodec::H264 => nal.first().is_some_and(|b| b & 0x80 == 0),
+        VideoCodec::H265 => nal.len() >= 2 && nal[0] & 0x80 == 0 && nal[1] & 0x07 != 0,
+    }
+}
+
 /// Whether a NAL may be sent (SPEC R2): H.264 types 1–13; H.265 types 0–9, 16–21 and
-/// 32–40 with `nuh_layer_id = 0`
+/// 32–40 with `nuh_layer_id = 0`; never a NAL with a corrupt header ([`header_valid`])
 pub fn allowed(codec: VideoCodec, nal: &[u8]) -> bool {
+    if !header_valid(codec, nal) {
+        return false;
+    }
     match (codec, nal_type(codec, nal)) {
         (VideoCodec::H264, Some((t, _))) => (1..=13).contains(&t),
         (VideoCodec::H265, Some((t, 0))) => {
@@ -149,6 +161,21 @@ mod tests {
         assert!(!allowed(VideoCodec::H265, &[0x26, 0x09])); // layer 1
         assert!(allowed(VideoCodec::H265, &[0x4e, 0x01])); // 39: prefix SEI
         assert!(!allowed(VideoCodec::H265, &[0x52, 0x01])); // 41: reserved
+    }
+
+    #[test]
+    fn test_whitelist_rejects_corrupt_headers() {
+        // H.264 forbidden_zero_bit
+        assert!(allowed(VideoCodec::H264, &[0x67, 0x64]));
+        assert!(!allowed(VideoCodec::H264, &[0xe7, 0x64])); // SPS
+        assert!(!allowed(VideoCodec::H264, &[0xe5, 0x88])); // IDR
+                                                            // H.265 forbidden_zero_bit (F)
+        assert!(!allowed(VideoCodec::H265, &[0xc2, 0x01])); // SPS
+        assert!(!allowed(VideoCodec::H265, &[0xa6, 0x01])); // IDR_W_RADL
+                                                            // H.265 nuh_temporal_id_plus1 = 0 is forbidden
+        assert!(!allowed(VideoCodec::H265, &[0x42, 0x00])); // SPS
+        assert!(!allowed(VideoCodec::H265, &[0x26, 0x00])); // IDR_W_RADL
+        assert!(allowed(VideoCodec::H265, &[0x02, 0x02])); // TRAIL_R, temporal id 1
     }
 
     #[test]
