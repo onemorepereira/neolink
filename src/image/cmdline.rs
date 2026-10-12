@@ -15,4 +15,8 @@ pub struct Opt {
     /// Using the snap feature, is preffered unless your camera does not support it
     #[structopt(short, long)]
     pub use_stream: bool,
+    /// Wake the camera for a new snapshot. Without it the snapshot taken during the
+    /// camera's last wake is written, if there is one. `--use-stream` always wakes it
+    #[arg(long)]
+    pub fresh: bool,
 }
