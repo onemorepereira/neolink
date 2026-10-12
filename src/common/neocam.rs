@@ -20,7 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    LockGuard, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance,
+    LedgerStatus, LockGuard, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance,
     Permit, StateFile, UseCounter, WakeLedger,
 };
 #[cfg(feature = "pushnoti")]
@@ -41,6 +41,7 @@ pub(crate) enum NeoCamCommand {
     #[cfg(feature = "pushnoti")]
     PushNoti(OneshotSender<WatchReceiver<Option<PushNoti>>>),
     GetUid(OneshotSender<String>),
+    Wakes(OneshotSender<WatchReceiver<LedgerStatus>>),
 }
 /// The underlying camera binding
 pub(crate) struct NeoCam {
@@ -66,6 +67,7 @@ impl NeoCam {
         let (watch_config_tx, watch_config_rx) = watch(config.clone());
         let (camera_watch_tx, camera_watch_rx) = watch(Weak::new());
         let (md_request_tx, md_request_rx) = mpsc(100);
+        let (ledger_status_tx, ledger_status_rx) = watch(LedgerStatus::default());
         // A sleeping camera is not contacted at boot (SPEC P1)
         let sleeps = config.sleeps();
         if config.idle_disconnect.is_none() && config.battery.is_none() {
@@ -177,6 +179,9 @@ impl NeoCam {
                                     }
                                 ).await?;
                             },
+                            NeoCamCommand::Wakes(sender) => {
+                                let _ = sender.send(ledger_status_rx.clone());
+                            }
                             NeoCamCommand::GetUid(sender) => {
                                 let mut uid_rx = uid_rx.clone();
                                 tokio::task::spawn(async move {
@@ -372,6 +377,7 @@ impl NeoCam {
         let connect_cancel = me.cancel.clone();
         let ledger_name = config.name.clone();
         let ledger = me.ledger.clone();
+        let ledger_tx = ledger_status_tx;
         me.set.spawn(async move {
             tokio::select!{
                 _ = connect_cancel.cancelled() => {
@@ -383,7 +389,8 @@ impl NeoCam {
                     loop {
                         if !config_rx.borrow_and_update().sleeps() {
                             connect_instance.connect().await?;
-                            ledger.lock().unwrap().wake("always-on".to_string());
+                            let _ = ledger.lock().unwrap().wake("always-on".to_string());
+                            ledger_tx.send_replace(ledger.lock().unwrap().status());
                             config_rx.wait_for(|config| config.sleeps()).await.map(|_| ())?;
                             // Switched to sleeping while connected: fall through to the
                             // release below (grace, then disconnect) instead of waiting
@@ -400,7 +407,11 @@ impl NeoCam {
                                 r.dedup();
                                 r.join(",")
                             };
-                            ledger.lock().unwrap().wake(reason);
+                            let warning = ledger.lock().unwrap().wake(reason);
+                            if let Some(warning) = warning {
+                                log::warn!("{ledger_name}: {warning}");
+                            }
+                            ledger_tx.send_replace(ledger.lock().unwrap().status());
                             connect_instance.connect().await?;
                         }
                         loop {
@@ -416,6 +427,7 @@ impl NeoCam {
                         if let Some(summary) = summary {
                             log::info!("{ledger_name}: {summary}");
                         }
+                        ledger_tx.send_replace(ledger.lock().unwrap().status());
                     }
                 } => {
                     v
@@ -620,7 +632,7 @@ async fn wake_reads(
 
 /// One battery read into the state file; false if the camera didn't answer
 async fn read_battery(instance: &NeoInstance, state: &StateFile, name: &str) -> bool {
-    use super::state::{unix_now, BatteryReading};
+    use super::state::BatteryReading;
     // Bounded, so a wake that ends meanwhile doesn't leave this waiting for the next one
     let result = tokio::time::timeout(
         Duration::from_secs(15),
@@ -644,15 +656,7 @@ async fn read_battery(instance: &NeoInstance, state: &StateFile, name: &str) -> 
     );
     let saved = state.update(|s| {
         s.battery = Some(true);
-        s.last_battery = Some(BatteryReading {
-            percent: b.battery_percent,
-            voltage: b.voltage,
-            current: b.current,
-            temperature: b.temperature,
-            charge_status: b.charge_status.clone(),
-            adapter_status: b.adapter_status.clone(),
-            at: unix_now(),
-        });
+        s.last_battery = Some(BatteryReading::now(&b));
     });
     if let Err(e) = saved {
         log::warn!("{name}: could not save the battery reading: {e:?}");

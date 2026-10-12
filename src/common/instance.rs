@@ -283,6 +283,15 @@ impl NeoInstance {
         Ok(instance_rx.await?)
     }
 
+    /// The wake ledger's state, updated on every wake and sleep (SPEC P6)
+    pub(crate) async fn wakes(&self) -> Result<WatchReceiver<super::LedgerStatus>> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::Wakes(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
     pub(crate) async fn config(&self) -> Result<WatchReceiver<CameraConfig>> {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control

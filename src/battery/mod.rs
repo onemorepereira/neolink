@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 
 mod cmdline;
 
-use crate::common::{unix_now, NeoReactor, StateFile};
+use crate::common::{NeoReactor, StateFile};
 use neolink_core::bc::xml::BatteryInfo;
 
 pub(crate) use cmdline::Opt;
@@ -29,23 +29,12 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         let config = camera.config().await?.borrow().clone();
         // The last reading from a wake (SPEC P7, P15); reading it doesn't wake the camera
         if let Some(b) = StateFile::for_camera(&config).load().last_battery {
-            let age = unix_now().saturating_sub(b.at);
             eprintln!(
                 "{}: reading from {} s ago (use --fresh to wake the camera)",
-                opt.camera, age
+                opt.camera,
+                b.age()
             );
-            let state = BatteryInfo {
-                channel_id: config.channel_id,
-                charge_status: b.charge_status,
-                adapter_status: b.adapter_status,
-                voltage: b.voltage,
-                current: b.current,
-                temperature: b.temperature,
-                battery_percent: b.percent,
-                low_power: 0,
-                battery_version: 0,
-            };
-            print_xml(&state);
+            print_xml(&b.to_info(config.channel_id));
             return Ok(());
         }
         eprintln!("{}: no saved reading yet, waking the camera", opt.camera);

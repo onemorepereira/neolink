@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::CameraConfig;
+use neolink_core::bc::xml::BatteryInfo;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BatteryReading {
@@ -25,6 +26,41 @@ pub(crate) struct BatteryReading {
     pub(crate) adapter_status: String,
     /// Unix seconds
     pub(crate) at: u64,
+}
+
+impl BatteryReading {
+    /// A reading taken now
+    pub(crate) fn now(b: &BatteryInfo) -> Self {
+        Self {
+            percent: b.battery_percent,
+            voltage: b.voltage,
+            current: b.current,
+            temperature: b.temperature,
+            charge_status: b.charge_status.clone(),
+            adapter_status: b.adapter_status.clone(),
+            at: unix_now(),
+        }
+    }
+
+    /// As the camera's reply, for the CLI and MQTT output formats
+    pub(crate) fn to_info(&self, channel_id: u8) -> BatteryInfo {
+        BatteryInfo {
+            channel_id,
+            charge_status: self.charge_status.clone(),
+            adapter_status: self.adapter_status.clone(),
+            voltage: self.voltage,
+            current: self.current,
+            temperature: self.temperature,
+            battery_percent: self.percent,
+            low_power: 0,
+            battery_version: 0,
+        }
+    }
+
+    /// Seconds since it was taken
+    pub(crate) fn age(&self) -> u64 {
+        unix_now().saturating_sub(self.at)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
