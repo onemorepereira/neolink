@@ -437,6 +437,43 @@ impl CameraConfig {
             None => self.battery != Some(false),
         }
     }
+
+    /// The power settings, those that decide whether and for how long the camera is woken,
+    /// that differ from `file`: this camera's entry in the config file, or `None` for a
+    /// camera the file doesn't have, which must keep the defaults. Turning the camera off
+    /// (`enabled = false`) only means fewer wakes, so it is not a change here (SPEC P14).
+    pub(crate) fn power_changes(&self, file: Option<&CameraConfig>) -> Vec<&'static str> {
+        let checks = [
+            ("battery", self.battery != file.and_then(|f| f.battery)),
+            (
+                "idle_disconnect",
+                self.idle_disconnect != file.and_then(|f| f.idle_disconnect),
+            ),
+            (
+                "idle_grace_s",
+                self.idle_grace_s != file.map_or(default_idle_grace_s(), |f| f.idle_grace_s),
+            ),
+            (
+                "motion_hold_max_s",
+                self.motion_hold_max_s
+                    != file.map_or(default_motion_hold_max_s(), |f| f.motion_hold_max_s),
+            ),
+            (
+                "snapshot_fresh",
+                self.snapshot_fresh != file.map_or(default_false(), |f| f.snapshot_fresh),
+            ),
+            (
+                "pause.on_motion",
+                self.pause.on_motion != file.map_or(default_on_motion(), |f| f.pause.on_motion),
+            ),
+            ("enabled", self.enabled && file.is_some_and(|f| !f.enabled)),
+        ];
+        checks
+            .iter()
+            .filter(|(_, changed)| *changed)
+            .map(|(key, _)| *key)
+            .collect()
+    }
 }
 
 const fn default_idle_grace_s() -> u64 {

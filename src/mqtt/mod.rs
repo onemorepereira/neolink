@@ -209,6 +209,9 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
 
     // This threads checks for config changes on the mqtt
     let thread_config = config.clone();
+    // Only the config file sets power settings: MQTT is the only other writer, and this
+    // copy is taken before it can write (SPEC P14)
+    let file_config = config.borrow().clone();
     let mut thread_instance = mqtt.subscribe("").await?;
     let thread_reactor = reactor.clone();
     let thread_cancel = global_cancel.clone();
@@ -231,7 +234,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                             continue;
                         }
                         let current = thread_config.borrow().clone();
-                        let config = match prepare_config_write(&msg.message, &current) {
+                        let config = match prepare_config_write(&msg.message, &file_config, &current) {
                             ConfigWrite::Unchanged => continue,
                             ConfigWrite::Refused(why) => {
                                 thread_instance.send_message("config/status", &why, false).await?;
@@ -1417,4 +1420,3 @@ async fn wait_for_state(updated: impl Fn() -> bool) {
         sleep(Duration::from_millis(500)).await;
     }
 }
-

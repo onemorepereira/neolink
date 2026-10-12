@@ -28,9 +28,9 @@ fn redacted_parse_error(text: &str, e: &toml::de::Error) -> String {
     }
 }
 
-/// Turn the text written to `neolink/config` into what to do with it. `current` is the
-/// running config.
-pub(super) fn prepare_config_write(text: &str, current: &Config) -> ConfigWrite {
+/// Turn the text written to `neolink/config` into what to do with it. `file` is the
+/// config neolink started with, `current` the running config.
+pub(super) fn prepare_config_write(text: &str, file: &Config, current: &Config) -> ConfigWrite {
     crate::config::warn_unknown_keys(text, "MQTT neolink/config");
     let mut config = match toml::from_str::<Config>(text) {
         Ok(c) => c,
@@ -42,8 +42,7 @@ pub(super) fn prepare_config_write(text: &str, current: &Config) -> ConfigWrite 
     // Fill in skipped passwords, but only for the same broker and the same camera address:
     // a write that points elsewhere must not receive the current secrets
     if let (Some(mqtt), Some(curr_mqtt)) = (config.mqtt.as_mut(), current.mqtt.as_ref()) {
-        let same_broker =
-            mqtt.broker_addr == curr_mqtt.broker_addr && mqtt.port == curr_mqtt.port;
+        let same_broker = mqtt.broker_addr == curr_mqtt.broker_addr && mqtt.port == curr_mqtt.port;
         if mqtt.credentials.is_none() && same_broker {
             mqtt.credentials = curr_mqtt.credentials.clone();
         }
@@ -77,6 +76,30 @@ pub(super) fn prepare_config_write(text: &str, current: &Config) -> ConfigWrite 
         .with_context(|| "Failed to validate the MQTT \"config\" config file")
     {
         return ConfigWrite::Refused(format!("{:?}", e));
+    }
+
+    // A battery camera must not be turned always-on (or kept awake longer, or woken by
+    // more) by whoever can publish to the broker: power settings come from the config file
+    // only, and a write that changes any of them is refused whole (SPEC P14)
+    let mut refused = vec![];
+    for cam in config.cameras.iter() {
+        let keys = cam.power_changes(file.cameras.iter().find(|f| f.name == cam.name));
+        if !keys.is_empty() {
+            let keys = keys.join(", ");
+            log::warn!(
+                "{}: refused a config write over MQTT: it changes {keys}, which only the \
+                 config file may set",
+                cam.name
+            );
+            refused.push(format!("{} ({keys})", cam.name));
+        }
+    }
+    if !refused.is_empty() {
+        return ConfigWrite::Refused(format!(
+            "FAIL: power settings can only be changed in the config file, and this write \
+             changes {}; nothing was applied",
+            refused.join("; ")
+        ));
     }
 
     if *current == config {
