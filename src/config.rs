@@ -116,9 +116,11 @@ pub(crate) struct LimitsConfig {
     #[validate(range(min = 1, max = 1000))]
     #[serde(default = "default_requests_per_second")]
     pub(crate) requests_per_second: u32,
-    /// Wrong credentials per address per minute. Past it, credentials from that address
-    /// are refused (401, at once) unless their user already authenticated from there in
-    /// the last day, until a minute passes without that many failures
+    /// Wrong credentials per (address, username) per minute; an address may fail 5 × this
+    /// across all usernames. Past either, that username's (or every username's)
+    /// credentials from that address are refused (401, at once, right or wrong) until a
+    /// minute passes without that many failures. RTSP connections already authenticated
+    /// as that user are not affected
     #[validate(range(min = 1, max = 1000))]
     #[serde(default = "default_failed_auth_per_minute")]
     pub(crate) failed_auth_per_minute: usize,

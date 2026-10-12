@@ -2,7 +2,9 @@
 //! (DESIGN §5.2, §5.3, §6.2, §6.3, §6.6; SPEC R4–R6, R12, R13, R23–R25)
 
 use super::auth::{Allowed, Auth, Decision};
-use super::headers::{choose_transport, session_id, transport_reply, TransportError};
+use super::headers::{
+    authorization, choose_transport, session_id, transport_reply, Authorization, TransportError,
+};
 use super::msg::{parse, Parsed, Request, Response};
 use super::route::{MountTarget, Routes};
 use super::sdp::sdp;
@@ -98,9 +100,6 @@ const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
 /// How long accept() waits after an error that isn't the peer's (out of fds or memory):
 /// those fail at once until something closes, so retrying at once would spin
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
-/// How long a user that authenticated from an address stays exempt from that address's
-/// failed-auth limit
-const PROVEN_FOR: Duration = Duration::from_secs(24 * 3600);
 
 impl Server {
     pub fn new(
@@ -258,6 +257,7 @@ impl Server {
             ctl: ctl_tx,
             session: None,
             authenticated: false,
+            users: vec![],
             tokens: self.config.request_burst,
             last_refill: Instant::now(),
             described: HashMap::new(),
@@ -425,72 +425,95 @@ impl Pending {
     }
 }
 
-/// Failed-auth limiting, per `ip_key`. Past `failed_auth_per_minute` failures in the last
-/// minute, an address is limited: credentials from it get the answer wrong ones would,
-/// unless the user already authenticated from there (`gate`). Nothing waits.
+/// Failed-auth limiting. Failures count per (address, username), where the address is
+/// `ip_key` and the username is the one the credentials claim (known or not), and per
+/// address across all usernames. Past `failed_auth_per_minute` for the pair, or
+/// `SPRAY_FACTOR` times that for the address (many usernames: spraying), credentials for
+/// that username from that address get the answer wrong ones would (`gate`). So a client
+/// with a stale password for one user doesn't throttle another user on the same address
+/// (rootless podman or docker-proxy show every LAN client as one address), and nobody gets
+/// unthrottled guesses at any user. Nothing waits.
 #[derive(Default)]
 struct FailedAuth {
-    /// The most recent failures, at most failed_auth_per_minute of them
-    failures: HashMap<IpAddr, VecDeque<Instant>>,
-    /// (address, user) → when that user last authenticated from there
-    proven: HashMap<(IpAddr, String), Instant>,
+    /// The most recent failures per (address, claimed username), at most the limit
+    per_user: HashMap<(IpAddr, String), VecDeque<Instant>>,
+    /// The most recent failures per address, at most the limit × SPRAY_FACTOR
+    per_addr: HashMap<IpAddr, VecDeque<Instant>>,
+}
+
+/// The per-address failed-auth ceiling, as a multiple of the per-username limit
+const SPRAY_FACTOR: usize = 5;
+/// Usernames are kept for limiting up to this many bytes
+const MAX_NAME: usize = 64;
+
+/// `limit` failures within the last minute
+fn over<K: std::hash::Hash + Eq>(m: &HashMap<K, VecDeque<Instant>>, k: &K, limit: usize) -> bool {
+    m.get(k).is_some_and(|f| {
+        f.len() >= limit
+            && f.front()
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+    })
+}
+
+/// Record a failure, keeping the last `limit`; bounded: forget keys with nothing recent
+fn record<K: std::hash::Hash + Eq>(m: &mut HashMap<K, VecDeque<Instant>>, k: K, limit: usize) {
+    if m.len() > 4096 {
+        m.retain(|_, f| {
+            f.back()
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+        });
+    }
+    let f = m.entry(k).or_default();
+    f.push_back(Instant::now());
+    while f.len() > limit {
+        f.pop_front();
+    }
 }
 
 impl FailedAuth {
-    fn limited(&self, ip: IpAddr, limit: usize) -> bool {
-        self.failures.get(&ip_key(ip)).is_some_and(|f| {
-            f.len() >= limit.max(1)
-                && f.front()
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
-        })
+    fn key(ip: IpAddr, user: &str) -> (IpAddr, String) {
+        let mut end = user.len().min(MAX_NAME);
+        while !user.is_char_boundary(end) {
+            end -= 1;
+        }
+        (ip_key(ip), user[..end].to_string())
     }
 
-    fn fail(&mut self, ip: IpAddr, limit: usize) {
-        let minute = Duration::from_secs(60);
-        // Bounded: forget addresses with nothing recent
-        if self.failures.len() > 1024 {
-            self.failures
-                .retain(|_, f| f.back().is_some_and(|t| t.elapsed() < minute));
-        }
-        let f = self.failures.entry(ip_key(ip)).or_default();
-        f.push_back(Instant::now());
-        while f.len() > limit.max(1) {
-            f.pop_front();
-        }
+    fn limited(&self, ip: IpAddr, user: &str, limit: usize) -> bool {
+        let limit = limit.max(1);
+        over(&self.per_user, &Self::key(ip, user), limit)
+            || over(&self.per_addr, &ip_key(ip), limit * SPRAY_FACTOR)
     }
 
-    fn proven(&self, ip: IpAddr, user: &str) -> bool {
-        self.proven
-            .get(&(ip_key(ip), user.to_string()))
-            .is_some_and(|t| t.elapsed() < PROVEN_FOR)
-    }
-
-    fn prove(&mut self, ip: IpAddr, user: &str) {
-        if self.proven.len() > 1024 {
-            self.proven.retain(|_, t| t.elapsed() < PROVEN_FOR);
-            // Only real users from many addresses get here: forgetting costs them nothing
-            // until an address of theirs is limited
-            if self.proven.len() > 4096 {
-                self.proven.clear();
-            }
-        }
-        self.proven
-            .insert((ip_key(ip), user.to_string()), Instant::now());
+    fn fail(&mut self, ip: IpAddr, user: &str, limit: usize) {
+        let limit = limit.max(1);
+        record(&mut self.per_user, Self::key(ip, user), limit);
+        record(&mut self.per_addr, ip_key(ip), limit * SPRAY_FACTOR);
     }
 }
 
-/// The failed-auth limit applied to a decision on a request that carried credentials,
-/// from a limited address. Credentials that aren't a user already proven from there get
-/// exactly what wrong ones would (`as_wrong`: the decision without credentials), so a
-/// guess that hits looks like one that missed, also through a stale Digest nonce or a
-/// valid user without access to the mount
+/// The username credentials claim, before they are checked ("" if none)
+fn claimed_user(header: &str) -> String {
+    match authorization(header) {
+        Some(Authorization::Basic { user, .. }) => user,
+        Some(Authorization::Digest(p)) => p.get("username").cloned().unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+/// The failed-auth limit applied to a decision on a request whose credentials' username
+/// is limited from this address. Only a user this connection already authenticated as
+/// (`authenticated_here`: its session's keepalives, its SETUP after DESCRIBE) gets
+/// through; anything else gets exactly what wrong credentials would (`as_wrong`: the
+/// decision without credentials), so a guess that hits looks like one that missed, also
+/// through a stale Digest nonce or a valid user without access to the mount
 fn gate(
     d: Decision,
-    proven: impl Fn(&str) -> bool,
+    authenticated_here: impl Fn(&str) -> bool,
     as_wrong: impl FnOnce() -> Decision,
 ) -> Decision {
     match d {
-        Decision::Ok(Some(ref u)) if proven(u) => d,
+        Decision::Ok(Some(ref u)) if authenticated_here(u) => d,
         Decision::Failed(_) => d,
         _ => match as_wrong() {
             // Wrong credentials on a mount that needs them fail (and count)
@@ -557,6 +580,8 @@ struct Conn {
     ctl: mpsc::Sender<WriterCmd>,
     session: Option<SessionState>,
     authenticated: bool,
+    /// The users this connection authenticated as (`gate`)
+    users: Vec<String>,
     tokens: f64,
     last_refill: Instant,
     /// mount → desc gen at DESCRIBE time
@@ -651,19 +676,24 @@ impl Conn {
         let check = |h| auth.check(&allowed, &req.method, &req.uri, h, self.ip);
         let mut decision = check(header);
         let limit = self.server.config.failed_auth_per_minute;
-        if header.is_some() {
-            let fa = self.server.failed_auth.lock().unwrap();
-            if fa.limited(self.ip, limit) {
-                // This connection's own session's user is proven too
-                let session_user = self.session.as_ref().and_then(|s| s.user.as_deref());
-                let proven = |u: &str| session_user == Some(u) || fa.proven(self.ip, u);
-                decision = gate(decision, proven, || check(None));
-            }
+        let claimed = header.map(claimed_user).unwrap_or_default();
+        if header.is_some()
+            && self
+                .server
+                .failed_auth
+                .lock()
+                .unwrap()
+                .limited(self.ip, &claimed, limit)
+        {
+            let here = |u: &str| self.users.iter().any(|v| v == u);
+            decision = gate(decision, here, || check(None));
         }
         match decision {
             Decision::Ok(user) => {
                 if let Some(u) = &user {
-                    self.server.failed_auth.lock().unwrap().prove(self.ip, u);
+                    if !self.users.contains(u) {
+                        self.users.push(u.clone());
+                    }
                     // Only real credentials make a connection authenticated
                     if !self.authenticated {
                         self.authenticated = true;
@@ -682,7 +712,8 @@ impl Conn {
             }
             Decision::Failed(c) => {
                 log::info!("rtsp: auth failure from {}", self.ip);
-                self.server.failed_auth.lock().unwrap().fail(self.ip, limit);
+                let mut fa = self.server.failed_auth.lock().unwrap();
+                fa.fail(self.ip, &claimed, limit);
                 let mut r = Response::new(401);
                 for v in c {
                     r = r.header("WWW-Authenticate", v);
@@ -1353,28 +1384,78 @@ mod tests {
         );
     }
 
-    /// Past the failed-auth limit, only a user proven from the address gets through;
-    /// everything else gets what wrong credentials would, so no answer tells a right
-    /// guess from a wrong one
+    /// Past the failed-auth limit, only a user the connection already authenticated as
+    /// gets through; everything else gets what wrong credentials would, so no answer tells
+    /// a right guess from a wrong one
     #[test]
     fn test_gate() {
         let challenge = || Decision::Challenge(vec!["Basic realm=\"neolink\"".into()]);
         let failed = Decision::Failed(vec!["Basic realm=\"neolink\"".into()]);
-        let proven = |u: &str| u == "alice";
+        let here = |u: &str| u == "alice";
         let alice = Decision::Ok(Some("alice".into()));
-        assert_eq!(gate(alice.clone(), proven, challenge), alice);
-        // Right password, not proven here
+        assert_eq!(gate(alice.clone(), here, challenge), alice);
+        // Right password, but not for a user this connection authenticated as
         let bob = Decision::Ok(Some("bob".into()));
-        assert_eq!(gate(bob.clone(), proven, challenge), failed);
+        assert_eq!(gate(bob.clone(), here, challenge), failed);
         // On an anonymous mount, wrong credentials fall back to anonymous: so do right ones
-        assert_eq!(gate(bob, proven, || Decision::Ok(None)), Decision::Ok(None));
+        assert_eq!(gate(bob, here, || Decision::Ok(None)), Decision::Ok(None));
         // A stale Digest nonce is only answered stale for the right password
         let stale = Decision::Challenge(vec!["Digest stale=TRUE".into()]);
-        assert_eq!(gate(stale, proven, challenge), failed);
+        assert_eq!(gate(stale, here, challenge), failed);
         // A valid user without access to the mount (404) would reveal the password too
-        assert_eq!(gate(Decision::NotFound, proven, challenge), failed);
+        assert_eq!(gate(Decision::NotFound, here, challenge), failed);
         // Wrong credentials stay a failure
-        assert_eq!(gate(failed.clone(), proven, challenge), failed);
+        assert_eq!(gate(failed.clone(), here, challenge), failed);
+    }
+
+    /// Failures limit their (address, username) pair; many usernames from one address hit
+    /// the address ceiling; IPv6 counts per /64
+    #[test]
+    fn test_failed_auth_per_user_and_address() {
+        let mut fa = FailedAuth::default();
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        for _ in 0..3 {
+            fa.fail(a, "alice", 4);
+        }
+        assert!(!fa.limited(a, "alice", 4));
+        fa.fail(a, "alice", 4);
+        assert!(fa.limited(a, "alice", 4));
+        assert!(!fa.limited(a, "bob", 4), "another user on the same address");
+        assert!(
+            !fa.limited(b, "alice", 4),
+            "the same user from another address"
+        );
+        // Spraying: 4 + 15 more failures over other names stay under 4 × 5 = 20
+        for i in 0..15 {
+            fa.fail(a, &format!("u{i}"), 4);
+        }
+        assert!(!fa.limited(a, "bob", 4));
+        fa.fail(a, "u99", 4);
+        assert!(fa.limited(a, "bob", 4), "the address ceiling");
+        // Long names are cut (and keep counting as one), char boundaries respected
+        let long = "é".repeat(100);
+        for _ in 0..4 {
+            fa.fail(b, &long, 4);
+        }
+        assert!(fa.limited(b, &format!("{long}x"), 4));
+        // IPv6 per /64
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let v6b: IpAddr = "2001:db8::2".parse().unwrap();
+        for _ in 0..4 {
+            fa.fail(v6, "alice", 4);
+        }
+        assert!(fa.limited(v6b, "alice", 4));
+    }
+
+    #[test]
+    fn test_claimed_user() {
+        assert_eq!(claimed_user("Basic YWxpY2U6d3Jvbmc="), "alice");
+        assert_eq!(
+            claimed_user("Digest username=\"bob\", realm=\"neolink\", nonce=\"x\""),
+            "bob"
+        );
+        assert_eq!(claimed_user("Bearer x"), "");
     }
 
     /// A full table closes the oldest entry of the address holding the most, or the

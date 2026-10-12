@@ -41,8 +41,12 @@ async fn try_request(
 
 /// What a Frigate ffmpeg does: OPTIONS, DESCRIBE without credentials (401 when users are
 /// configured), DESCRIBE with them, SETUP both tracks, PLAY; then it must get video.
-/// Ok(client) when playing with media, Err(the step that failed)
-async fn player(addr: SocketAddr, src: &str, auth: Option<&str>) -> Result<Client, String> {
+/// Ok((client, session id)) when playing with media, Err(the step that failed)
+async fn player(
+    addr: SocketAddr,
+    src: &str,
+    auth: Option<&str>,
+) -> Result<(Client, String), String> {
     let base = format!("rtsp://{addr}/argus/main");
     let mut c = Client::connect_from(addr, src).await;
     let s = try_request(&mut c, "OPTIONS", &base, &[]).await;
@@ -102,7 +106,7 @@ async fn player(addr: SocketAddr, src: &str, auth: Option<&str>) -> Result<Clien
     if !has_new_video(&mut c, Duration::from_secs(3)).await {
         return Err("no video".into());
     }
-    Ok(c)
+    Ok((c, session))
 }
 
 /// Fresh video arrives within `d`
@@ -270,7 +274,7 @@ async fn test_anonymous_players_hold_no_unauthenticated_slot() {
     let mut players = vec![];
     for i in 0..10 {
         match player(h.addr, "127.0.0.1", None).await {
-            Ok(c) => players.push(c),
+            Ok((c, _)) => players.push(c),
             Err(e) => panic!("player {i}: {e}"),
         }
     }
@@ -369,18 +373,15 @@ async fn test_failed_auth_limit_answers_at_once() {
     );
 }
 
-/// Finding 3: past the limit, an address gets no answer about any password it hasn't
-/// already proven, so a parallel guesser can't tell when it hit; other addresses, and
-/// users already proven from that address, are not affected
+/// Finding 3: past the limit for a user from an address, that user's credentials from
+/// there get the answer wrong ones would, also the right password, so a parallel guesser
+/// can't tell when it hit. Another user on the same address (a stale password in one
+/// client must not lock out Frigate's user) and the same user from another address are
+/// not affected
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_failed_auth_limit_gates_guesses() {
+async fn test_failed_auth_limit_is_per_user() {
     let h = start_with(throttled(4)).await;
     let a = h.addr;
-    // Proven before the failures start
-    assert_eq!(
-        describe_from(a, "127.0.0.2", "alice", "alicepw").await,
-        Some(200)
-    );
     let mut tasks = vec![];
     for _ in 0..6 {
         tasks.push(tokio::spawn(async move {
@@ -390,20 +391,114 @@ async fn test_failed_auth_limit_gates_guesses() {
     for t in tasks {
         assert_eq!(t.await.unwrap(), Some(401));
     }
-    // The right password, not proven from here: refused like a wrong one
-    assert_eq!(
-        describe_from(a, "127.0.0.2", "bob", "bobpw").await,
-        Some(401)
-    );
-    // A user already proven here keeps working (a client with a stale password on the
-    // same host must not lock out Frigate)
     assert_eq!(
         describe_from(a, "127.0.0.2", "alice", "alicepw").await,
+        Some(401),
+        "a right guess past the limit"
+    );
+    assert_eq!(
+        describe_from(a, "127.0.0.2", "bob", "bobpw").await,
         Some(200)
     );
-    // Another address is not affected
     assert_eq!(
-        describe_from(a, "127.0.0.3", "bob", "bobpw").await,
+        describe_from(a, "127.0.0.3", "alice", "alicepw").await,
+        Some(200)
+    );
+}
+
+/// Red team: brute force of alice from the address Frigate plays alice from. Frigate's
+/// session (keepalives carrying credentials, PAUSE/PLAY, media) is unaffected; new
+/// guesses at alice from that address, right or wrong, stay limited
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_failed_auth_limit_keeps_sessions() {
+    let h = start_with(throttled(4)).await;
+    let a = h.addr;
+    let base = format!("rtsp://{a}/argus/main");
+    let alice = basic("alice", "alicepw");
+    let (mut frigate, session) = player(a, "127.0.0.2", Some(&alice)).await.unwrap();
+    let mut tasks = vec![];
+    for i in 0..30 {
+        tasks.push(tokio::spawn(async move {
+            describe_from(a, "127.0.0.2", "alice", &format!("guess{i}")).await
+        }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), Some(401));
+    }
+    assert_eq!(
+        describe_from(a, "127.0.0.2", "alice", "alicepw").await,
+        Some(401),
+        "a new right guess at alice"
+    );
+    let auth = [
+        ("Session", session.as_str()),
+        ("Authorization", alice.as_str()),
+    ];
+    assert_eq!(
+        try_request(&mut frigate, "GET_PARAMETER", &base, &auth).await,
+        Some(200),
+        "Frigate's keepalive"
+    );
+    assert_eq!(
+        try_request(&mut frigate, "PAUSE", &base, &auth).await,
+        Some(200)
+    );
+    assert_eq!(
+        try_request(&mut frigate, "PLAY", &base, &auth).await,
+        Some(200)
+    );
+    assert!(has_new_video(&mut frigate, Duration::from_secs(3)).await);
+}
+
+/// Red team: username spraying (many usernames, known or not, one wrong password each)
+/// from one address hits the address ceiling (5 × the per-user limit): every user's
+/// credentials from there are then refused; below the ceiling they are not
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_failed_auth_username_spraying() {
+    let h = start_with(throttled(4)).await;
+    let a = h.addr;
+    // 19 usernames once each (under 20): bob still gets in
+    for i in 0..19 {
+        assert_eq!(
+            describe_from(a, "127.0.0.4", &format!("user{i}"), "x").await,
+            Some(401)
+        );
+    }
+    assert_eq!(
+        describe_from(a, "127.0.0.4", "bob", "bobpw").await,
+        Some(200)
+    );
+    // The 20th and on: the address is limited for every username
+    for i in 19..25 {
+        assert_eq!(
+            describe_from(a, "127.0.0.4", &format!("user{i}"), "x").await,
+            Some(401)
+        );
+    }
+    assert_eq!(
+        describe_from(a, "127.0.0.4", "bob", "bobpw").await,
+        Some(401)
+    );
+    // Unparseable credentials count too (as one empty username)
+    let mut c = Client::connect_from(a, "127.0.0.5").await;
+    for _ in 0..4 {
+        assert_eq!(
+            try_request(
+                &mut c,
+                "DESCRIBE",
+                &format!("rtsp://{a}/argus/main"),
+                &[("Authorization", "Basic !!!")]
+            )
+            .await,
+            Some(401)
+        );
+    }
+    assert_eq!(
+        describe_from(a, "127.0.0.5", "bob", "bobpw").await,
+        Some(200)
+    );
+    assert_eq!(
+        describe_from(a, "127.0.0.6", "bob", "bobpw").await,
         Some(200)
     );
 }

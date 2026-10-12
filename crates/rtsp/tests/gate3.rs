@@ -656,9 +656,10 @@ async fn test_unauthenticated_bounds() {
             .status,
         404
     );
-    // 10 wrong passwords over 10 parallel connections: all answered at once (nothing
-    // waits while holding a connection); past the 4 allowed per minute this address gets
-    // 401 for any user not already proven from it (alice was, above), right or wrong
+    // 10 wrong passwords for alice over 10 parallel connections: all answered at once
+    // (nothing waits while holding a connection); past the 4 allowed per minute, alice's
+    // credentials from this address get 401, right or wrong, except on a connection that
+    // already authenticated as alice; bob is not affected
     let t = Instant::now();
     let mut tasks = vec![];
     for _ in 0..10 {
@@ -679,9 +680,10 @@ async fn test_unauthenticated_bounds() {
         "10 failures took {:?}",
         t.elapsed()
     );
-    let bob = basic("bob", "bobpw");
+    let mut fresh = Client::connect(h.addr).await;
     assert_eq!(
-        c.request("DESCRIBE", &base, &[("Authorization", &bob)])
+        fresh
+            .request("DESCRIBE", &base, &[("Authorization", &alice)])
             .await
             .status,
         401,
@@ -692,6 +694,15 @@ async fn test_unauthenticated_bounds() {
             .await
             .status,
         200,
-        "a user proven from this address"
+        "a connection already authenticated as alice"
+    );
+    let bob = basic("bob", "bobpw");
+    assert_eq!(
+        fresh
+            .request("DESCRIBE", &base, &[("Authorization", &bob)])
+            .await
+            .status,
+        200,
+        "another user"
     );
 }

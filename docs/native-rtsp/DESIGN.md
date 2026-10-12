@@ -639,14 +639,24 @@ The connection task owns the read half. A writer task owns the write half.
 - A user with no password matches only the empty password.
 
 **Failed-auth limiting (F-cc 5)**: only requests that carried credentials and failed count.
-The initial no-credentials 401 does not. Past the limit (10 in the last minute, per IP or
-IPv6 /64) the address is *limited*: credentials from it get exactly the answer wrong ones
-would (401 with a fresh challenge, or anonymous access on an anonymous mount), also where a
-right password would have earned `stale=true` or a 404, so a guesser can't tell a hit
-from a miss. The exception is a user who authenticated from that address in the last 24 h
-(or owns the connection's session): a client with a stale password must not lock Frigate
-on the same host out. That exception is also an oracle for that user's password to anyone
-sharing the address (NAT), which is the price of not locking out the legitimate client.
+The initial no-credentials 401 does not. Failures count per (address, username), where
+the address is the IP or IPv6 /64 and the username is the one the credentials claim (known
+or not; unparseable credentials count as the empty name), and per address across all
+usernames. A username is *limited* from an address after 10 failures for that pair in the
+last minute, or after 50 (5 × 10) for the address in all, which stops username spraying.
+Credentials for a limited username get exactly the answer wrong ones would (401 with a
+fresh challenge, or anonymous access on an anonymous mount), also where a right password
+would have earned `stale=true` or a 404, so a guesser can't tell a hit from a miss.
+
+Why per username: under rootless podman (slirp4netns, pasta) or docker-proxy, every LAN
+client can appear as one address. A client with a stale password for one user then
+throttles only that user, not Frigate's; and nobody gets unthrottled guesses at any user.
+The one exception is a connection that already authenticated as that user: its session's
+keepalives (which carry credentials and are re-authorized, R23) and its SETUP after
+DESCRIBE go through, so a brute force of user X from Frigate's address doesn't break
+Frigate's running session as X. It does refuse Frigate's *new* connections as X while it
+lasts: from one address a guesser and a reconnecting client are indistinguishable.
+
 Nothing sleeps: an earlier design delayed each failure past the limit by its own 1 s slot
 inside the request handler, which held the connection's slots, stalled shutdown, and
 still answered a right guess at once.
@@ -663,7 +673,7 @@ still answered a right guess at once.
 | First request | within 10 s | close |
 | Request rate | 20/s, burst 40, per connection | 503 |
 | Bodies | Content-Length ≤ 4 KiB | 413 |
-| Failed auth | 10/min per IP | credentials not proven from that IP are answered as wrong (§6.5) |
+| Failed auth | 10/min per (IP, username), 50/min per IP | that username's credentials (every username's, past the per-IP ceiling) from that IP are answered as wrong, except on connections already authenticated as that user (§6.5) |
 | accept() errors (EMFILE, ENOMEM) | — | retry after 100 ms |
 
 Why close an old connection instead of refusing the new one: every client starts
