@@ -88,6 +88,10 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
     must leave those keys unset, so it sleeps. Before, any MQTT client could set
     `battery = false` or `idle_disconnect = false` and keep a battery camera awake. Other
     config writes (such as `[cameras.mqtt]` toggles) work as before.
+  - **Users and permissions come only from the config file, too.** A config write that
+    changes `[[users]]` (adds, removes or re-passwords one) or any camera's
+    `permitted_users` is refused whole with `FAIL: ...`. Before, an MQTT client could add
+    itself as a user or open a camera to `anonymous`.
 - **CLI `battery` and `image`** print what was saved at the camera's last wake, without
   waking it; `--fresh` wakes the camera (`image --use-stream` always does).
 - **Config.** Unknown keys (for example a misspelt `idle_disconect`) are reported with a

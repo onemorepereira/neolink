@@ -397,6 +397,14 @@ const FILE_CONFIG: &str = r#"
 broker_addr = "127.0.0.1"
 port = 1883
 
+[[users]]
+name = "alice"
+pass = "alicesecret"
+
+[[users]]
+name = "bob"
+pass = "bobsecret"
+
 [[cameras]]
 name = "garden"
 username = "admin"
@@ -404,6 +412,7 @@ password = "camsecret"
 address = "192.168.1.10:9000"
 battery = true
 idle_grace_s = 15
+permitted_users = ["alice", "bob"]
 
 [[cameras]]
 name = "porch"
@@ -670,6 +679,93 @@ fn test_config_write_other_changes_apply() {
     }));
     let porch = c.cameras.iter().find(|c| c.name == "porch").unwrap();
     assert_eq!(porch.stream, crate::config::StreamConfig::Main);
+}
+
+fn users(t: &toml::Table) -> Vec<toml::Value> {
+    t["users"].as_array().unwrap().clone()
+}
+
+fn set_users(t: &mut toml::Table, v: Vec<toml::Value>) {
+    t.insert("users".into(), toml::Value::Array(v));
+}
+
+#[test]
+fn test_config_write_cannot_change_users() {
+    let refused_users = |text: String| match write(&text) {
+        ConfigWrite::Refused(why) => {
+            assert!(why.starts_with("FAIL:") && why.contains("users"), "{}", why);
+            assert!(!why.contains("secret"), "{}", why);
+        }
+        other => panic!("not refused: {:?}", other),
+    };
+    // Add a user
+    refused_users(edited_write(|t| {
+        let mut u = users(t);
+        let mut eve = toml::Table::new();
+        eve.insert("name".into(), "eve".into());
+        eve.insert("pass".into(), "evesecret".into());
+        u.push(toml::Value::Table(eve));
+        set_users(t, u);
+    }));
+    // Remove one
+    refused_users(edited_write(|t| {
+        let mut u = users(t);
+        u.pop();
+        set_users(t, u);
+    }));
+    // Change a password
+    refused_users(edited_write(|t| {
+        let mut u = users(t);
+        u[0].as_table_mut()
+            .unwrap()
+            .insert("pass".into(), "newsecret".into());
+        set_users(t, u);
+    }));
+    // Remove them all (no users means anonymous access)
+    refused_users(edited_write(|t| {
+        t.remove("users");
+    }));
+    // Reordered, with the passwords left out as neolink publishes them: not a change
+    let c = applied(&edited_write(|t| {
+        let mut u = users(t);
+        u.reverse();
+        set_users(t, u);
+    }));
+    assert_eq!(c.users[0].pass.as_deref(), Some("bobsecret"));
+}
+
+#[test]
+fn test_config_write_cannot_change_permitted_users() {
+    for edit in [
+        // Narrow it, widen it to anyone or anonymous, or remove it
+        toml::Value::from(vec!["alice"]),
+        toml::Value::from(vec!["alice", "bob", "anyone"]),
+        toml::Value::from(vec!["alice", "bob", "anonymous"]),
+    ] {
+        assert_refused(
+            &edited_write(|t| {
+                camera(t, "garden").insert("permitted_users".into(), edit);
+            }),
+            &[("garden", "permitted_users")],
+        );
+    }
+    assert_refused(
+        &edited_write(|t| {
+            camera(t, "garden").remove("permitted_users");
+        }),
+        &[("garden", "permitted_users")],
+    );
+    // Setting it on a camera the file leaves open
+    assert_refused(
+        &edited_write(|t| {
+            camera(t, "porch").insert("permitted_users".into(), vec!["anonymous"].into());
+        }),
+        &[("porch", "permitted_users")],
+    );
+    // Same names in another order: not a change
+    applied(&edited_write(|t| {
+        camera(t, "garden").insert("permitted_users".into(), vec!["bob", "alice"].into());
+    }));
 }
 
 #[test]

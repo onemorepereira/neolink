@@ -76,7 +76,7 @@ The URLs are the same 19 aliases per camera (`/Cam`, `/Cam/main`, `/Cam/mainStre
 | `rtsp_auth` | top | `["digest", "basic"]` | Schemes offered. Basic sends passwords in clear text (there is no TLS yet), so prefer `["digest"]` when every client supports it |
 | `rtp_mtu` | top | 1400 | 576–9000 |
 | `limits.*` | top | see below | `max_connections` 128, `max_unauthenticated_per_ip` 32, `first_request_timeout_s` 10, `idle_timeout_s` 60, `requests_per_second` 20, `failed_auth_per_minute` 10. Unauthenticated means no credentials accepted and no session yet; past the per-IP cap (or `max_connections / 2` in all) an old unauthenticated connection is closed, so a flood can't lock others out, and authenticated or playing clients never count. Past `failed_auth_per_minute` wrong passwords for one user from one IP (or 5 × that across all usernames), that user's credentials from that IP get 401, right or wrong, until a minute passes; sessions already playing as that user are not affected. The snapshot endpoint applies the same limits |
-| `mqtt_config_writes` | top | `true` | Set `false` to stop MQTT clients rewriting the config. Even when `true`, they can't change power settings (SPEC P14) |
+| `mqtt_config_writes` | top | `true` | Set `false` to stop MQTT clients rewriting the config. Even when `true`, they can't change power settings (SPEC P14), users or `permitted_users` (R29) |
 | `audio` | camera | `aac` | `aac` or `none` |
 | `pacing_latency_ms` | camera | 1500 | 0–3000: the jitter buffer that smooths the camera's bursty Wi-Fi delivery |
 | `parameter_sets` | camera | `strip` | `strip`, `passthrough` or `inject`. Keep `strip` if you re-publish to go2rtc (Home Assistant): go2rtc 1.9.14 can't read ffmpeg's re-published in-band parameter sets |
@@ -187,8 +187,8 @@ These are the SPEC §5 deltas:
   camera stream) holds the last keyframe:
   an image of what the camera last saw. Set `persist_irap = false` to keep it only in
   memory, and protect the state directory like the config.
-- **MQTT.** The `neolink/config` topic can rewrite the whole config, including users,
-  `permitted_users` and camera addresses, but not power settings. Anyone who can publish
+- **MQTT.** The `neolink/config` topic can rewrite most of the config, including camera
+  addresses, but not users, `permitted_users` or power settings. Anyone who can publish
   to your broker can do that. Set `mqtt_config_writes = false` unless you use it.
   - Passwords left out of a config sent there are filled in from the running config only
     when the camera's address (and UID) and the MQTT broker are unchanged. A config that

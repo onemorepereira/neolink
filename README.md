@@ -382,9 +382,14 @@ refused whole, with nothing applied: `neolink/config/status` gets
 <camera> (<keys>); ...` and neolink logs a warning per camera. Edit the config file and
 restart neolink to change them. So anyone who can publish to the broker can't keep a
 battery camera awake. Writes that keep these values, such as toggling
-`[cameras.mqtt]` features, apply as before. The rest of the config (users,
-`permitted_users`, addresses, streams) can still be rewritten unless
-`mqtt_config_writes = false`.
+`[cameras.mqtt]` features, apply as before.
+
+The same goes for access: a write that adds, removes or re-passwords a `[[users]]` entry,
+or changes any camera's `permitted_users`, is refused whole with
+`FAIL: users and permitted_users can only be changed in the config file, ...`. Order
+doesn't matter, and passwords left out (as neolink publishes the config) are kept. The
+rest of the config (addresses, streams, `[cameras.mqtt]` features) can still be
+rewritten unless `mqtt_config_writes = false`.
 
 ### MQTT Disable Features
 

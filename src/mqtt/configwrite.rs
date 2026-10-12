@@ -1,6 +1,8 @@
 //! A config published on `neolink/config`: parsed, secrets restored, validated and checked
 //! before the reactor sees it
 
+use std::collections::HashSet;
+
 use anyhow::Context;
 use validator::Validate;
 
@@ -102,8 +104,51 @@ pub(super) fn prepare_config_write(text: &str, file: &Config, current: &Config) 
         ));
     }
 
+    // Nor can it grant itself access: users and each camera's permitted_users also come
+    // from the config file only (SPEC R29)
+    let mut refused = vec![];
+    if !same_users(&config, file) {
+        log::warn!("Refused a config write over MQTT: it changes users");
+        refused.push("users".to_string());
+    }
+    for cam in config.cameras.iter() {
+        let from_file = file
+            .cameras
+            .iter()
+            .find(|f| f.name == cam.name)
+            .and_then(|f| f.permitted_users.as_ref());
+        if !same_names(cam.permitted_users.as_ref(), from_file) {
+            log::warn!(
+                "{}: refused a config write over MQTT: it changes permitted_users",
+                cam.name
+            );
+            refused.push(format!("{} (permitted_users)", cam.name));
+        }
+    }
+    if !refused.is_empty() {
+        return ConfigWrite::Refused(format!(
+            "FAIL: users and permitted_users can only be changed in the config file, and \
+             this write changes {}; nothing was applied",
+            refused.join("; ")
+        ));
+    }
+
     if *current == config {
         return ConfigWrite::Unchanged;
     }
     ConfigWrite::Apply(Box::new(config))
+}
+
+/// The same users with the same passwords, in any order
+fn same_users(a: &Config, b: &Config) -> bool {
+    a.users.iter().collect::<HashSet<_>>() == b.users.iter().collect::<HashSet<_>>()
+}
+
+/// The same `permitted_users`, in any order; absent stays absent (it means every user)
+fn same_names(a: Option<&Vec<String>>, b: Option<&Vec<String>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.iter().collect::<HashSet<_>>() == b.iter().collect::<HashSet<_>>(),
+        _ => false,
+    }
 }

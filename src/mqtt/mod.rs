@@ -111,8 +111,9 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
         let c = config.borrow();
         if c.mqtt_config_writes && !c.users.is_empty() {
             log::warn!(
-                "MQTT clients can rewrite the config, including users and permitted_users, \
-                 on the neolink/config topic; set mqtt_config_writes = false to prevent that"
+                "MQTT clients can rewrite the config, including camera addresses (but not \
+                 users, permitted_users or power settings), on the neolink/config topic; \
+                 set mqtt_config_writes = false to prevent that"
             );
         }
     }
@@ -221,7 +222,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
             v = async {
                 while let Ok(msg) = thread_instance.recv().await {
                     if msg.topic == "config" {
-                        // SPEC R29: the topic can rewrite users and permissions
+                        // SPEC R29: the topic can rewrite addresses and streams (not users or power)
                         if !thread_config.borrow().mqtt_config_writes {
                             log::warn!("Ignored a config write over MQTT: mqtt_config_writes = false");
                             thread_instance
