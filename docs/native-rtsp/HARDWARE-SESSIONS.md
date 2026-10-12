@@ -63,6 +63,26 @@ neolink battery --fresh --config ~/.config/neolink/argus.toml   # before/after (
 - **Next time:** for a full outage, also drop input from the camera:
   `sudo nft add chain inet a11 i '{ type filter hook input priority 0; }'; sudo nft add rule inet a11 i ip saddr 192.168.86.34 drop`.
 
+**Session 4, 2026-10-12 01:15 UTC** (battery 45 %, 3644 mV; the camera stayed connected
+with `pause.on_motion`):
+- **Two false starts:**
+  - The first: my script launch let the container receive SIGTERM a second in.
+  - The second: an always-connected camera served no mounts until it had connected
+    (404). Fixed: every camera's mounts are seeded from its configured streams.
+- **A12:**
+  - No camera stream while nothing moved.
+  - The owner's walk past the PIR (motion 01:16:20–01:16:33), and a second burst
+    01:16:52–01:17:07, each gave a live stretch of about 9 s. They are 19.5 s apart, as
+    the events were, and the stream paused after each.
+  - The session survived 5 min, including the idle time before and after.
+- **Defect, fixed:** before the first motion, the client got the cached keyframe and then
+  nothing for 48 s. Bridging only started after live video, so Frigate's 5 s `-timeout`
+  would have dropped the stream. The Hub now bridges from the restamped keyframe on a
+  cold start. Regression test `test_native_cold_motion_paused_bridges` failed before the
+  fix (0 audio packets) and passes after.
+- **Not measured:** the time from the motion event to the first live keyframe needs the
+  Hub's debug timeline; to do next time with the fix in place.
+
 ## Session 1 (day 1): A1, A2, A7, on main and sub
 
 1. A1:
