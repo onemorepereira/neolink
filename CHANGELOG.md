@@ -176,6 +176,9 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
 ### Fixed
 
 - PIR control on newer firmwares; a malformed XML reply no longer drops the connection.
+- `pushnoti` builds: each `pause.on_motion` stream (and each MQTT camera listener) left
+  a task behind that forwarded push notifications to nobody; it now stops with its last
+  receiver.
 - MQTT with an unreachable broker: `mqtt` and `mqtt-rtsp` no longer exit (status 1) when
   the broker is down at startup or goes away. Neolink logs a warning and retries with
   backoff (1 s doubling to 60 s); what it publishes meanwhile waits and is sent once the
