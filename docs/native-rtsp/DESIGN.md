@@ -843,8 +843,11 @@ backends.
 
 **Wake ledger (P6)**
 - A `Vec` ring of the last 1000 wakes per camera, in memory.
-- Each permit carries a reason string, which `run_task` callers pass. Today permits have
-  no reason, so this is a signature change on `NeoInstance::permit`/`run_task`.
+- Each permit carries a reason string: `stream:<kind>`, `cli:<cmd>`, `mqtt:<topic>` for
+  every MQTT task, and so on.
+- The current state and the day's totals are published retained on
+  `neolink/<camera>/status/wakes`; the 13th wake within an hour logs a warning naming the
+  reasons (at most once an hour).
 
 **Snapshot endpoint (P5)**
 - A minimal HTTP/1.1 GET server on `snapshot_port` (same limits as §6.6; failed auth as
