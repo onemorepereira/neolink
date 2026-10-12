@@ -258,15 +258,18 @@ Control messages:
 - `/control/floodlight [on|off]` Turns floodlight (if equipped) on/off
 - `/control/floodlight_tasks [on|off]` Turns floodlight (if equipped) tasks on/off
   This is the automatic tasks such as on motion and night triggers
-- `/control/wakeup (mins)` For a sleeping camera (the default, see
-  [Power](#power-sleeping-and-always-on-cameras)) this wakes it and keeps it
-  connected for at least the given minutes
+- `/control/wakeup (mins)` Keep a sleeping camera (the default, see
+  [Power](#power-sleeping-and-always-on-cameras)) awake for the given whole
+  minutes, at most 30 (larger values are capped, anything else is rejected with a
+  `FAIL:` reply). A new wakeup replaces the pending one instead of adding to it, and
+  `0` cancels it. It also ends when neolink stops or the camera is removed
 - `/control/siren on` Signal the siren, the message is always "on" as there is no
   "off" signal for the siren
 
-Every `/control/*` and `/query/*` message needs the camera, so it wakes a
-sleeping camera for as long as the command runs. Publish them without the retain
-flag: retained `/control/*` and `/query/*` messages are ignored with a warning, so
+Every `/control/*` message needs the camera, so it wakes a sleeping camera for as
+long as the command runs (each is recorded as `mqtt:<topic>` in `/status/wakes`).
+`/query/*` messages don't wake a sleeping camera unless the payload is `fresh`; see
+Query Messages below. Publish them without the retain flag: retained `/control/*` and `/query/*` messages are ignored with a warning, so
 that a broker reconnect doesn't replay them and wake the camera.
 
 Status Messages:
@@ -275,7 +278,8 @@ Status Messages:
   right now. A sleeping camera is `disconnected` until something wakes it, so
   read this as "awake", not "working"
 - `/status/battery` Sent in reply to a `/query/battery` an XML encoded version
-  of the battery status
+  of the battery status. For a sleeping camera this is the reading from its last
+  wake; the reply on `/query/battery` gives its age
 - `/status/battery_level` A simple % value of current battery level, only
   published when `enable_battery` is true in the config. For a sleeping camera
   it is published once per wake, not every `battery_update` ms
@@ -284,7 +288,9 @@ Status Messages:
 - `/status/motion` Contains the motion detection alarm status. `on` for motion
   and `off` for still, only published when `enable_motion` is true in the config.
   The camera sends motion events only over an open connection, so for a sleeping
-  camera this stays `unknown` until a wake and is updated only while it is awake
+  camera this stays `unknown` until a wake and is updated only while it is awake.
+  Motion that is `on` when the camera goes to sleep (or its connection drops) is
+  published as `off`
 - `/status/ptz/preset` Sent in reply to a `/query/ptz/preset` an XML encoded
   version of the PTZ presets
 - `/status/preview` a base64 encoded camera image updated every 2s. Not
@@ -295,14 +301,33 @@ Status Messages:
 - `/status/floodlight_tasks` The current status of the floodlight tasks
   used updated every 2s by default (for a sleeping camera, only while it is
   awake)
+- `/status/wakes` The wake ledger, retained, published whenever the camera wakes
+  or goes back to sleep: JSON with `awake`, `reason` (what woke it, e.g.
+  `mqtt:control/wakeup`, `mqtt:query/battery` or `stream:Main`), `since` (Unix seconds),
+  `last_awake_s`, `today_wakes`, `today_awake_s` and `last_hour_wakes`. A camera
+  woken more than 12 times in an hour is also logged as a warning, with the reasons
 
 Query Messages:
 
-- `/query/battery` Request that the camera reports its battery level
-- `/query/pir` Request that the camera reports its pir status
-- `/query/ptz/preset` Request that the camera reports its PTZ presets
+Each query is answered on its own topic with `OK` or `FAIL: <why>`. A query never
+wakes a sleeping (battery) camera unless its payload is `fresh`; always-on
+cameras answer every query live.
+
+- `/query/battery` Request that the camera reports its battery level. A sleeping
+  camera answers with the reading from its last wake (`OK: saved 120 s ago ...`),
+  or `FAIL` if there is none yet. With the payload `fresh` it wakes the camera,
+  unless the saved reading is at most 60 s old
+- `/query/pir` Request that the camera reports its pir status. On a sleeping
+  camera this needs the payload `fresh`, unless the camera is awake anyway
+- `/query/ptz/preset` Request that the camera reports its PTZ presets (as
+  `/query/pir` for sleeping cameras)
 - `/query/preview` Request that the camera post a base64 encoded jpeg
-  of the stream to `/status/preview` now, ignoring the timer
+  of the stream to `/status/preview` now, ignoring the timer. A sleeping camera
+  posts the snapshot from its last wake; `fresh` wakes it as for `/query/battery`
+
+Concurrent `fresh` queries on the same topic share one wake: the extra ones are
+answered `OK: a fresh query is already waking the camera; its answer follows`.
+Retained `control` and `query` messages are ignored.
 
 ### Controlling RTSP from MQTT
 
@@ -552,11 +577,15 @@ These wake it:
   camera stream and so wakes it, including a `DESCRIBE`-only health check. The native
   backend answers `DESCRIBE` from a cache and wakes the camera only on `PLAY`, or to
   learn a stream it has never seen (at most once per camera per 10 minutes).
-- **MQTT `control/*` and `query/*` messages**, while the command runs.
-  `control/wakeup <minutes>` keeps the camera awake for that many minutes.
-- **CLI commands**: `image`, `pir`, `ptz`, `reboot`, `status-light`, `talk` and so on.
-  `battery` prints the reading saved at the last wake without waking the camera;
-  `battery --fresh`, or having no saved reading yet, wakes it.
+- **MQTT `control/*` messages**, while the command runs (at most 60 s each).
+  `control/wakeup <minutes>` keeps the camera awake for that many minutes, at most 30;
+  a new one replaces the pending one and `0` cancels it.
+- **MQTT `query/*` messages with the payload `fresh`** (several at once share one wake;
+  a battery or preview reading at most 60 s old is answered without waking). Without
+  `fresh`, queries are answered from the last wake and never wake the camera.
+- **CLI commands**: `pir`, `ptz`, `reboot`, `status-light`, `talk` and so on.
+  `battery` and `image` print what was saved at the last wake without waking the camera;
+  `--fresh`, or having nothing saved yet, wakes it (`image --use-stream` always does).
 - **`/<camera>/snapshot.jpg?fresh=1`** on the snapshot endpoint, only when the camera has
   `snapshot_fresh = true`, and at most once a minute.
 
@@ -566,7 +595,9 @@ These **never** wake it:
 - motion (the camera sends motion events only over an open connection, see below).
 
 Each time a sleeping camera is released, neolink logs one line at info level, for example
-`argus: awake 23.4 s for stream:Main; today: 3 wakes, 71 s awake`.
+`argus: awake 23.4 s for stream:Main; today: 3 wakes, 71 s awake`. With MQTT, the same
+ledger is published retained on `neolink/<camera>/status/wakes`, and a camera woken more
+than 12 times in an hour is logged as a warning naming what woke it.
 
 #### What changes for a sleeping camera
 
@@ -744,6 +775,10 @@ the camera from the config to save the image from.
 
 File is always jpeg and the extension given in filepath will be added or changed
 to reflect this.
+
+By default this writes the snapshot taken during the camera's last wake, without
+waking it, and prints its age. Add `--fresh` to wake the camera for a new one
+(also done when nothing is saved yet). `--use-stream` always wakes the camera.
 
 Some cameras do not support the SNAP command that is used to generate the image
 on the camera. If this is the case with your camera you can try the

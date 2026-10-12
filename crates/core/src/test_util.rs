@@ -64,6 +64,8 @@ pub struct FakeCameraConfig {
     pub chunk_size: usize,
     /// JPEG returned by snapshot requests; `None` answers them with 400
     pub snapshot: Option<Arc<Vec<u8>>>,
+    /// Message ids always answered with 500 (a read the camera won't serve)
+    pub fail_msgs: Vec<u32>,
 }
 
 impl Default for FakeCameraConfig {
@@ -81,6 +83,7 @@ impl Default for FakeCameraConfig {
             loop_media: false,
             chunk_size: 40_000,
             snapshot: Some(Arc::new(b"\xff\xd8fake jpeg\xff\xd9".to_vec())),
+            fail_msgs: vec![],
         }
     }
 }
@@ -384,6 +387,9 @@ impl Conn {
             _ => None,
         };
         let config = self.shared.config.clone();
+        if config.fail_msgs.contains(&meta.msg_id) {
+            return self.reply(meta, 500, None).await;
+        }
         match meta.msg_id {
             MSG_ID_LOGIN if meta.class == 0x6514 => {
                 // Legacy login (or the discovery probe): offer an unencrypted upgrade

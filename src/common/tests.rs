@@ -7,12 +7,8 @@ use std::time::Duration;
 
 /// A camera config that reaches `cam` over TCP, with extra TOML lines
 pub(crate) fn config_for(cam: &FakeCamera, extra: &str) -> CameraConfig {
-    // State files of all tests go to one temporary directory; the fake's port keeps
-    // them apart
-    std::env::set_var(
-        "NEOLINK_STATE_DIR",
-        std::env::temp_dir().join(format!("neolink-tests-{}", std::process::id())),
-    );
+    // State files of all tests go to one temporary directory (`state_dir` under test);
+    // the fake's port keeps them apart
     let text = format!(
         "name = \"fake\"\nusername = \"admin\"\npassword = \"fakepass\"\naddress = \"{}\"\n{}",
         cam.addr(),
@@ -549,4 +545,43 @@ async fn test_shutdown_during_backoff_is_fast() {
         "shutdown took {:?}",
         t.elapsed()
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Battery-safety review: one failing read must not starve the others
+
+/// P5, P7: a camera that won't answer one wake read (UID, version) still gets its
+/// snapshot, stream list and battery saved; before, the first failure ended the wake reads,
+/// so the snapshot endpoint and MQTT served nothing for that camera, forever
+#[tokio::test]
+async fn test_wake_reads_survive_a_failing_read() {
+    use neolink_core::bc::model::{MSG_ID_UID, MSG_ID_VERSION};
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cam = FakeCamera::start(FakeCameraConfig {
+        fail_msgs: vec![MSG_ID_UID, MSG_ID_VERSION],
+        // The first battery read fails (busy after waking), so the later retries matter
+        battery_busy_reads: 1,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let neocam = new_neocam(config_for(&cam, "idle_grace_s = 30")).await;
+    let instance = neocam.subscribe().await.unwrap();
+    instance
+        .run_task(|cam| Box::pin(async move { Ok(cam.get_linktype().await?) }))
+        .await
+        .unwrap();
+    let state = neocam.state();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let s = state.load();
+        if s.snapshot_at.is_some() && s.last_battery.is_some() && !s.supported_streams.is_empty()
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "state: {:?}", s);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(state.load().uid, None);
+    assert_eq!(cam.stats().logins, 1, "the reads must not cause another wake");
 }
