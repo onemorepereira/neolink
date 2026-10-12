@@ -235,8 +235,10 @@ Control messages:
 - `/control/floodlight [on|off]` Turns floodlight (if equipped) on/off
 - `/control/floodlight_tasks [on|off]` Turns floodlight (if equipped) tasks on/off
   This is the automatic tasks such as on motion and night triggers
-- `/control/wakeup (mins)` For cameras that are using `idle_disconnect` this will
-  force a wakeup for at least the given minutes
+- `/control/wakeup (mins)` Keep a sleeping camera awake for the given whole
+  minutes, at most 30 (larger values are capped, anything else is rejected with a
+  `FAIL:` reply). A new wakeup replaces the pending one instead of adding to it, and
+  `0` cancels it. It also ends when neolink stops or the camera is removed
 - `/control/siren on` Signal the siren, the message is always "on" as there is no
   "off" signal for the siren
 
@@ -244,13 +246,16 @@ Status Messages:
 
 - `/status disconnected` Sent when the camera goes offline
 - `/status/battery` Sent in reply to a `/query/battery` an XML encoded version
-  of the battery status
+  of the battery status. For a sleeping camera this is the reading from its last
+  wake; the reply on `/query/battery` gives its age
 - `/status/battery_level` A simple % value of current battery level, only
   published when `enable_battery` is true in the config
 - `/status/pir` Sent in reply to a `/query/pir` an XML encoded version of the
   pir status
 - `/status/motion` Contains the motion detection alarm status. `on` for motion
-  and `off` for still, only published when `enable_moton` is true in the config
+  and `off` for still, only published when `enable_moton` is true in the config.
+  Motion that is `on` when the camera goes to sleep (or its connection drops) is
+  published as `off`
 - `/status/ptz/preset` Sent in reply to a `/query/ptz/preset` an XML encoded
   version of the PTZ presets
 - `/status/preview` a base64 encoded camera image updated every 2s. Not
@@ -259,14 +264,33 @@ Status Messages:
   `enable_preview` is true in the config
 - `/status/floodlight_tasks` The current status of the floodlight tasks
   used updated every 2s by default
+- `/status/wakes` The wake ledger, retained, published whenever the camera wakes
+  or goes back to sleep: JSON with `awake`, `reason` (what woke it, e.g.
+  `mqtt:control/wakeup`, `mqtt:query/battery` or `stream:Main`), `since` (Unix seconds),
+  `last_awake_s`, `today_wakes`, `today_awake_s` and `last_hour_wakes`. A camera
+  woken more than 12 times in an hour is also logged as a warning, with the reasons
 
 Query Messages:
 
-- `/query/battery` Request that the camera reports its battery level
-- `/query/pir` Request that the camera reports its pir status
-- `/query/ptz/preset` Request that the camera reports its PTZ presets
+Each query is answered on its own topic with `OK` or `FAIL: <why>`. A query never
+wakes a sleeping (battery) camera unless its payload is `fresh`; always-on
+cameras answer every query live.
+
+- `/query/battery` Request that the camera reports its battery level. A sleeping
+  camera answers with the reading from its last wake (`OK: saved 120 s ago ...`),
+  or `FAIL` if there is none yet. With the payload `fresh` it wakes the camera,
+  unless the saved reading is at most 60 s old
+- `/query/pir` Request that the camera reports its pir status. On a sleeping
+  camera this needs the payload `fresh`, unless the camera is awake anyway
+- `/query/ptz/preset` Request that the camera reports its PTZ presets (as
+  `/query/pir` for sleeping cameras)
 - `/query/preview` Request that the camera post a base64 encoded jpeg
-  of the stream to `/status/preview` now, ignoring the timer
+  of the stream to `/status/preview` now, ignoring the timer. A sleeping camera
+  posts the snapshot from its last wake; `fresh` wakes it as for `/query/battery`
+
+Concurrent `fresh` queries on the same topic share one wake: the extra ones are
+answered `OK: a fresh query is already waking the camera; its answer follows`.
+Retained `control` and `query` messages are ignored.
 
 ### Controlling RTSP from MQTT
 
@@ -523,6 +547,10 @@ the camera from the config to save the image from.
 File is always jpeg and the extension given in filepath will be added or changed
 to reflect this.
 
+By default this writes the snapshot taken during the camera's last wake, without
+waking it, and prints its age. Add `--fresh` to wake the camera for a new one
+(also done when nothing is saved yet). `--use-stream` always wakes the camera.
+
 Some cameras do not support the SNAP command that is used to generate the image
 on the camera. If this is the case with your camera you can try the
 `--use-stream` option which will instead create a jpeg by transcoding the video
@@ -536,7 +564,9 @@ You can get the battery level and status using
 neolink battery --config=config.toml CameraName
 ```
 
-This will produce an xml formatted battery status on stdout for processing
+This will produce an xml formatted battery status on stdout for processing.
+It is the reading from the camera's last wake, so it doesn't wake the camera; add
+`--fresh` to wake it for a new reading.
 
 ### PIR
 
