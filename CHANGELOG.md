@@ -11,7 +11,8 @@ camera set `idle_disconnect = true`. Now **a camera with neither `battery` nor
 `idle_disconnect` in its config sleeps**:
 - neolink does not contact it at startup;
 - it connects only while something uses the camera: an RTSP client, an MQTT
-  `control/*` or `query/*` message, a CLI command, or a `snapshot.jpg?fresh=1`;
+  `control/*` message or a `query/*` with the payload `fresh`, a CLI command, or a
+  `snapshot.jpg?fresh=1`;
 - it logs out and disconnects `idle_grace_s` seconds (default 10) after the last use.
 
 This applies to both RTSP backends (GStreamer and native) and to every mode. It is the
@@ -67,8 +68,19 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
   - New top-level `mqtt_config_writes` (default `true`): set `false` to stop MQTT clients
     rewriting the config. Neolink warns at startup when it is on and users are
     configured.
-- **CLI `battery`** prints the reading saved at the camera's last wake, without waking it;
-  `--fresh` wakes the camera for a new reading.
+- **MQTT on sleeping cameras.**
+  - `control/wakeup <minutes>` is capped at 30 minutes (larger values are capped,
+    non-numbers get `FAIL:`), a new wakeup replaces the pending one, `0` cancels it, and
+    it ends when neolink stops or the camera is removed. Before, any value was accepted
+    and wakeups stacked, so a camera could be held awake indefinitely.
+  - `query/battery` and `query/preview` answer from the last wake (the reply gives its
+    age); `query/pir` and `query/ptz/preset` answer only while the camera is awake. The
+    payload `fresh` wakes the camera; concurrent `fresh` queries share one wake.
+  - `status/motion` is published `off` when the camera sleeps or drops mid-motion,
+    instead of staying `on`.
+  - MQTT wakes are recorded as `mqtt:<topic>` in the wake ledger.
+- **CLI `battery` and `image`** print what was saved at the camera's last wake, without
+  waking it; `--fresh` wakes the camera (`image --use-stream` always does).
 - **Config.** Unknown keys (for example a misspelt `idle_disconect`) are reported with a
   warning instead of being silently ignored. Secrets are redacted from config debug
   output.
@@ -91,7 +103,9 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
   last wake (UID, model, firmware, streams, battery reading, snapshot). A lock file warns
   when a second neolink process uses the same camera.
 - **Wake ledger**: an info line each time a sleeping camera is released, with why it was
-  awake and the day's totals.
+  awake and the day's totals; published retained on MQTT as
+  `neolink/<camera>/status/wakes` (JSON); a warning when a camera wakes more than 12 times
+  in an hour.
 - **New camera keys**: `battery`, `idle_grace_s`, `motion_hold_max_s`, `snapshot_fresh`.
   `idle_disconnect` is unchanged in meaning but now defaults to "follow `battery`".
 - A warning when a sleeping camera has streamed for 30 min straight.
