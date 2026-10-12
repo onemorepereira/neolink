@@ -1,5 +1,5 @@
 #!/bin/sh
-# Gate 3 client acceptance (SPEC §7: A1, A2, A2b, A4, A4b, A5, A10; PLAN 3.9/3.11) against
+# Gate 3 client acceptance (SPEC §7: A1, A2, A2b, A4, A4b, A5, A10, A11b; PLAN 3.9/3.11) against
 # the native server (xtask rtsp-serve) on the synthetic fixtures, with real clients:
 # ffprobe/ffmpeg, go2rtc and VLC (cvlc).
 # Runs in the neolink-clients image (tests/e2e/clients/Containerfile) with --network host,
@@ -8,8 +8,10 @@
 # Exit status: the number of failed checks; 2 when a server or go2rtc did not start.
 # E2E_WORK must be a fresh directory (nothing in it is deleted or reused).
 # Env: TESTS (default "A1 A2 A2b A4 A4b A5 A10"), A2_SECS (120), A2B_SECS (20),
-#      A5_SECS (60; the full gate is 300), PSETS (the --parameter-sets mode for the main
-#      server, default the server's own), A4B_MODES ("strip passthrough inject"),
+#      A5_SECS (60; the full gate is 300), A11B_SECS (240: two congestion episodes),
+#      A11B_LATENCIES (pacing latencies, ms, run side by side; at most 2, default "300 1500"),
+#      A11B_VLC_STALL (VLC's longest allowed display freeze, s, default 18),
+#      PSETS (the --parameter-sets mode for the main server, default the server's own), A4B_MODES ("strip passthrough inject"),
 #      A4B_GATE (the A4b modes that must pass, default "strip"),
 #      PORT (base port, default 48710; uses PORT..PORT+29),
 #      SERVER (rtsp-serve, the default, or neolink: `neolink rtsp` on the native backend
@@ -26,6 +28,9 @@ TESTS=${TESTS:-A1 A2 A2b A4 A4b A5 A10}
 A2_SECS=${A2_SECS:-120}
 A2B_SECS=${A2B_SECS:-20}
 A5_SECS=${A5_SECS:-60}
+A11B_SECS=${A11B_SECS:-240}
+A11B_LATENCIES=${A11B_LATENCIES:-300 1500}
+A11B_VLC_STALL=${A11B_VLC_STALL:-18}
 PSETS=${PSETS:-}
 A4B_MODES=${A4B_MODES:-strip passthrough inject}
 # Modes whose A4b result gates the run (the default); the others are reported as INFO
@@ -46,6 +51,9 @@ want() { case " $TESTS " in *" $1 "*) return 0;; esac; return 1; }
 wait_for() { # file [tenths]
   i=0; until [ -e "$1" ] || [ $i -gt "${2:-100}" ]; do sleep 0.1; i=$((i+1)); done
   [ -e "$1" ]
+}
+a11b_idx() { # latency -> its slot (0 or 1) among A11B_LATENCIES
+  n=0; for x in $A11B_LATENCIES; do [ "$x" = "$1" ] && { echo $n; return; }; n=$((n+1)); done; echo 0
 }
 cleanup() { for p in $PIDS; do kill -TERM "$p" 2>/dev/null; done; wait 2>/dev/null; }
 trap cleanup EXIT
@@ -197,6 +205,7 @@ go2rtc_start() {
     echo "  a10_notpermitted: rtsp://bob:bobpw@127.0.0.1:$((PORT+20))/argus/main"
     echo "  a10_anyone_valid: rtsp://bob:bobpw@127.0.0.1:$((PORT+23))/argus/main"
     echo "  a10_anyone_none: rtsp://127.0.0.1:$((PORT+23))/argus/main"
+    for l in $A11B_LATENCIES; do echo "  a11b_$l: rtsp://127.0.0.1:$((PORT+24+$(a11b_idx "$l")))/argus/main"; done
   } > "$W/go2rtc.yaml"
   go2rtc -config "$W/go2rtc.yaml" > "$W/go2rtc.log" 2>&1 &
   G2R=$!; PIDS="$PIDS $G2R"
@@ -276,6 +285,118 @@ if want A5; then
   msg="main ${A5_SECS}s: decoded=${dec:-0} displayed=${shown:-0} (min $minf) lost=${lost:-?} audio-decoded=${adec:-0} too-late=$late"
   if [ "${shown:-0}" -ge $minf ] && [ "${adec:-0}" -gt 0 ] && [ $((late * 60)) -lt "$A5_SECS" ]; then pass "A5 $msg"
   else fail "A5 $msg"; grep -i -E 'error|too late' "$W/a5.vlc.log" | head -5; fi
+fi
+
+# ---- A11b: congestion episodes (forward wire-clock rebases), ffmpeg, go2rtc and VLC -------------
+# The looped congestion fixture (an episode ~58 s into each 120 s lap) at each pacing
+# latency in A11B_LATENCIES, all at once, for A11B_SECS (2 episodes need 230 s: the second
+# catch-up skip is at ~218 s). The server logs each rebase over 1 s at info.
+a11b_vlc_poll() { # rc-port secs out: "secs-since-start displayed" once a second, then quit
+  python3 -I -c '
+import re, socket, sys, time
+port, secs, out = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
+t0 = time.monotonic(); s = None
+with open(out, "w") as f:
+    while time.monotonic() - t0 < secs:
+        t = time.monotonic()
+        try:
+            if s is None:
+                s = socket.create_connection(("127.0.0.1", port), timeout=2); s.settimeout(0.3)
+            s.sendall(b"stats\n"); time.sleep(0.3); buf = b""
+            try:
+                while True:
+                    b = s.recv(65536)
+                    if not b: break
+                    buf += b
+            except socket.timeout: pass
+            m = re.findall(rb"frames displayed\s*:\s*(\d+)", buf)
+            if m: f.write("%.1f %s\n" % (t - t0, m[-1].decode())); f.flush()
+        except OSError: s = None
+        time.sleep(max(0.0, 1 - (time.monotonic() - t)))
+    s and s.close()' "$@"
+}
+a11b_run() { # latency-ms: one server and its clients; writes $W/a11b.$1.*
+  l=$1; i=$(a11b_idx "$l"); p=$((PORT+24+i)); rc=$((PORT+26+i)); L=$W/a11b.$l
+  "$BIN/xtask" rtsp-serve --bind 127.0.0.1:$p --main "$F/congestion_h265.bcm" --loop --latency-ms "$l" \
+    --ready-file "$L.ready" --stats "$L.stats.json" > "$L.server.log" 2>&1 &
+  srv=$!
+  wait_for "$L.ready" || { echo "a11b $l: the server did not start" > "$L.err"; kill $srv; return; }
+  # Recorders: -c copy, stopped by SIGINT at the end (exit 124 from timeout: it ran to the end)
+  timeout -s INT "$A11B_SECS" "$FFMPEG" -nostdin -v error -rtsp_transport tcp -i "rtsp://127.0.0.1:$p/argus/main" \
+    -map 0 -c copy -y "$L.ffmpeg.mkv" > "$L.ffmpeg.log" 2>&1 &
+  f1=$!
+  timeout -s INT "$A11B_SECS" "$FFMPEG" -nostdin -v error -rtsp_transport tcp -i "rtsp://127.0.0.1:$G2R_RTSP/a11b_$l" \
+    -map 0 -c copy -y "$L.go2rtc.mkv" > "$L.go2rtc.log" 2>&1 &
+  f2=$!
+  timeout $((A11B_SECS+30)) runuser -u vlc -- cvlc -I rc --rc-host "127.0.0.1:$rc" --rtsp-tcp \
+    --vout=dummy --aout=dummy --no-video-title-show --stats -vv "rtsp://127.0.0.1:$p/argus/main" \
+    > "$L.vlc.log" 2>&1 < /dev/null &
+  v=$!
+  a11b_vlc_poll "$rc" "$A11B_SECS" "$L.vlc.stats"
+  e1=0; wait $f1 || e1=$?; e2=0; wait $f2 || e2=$?
+  sleep 2; vx=0; kill -0 $v 2>/dev/null || vx=1; kill -TERM $v 2>/dev/null; wait $v 2>/dev/null
+  echo "$e1 $e2 $vx" > "$L.exits"
+  if kill -0 $srv 2>/dev/null; then stop $srv; else echo "a11b $l: the server exited" > "$L.err"; fi
+}
+a11b_rec() { # latency client exit: the recording ran to the end, decodes cleanly, timeline
+  # tracks wall time, A/V stays in sync across the rebases
+  l=$1; c=$2; RL=$W/a11b.$l.$c
+  dec=1; errs="?"; span=0
+  if [ -s "$RL.mkv" ]; then
+    timeout 120 "$FFMPEG" -nostdin -v error -i "$RL.mkv" -f null - > "$RL.decode.log" 2>&1; dec=$?
+    errs=$(wc -l < "$RL.decode.log")
+    span=$("$FFPROBE" -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$RL.mkv" \
+      | awk -F, '$1 != "" && $1 != "N/A" {if (n++ == 0) lo = $1; if ($1 > hi) hi = $1} END {printf "%.1f", hi - lo}')
+    # Audio pts must never go back
+    aback=$("$FFPROBE" -v error -select_streams a:0 -show_entries packet=pts_time -of csv=p=0 "$RL.mkv" \
+      | awk -F, '$1 != "" && $1 != "N/A" {if (n++ && $1 < p) b++; p = $1} END {print b + 0}')
+    "$BIN/xtask" avsync --min-pairs 1 "$RL.mkv" > "$RL.avsync" 2>&1; av=$?
+  else aback="?"; av=1; echo "no recording" > "$RL.avsync"; fi
+  pairs=$(sed -n 's/^pairs \([0-9]*\).*/\1/p' "$RL.avsync"); worst=$(sed -n 's/.*worst |\([0-9.]*\)|.*/\1/p' "$RL.avsync")
+  minpairs=$(awk -v s="$span" 'BEGIN {printf "%d", s / 2 * 0.75}')
+  # Wire time follows wall time: the recording spans the run less the start-up (about 4 s);
+  # a ratchet ahead (the bug PR #6 fixed: about +4 s per bridged episode) makes it longer
+  drift=$(awk -v s="$span" -v w="$A11B_SECS" 'BEGIN {printf "%.1f", s - w}')
+  driftok=$(awk -v d="$drift" 'BEGIN {print (d >= -10 && d <= 2) ? 1 : 0}')
+  msg="latency ${l}ms $c: exit=$3 (124: ran to the end) decode-exit=$dec decode-errors=$errs span=${span}s (run ${A11B_SECS}s, drift ${drift}s, want -10..+2) audio-pts-back=$aback A/V pairs=${pairs:-0} (min $minpairs) worst=${worst:-?}ms (max 150)"
+  if [ "$3" = 124 ] && [ $dec = 0 ] && [ "$errs" = 0 ] && [ "$driftok" = 1 ] && [ "$aback" = 0 ] \
+     && [ $av = 0 ] && [ "${pairs:-0}" -ge "$minpairs" ]; then pass "A11b $msg"
+  else fail "A11b $msg"; head -3 "$RL.decode.log" 2>/dev/null; tail -3 "$RL.avsync"; tail -3 "$W/a11b.$l.$c.log"; fi
+}
+if want A11b; then
+  if [ "${SERVER:-rtsp-serve}" = neolink ]; then
+    info "A11b: rtsp-serve only (it needs --latency-ms and the congestion fixture)"
+  else
+    go2rtc_start
+    A11B_PIDS=""
+    for l in $A11B_LATENCIES; do a11b_run "$l" & A11B_PIDS="$A11B_PIDS $!"; done
+    PIDS="$PIDS $A11B_PIDS"
+    for p in $A11B_PIDS; do wait "$p"; done
+    for l in $A11B_LATENCIES; do
+      L=$W/a11b.$l
+      if [ -s "$L.err" ]; then fail "A11b latency ${l}ms: $(cat "$L.err")"; tail -5 "$L.server.log"; continue; fi
+      # The episodes happened: logged forward rebases over 1 s, and the guard never engaged
+      reb=$(count 'INFO .*wire clock rebased' "$L.server.log")
+      guard=$(sed -n 's/.*"guard_engaged":\([0-9]*\).*/\1/p' "$L.stats.json")
+      msg="latency ${l}ms: $reb logged rebases > 1 s (min 2), guard_engaged=${guard:-?}"
+      if [ "$reb" -ge 2 ] && [ "${guard:-1}" = 0 ]; then pass "A11b $msg"; else fail "A11b $msg"; fi
+      read -r e1 e2 vx < "$L.exits"
+      a11b_rec "$l" ffmpeg "$e1"
+      a11b_rec "$l" go2rtc "$e2"
+      # VLC: still playing at the end, 85 % of the frames shown, no display freeze longer
+      # than A11B_VLC_STALL. Measured: at most 14 s, at an underrun, not a rebase: frames
+      # come late after an arrival gap, VLC raises its pts_delay (to 2.8 s by the second
+      # episode) and re-buffers; after a 13 s forward rebase it recovers in 5-8 s. A client
+      # that froze for the length of each step would fail both bounds
+      st=$(awk -v w="$A11B_SECS" 'NR == 1 {lt = $1; ld = $2} $2 > ld {if ($1 - lt > m) m = $1 - lt; lt = $1}
+        {ld = $2; last = $1} END {if (last - lt > m) m = last - lt; printf "%.0f %d", m, ld}' "$L.vlc.stats")
+      stall=${st% *}; shown=${st#* }
+      minf=$((A11B_SECS * FPS * 85 / 100))
+      msg="latency ${l}ms vlc: playing-at-end=$((1 - vx)) displayed=${shown:-0} (min $minf) longest-freeze=${stall:-?}s (max $A11B_VLC_STALL) too-late=$(count 'picture is too late' "$L.vlc.log")"
+      if [ "$vx" = 0 ] && [ "${shown:-0}" -ge $minf ] && [ "${stall:-99}" -le "$A11B_VLC_STALL" ]; then pass "A11b $msg"
+      else fail "A11b $msg"; grep -E 'PCR|deadlock|buffering done' "$L.vlc.log" | head -8; fi
+    done
+  fi
 fi
 
 # ---- A10: the auth matrix, per client --------------------------------------------------------
