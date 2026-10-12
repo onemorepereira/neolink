@@ -39,20 +39,32 @@ jobs:
         name: apt install linux deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgstrtspserver-1.0-dev \
+          # The runner image ships libunwind-14-dev, which conflicts with the libunwind-dev
+          # that libgstreamer1.0-dev needs; naming libunwind-dev makes apt swap them
+          sudo apt-get install -y --no-install-recommends libunwind-dev libgstrtspserver-1.0-dev \
             libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
       - if: runner.os == 'Windows'
         name: Install Windows deps
         shell: pwsh
         run: |
-          # Gstreamer
-          choco install -y --no-progress gstreamer --version=1.24.2
-          choco install -y --no-progress gstreamer-devel --version=1.24.2
-          $env:GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:SYSTEMDRIVE + '\gstreamer\1.0\msvc_x86_64\'
-          # Github runners work on both C or D drive and figuring out which was used is difficult
-          if (-not (Test-Path -Path "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64" -PathType Container)) {
-            $env:GSTREAMER_1_0_ROOT_MSVC_X86_64='D:\\gstreamer\1.0\msvc_x86_64\'
+          # GStreamer from gstreamer.freedesktop.org, pinned and checked. Old point releases
+          # are deleted there; the last release of a series (1.24.13) is kept.
+          $base = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.24.13/msvc'
+          $msis = @{
+            'gstreamer-1.0-msvc-x86_64-1.24.13.msi' = '66915d82adda34189703c36a5d2ef145d2e3afb7afc12c66fcf2ea506e2466d2'
+            'gstreamer-1.0-devel-msvc-x86_64-1.24.13.msi' = '0afb4394c2cba3999c0f5e74f28c2ac5d98f03131140e09246d4dcd60a0a0395'
           }
+          foreach ($msi in $msis.Keys) {
+            $file = Join-Path $env:RUNNER_TEMP $msi
+            Invoke-WebRequest -Uri "$base/$msi" -OutFile $file
+            $hash = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLower()
+            if ($hash -ne $msis[$msi]) { throw "$msi sha256 $hash, expected $($msis[$msi])" }
+            $p = Start-Process msiexec -ArgumentList '/i', "`"$file`"", '/qn', 'ADDLOCAL=ALL' -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "msiexec $msi exited $($p.ExitCode)" }
+          }
+          # The installer sets the root machine-wide; this step's environment predates it
+          $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = [Environment]::GetEnvironmentVariable('GSTREAMER_1_0_ROOT_MSVC_X86_64', 'Machine')
+          if (-not $env:GSTREAMER_1_0_ROOT_MSVC_X86_64) { throw 'GSTREAMER_1_0_ROOT_MSVC_X86_64 not set by the installer' }
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
 
           # Proto buffers
@@ -78,7 +90,6 @@ jobs:
           # Set github vars
           Add-Content -Path $env:GITHUB_ENV  -Value "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
           Add-Content -Path $env:GITHUB_PATH  -Value "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\bin"
-          Add-Content -Path $env:GITHUB_PATH  -Value "%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin"
           Add-Content -Path $env:GITHUB_ENV  -Value "OPENSSL_DIR=$env:OPENSSL_DIR"
 
           # One last check on directories
@@ -87,8 +98,17 @@ jobs:
       - if: runner.os == 'macOS'
         name: Install macOS deps
         run: |
-          curl -fL 'https://gstreamer.freedesktop.org/data/pkg/osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg' -o "$(pwd)/gstreamer-devel.pkg"
-          sudo installer -verbose -pkg "$(pwd)/gstreamer-devel.pkg" -target /
+          # Pinned and checked; old point releases are deleted upstream, the last release of a
+          # series (1.24.13) is kept. The runtime package, then the headers and .pc files.
+          base=https://gstreamer.freedesktop.org/data/pkg/osx/1.24.13
+          while read -r sha pkg; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$pkg" "$base/$pkg"
+            echo "$sha  $RUNNER_TEMP/$pkg" | shasum -a 256 -c -
+            sudo installer -pkg "$RUNNER_TEMP/$pkg" -target /
+          done <<'PKGS'
+          a18458c7cd61e5f2c71bb17c6eb88d54493adb964ec30dd53d96244aac537839 gstreamer-1.0-1.24.13-universal.pkg
+          95633de7eec859e1dbfc4e8e7b650b78a47a31075735eee7550ccf9b919ba398 gstreamer-1.0-devel-1.24.13-universal.pkg
+          PKGS
           PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           PKG_CONFIG_GSTREAMER_1_0_PREFIX="/Library/Frameworks/GStreamer.framework/Versions/1.0"
           {
