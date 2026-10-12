@@ -15,6 +15,19 @@ use bytes::Bytes;
 /// (ffmpeg: "non monotonically increasing dts"); the Hub sets it from the stream's fps.
 pub const RELATCH_MIN_GAP_US: u64 = 67_667;
 
+/// Seconds between 1900 (NTP) and 1970
+const NTP_UNIX_OFFSET_S: u64 = 2_208_988_800;
+
+/// The system clock as NTP µs (since 1900). A Hub takes it with its wire clock's epoch,
+/// so that SR NTP times (epoch + wire time) start at real time (DESIGN §5.3)
+pub fn ntp_now_us() -> u64 {
+    let unix_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    unix_us + NTP_UNIX_OFFSET_S * 1_000_000
+}
+
 /// A track of a stream
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Track {
@@ -82,16 +95,20 @@ impl WireClock {
         }
     }
 
-    /// Re-latch so that `media_us` is on the wire at `virtual_now` (resume after a bridge,
-    /// or a MediaClock discontinuity)
+    /// Re-latch so that the video frame at `media_us` is on the wire at `virtual_now`
+    /// (resume after a bridge, or a MediaClock discontinuity)
     pub fn relatch(&mut self, media_us: u64, now_wall: u64) {
-        // After anything already sent by a real step, even when no wall time has passed
+        // After the last video frame by a real step, even when no wall time has passed
         // (frames released together after a camera reconnect): a 1 µs step is below the
-        // 90 kHz RTP tick and the millisecond of recordings (duplicate DTS in ffmpeg)
-        let mut v = match self.last_out {
-            Some((wire, _)) => self.virtual_now(now_wall).max(wire + self.min_gap_us),
-            None => self.virtual_now(now_wall),
-        };
+        // 90 kHz RTP tick and the millisecond of recordings (duplicate DTS in ffmpeg).
+        // Not after the last audio AU: that one is usually released moments earlier, and
+        // a frame interval after it puts video ahead of the wall clock for good, a little
+        // more at every discontinuity. Live audio that would not follow its last AU is
+        // dropped by `stamp_if_after`; `virtual_now` is never behind any track
+        let mut v = self.virtual_now(now_wall);
+        if let Some(last) = self.last_track[Track::Video.index()] {
+            v = v.max(last + self.min_gap_us);
+        }
         if let Some(r) = self.last_restamp {
             v = v.max(r + self.min_gap_us);
         }
@@ -475,6 +492,30 @@ mod tests {
         clock.relatch(10_000, 5_000_000);
         let b = clock.stamp(Track::Video, 10_000, 5_000_000);
         assert!(b >= a + RELATCH_MIN_GAP_US, "{a} then {b}");
+        assert_eq!(clock.stats.guard_engaged, 0);
+    }
+
+    /// A discontinuity frame released on schedule, one frame after the last video frame
+    /// and just after an audio AU: it lands one step after the last video frame, at wall
+    /// time, not a frame interval after the audio AU (which ratcheted wire time ahead of
+    /// the wall clock at every discontinuity)
+    #[test]
+    fn test_relatch_gap_is_to_the_last_video_frame() {
+        let mut clock = WireClock::new();
+        let v = clock.stamp(Track::Video, 1_000_000, 5_000_000);
+        assert_eq!(v, 5_000_000);
+        let a = clock.stamp(Track::Audio, 1_060_000, 5_060_000);
+        assert_eq!(a, 5_060_000);
+        clock.relatch(10_000, 5_066_667);
+        let w = clock.stamp(Track::Video, 10_000, 5_066_667);
+        assert_eq!(
+            w,
+            v + RELATCH_MIN_GAP_US,
+            "lead {} µs",
+            w as i64 - 5_066_667
+        );
+        // Audio from the old timeline that would not follow its last AU is dropped
+        assert_eq!(clock.stamp_if_after(Track::Audio, 0, 5_070_000), None);
         assert_eq!(clock.stats.guard_engaged, 0);
     }
 

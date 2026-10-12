@@ -2,7 +2,9 @@
 //! (DESIGN §5.2, §5.3, §6.2, §6.3, §6.6; SPEC R4–R6, R12, R13, R23–R25)
 
 use super::auth::{Allowed, Auth, Decision};
-use super::headers::{choose_transport, session_id, transport_reply, TransportError};
+use super::headers::{
+    authorization, choose_transport, session_id, transport_reply, Authorization, TransportError,
+};
 use super::msg::{parse, Parsed, Request, Response};
 use super::route::{MountTarget, Routes};
 use super::sdp::sdp;
@@ -32,11 +34,15 @@ pub trait Provider: Send + Sync + 'static {
 
 pub struct ServerConfig {
     pub max_connections: usize,
+    /// Unauthenticated connections (see `Pending`) per address (IPv4, or IPv6 /64). Past
+    /// it, the address's own oldest one is closed: a flood only displaces itself
     pub max_unauthenticated_per_ip: usize,
-    /// Below max_connections, so unauthenticated clients can't take every slot
+    /// Unauthenticated connections in all. Below max_connections, so they can't take
+    /// every slot; past it, the oldest one of the address holding the most is closed, so
+    /// an address with fewer always gets in
     pub max_unauthenticated_total: usize,
-    /// With users configured, a connection must authenticate within this, unless playing
-    /// an anonymous mount
+    /// A connection with neither credentials nor a session is closed this long after it
+    /// opened (or lost its session), whatever it sends to look alive
     pub unauthenticated_lifetime: Duration,
     pub first_request_timeout: Duration,
     pub idle_timeout: Duration,
@@ -55,7 +61,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_connections: 128,
-            max_unauthenticated_per_ip: 64,
+            max_unauthenticated_per_ip: 32,
             max_unauthenticated_total: 64,
             unauthenticated_lifetime: Duration::from_secs(30),
             first_request_timeout: Duration::from_secs(10),
@@ -79,19 +85,17 @@ pub struct Server {
     auth: std::sync::RwLock<Arc<Auth>>,
     pub provider: Arc<dyn Provider>,
     connections: AtomicUsize,
-    /// Keyed by `ip_key`, as is `failed_auth`
-    unauth_per_ip: Mutex<HashMap<IpAddr, usize>>,
-    unauth_total: AtomicUsize,
-    failed_auth: Mutex<HashMap<IpAddr, FailedAuth>>,
+    next_connection: AtomicU64,
+    pending: Mutex<Pending>,
+    failed_auth: Mutex<FailedAuth>,
     next_session: AtomicU64,
-    /// Fixed at creation: NTP = ntp_epoch + wire time (DESIGN §5.3)
-    ntp_epoch_us: u64,
 }
 
 const PUBLIC: &str =
     "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER, SET_PARAMETER";
-/// Seconds between 1900 (NTP) and 1970
-const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
+/// How long accept() waits after an error that isn't the peer's (out of fds or memory):
+/// those fail at once until something closes, so retrying at once would spin
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 impl Server {
     pub fn new(
@@ -100,27 +104,27 @@ impl Server {
         auth: Auth,
         provider: Arc<dyn Provider>,
     ) -> Arc<Self> {
-        let unix_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
         Arc::new(Self {
             config,
             routes,
             auth: std::sync::RwLock::new(Arc::new(auth)),
             provider,
             connections: AtomicUsize::new(0),
-            unauth_per_ip: Mutex::new(HashMap::new()),
-            unauth_total: AtomicUsize::new(0),
-            failed_auth: Mutex::new(HashMap::new()),
+            next_connection: AtomicU64::new(0),
+            pending: Mutex::new(Pending::default()),
+            failed_auth: Mutex::new(FailedAuth::default()),
             next_session: AtomicU64::new(rand::random::<u32>() as u64),
-            ntp_epoch_us: unix_us + NTP_UNIX_OFFSET * 1_000_000,
         })
     }
 
     /// Connections open now
     pub fn connection_count(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    /// Connections holding an unauthenticated slot now
+    pub fn unauthenticated_count(&self) -> usize {
+        self.pending.lock().unwrap().conns.len()
     }
 
     /// The current users and schemes
@@ -136,16 +140,32 @@ impl Server {
 
     /// Accept connections until `cancel`
     pub async fn serve(self: Arc<Self>, listener: TcpListener, cancel: CancellationToken) {
+        let mut failing = false;
         loop {
-            let (stream, peer) = tokio::select! {
+            let v = tokio::select! {
                 _ = cancel.cancelled() => return,
-                v = listener.accept() => match v {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::debug!("accept: {e}");
-                        continue;
+                v = listener.accept() => v,
+            };
+            let (stream, peer) = match v {
+                Ok(v) => {
+                    failing = false;
+                    v
+                }
+                // That connection's problem: the next accept is fine
+                Err(e) if is_connection_error(&e) => {
+                    log::debug!("rtsp: accept: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    if !failing {
+                        log::warn!("rtsp: accept: {e}; retrying every {ACCEPT_BACKOFF:?}");
                     }
-                },
+                    failing = true;
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(ACCEPT_BACKOFF) => continue,
+                    }
+                }
             };
             let server = self.clone();
             let cancel = cancel.child_token();
@@ -153,67 +173,34 @@ impl Server {
         }
     }
 
-    fn unauth_inc(&self, ip: IpAddr) -> bool {
-        let mut m = self.unauth_per_ip.lock().unwrap();
-        if self.unauth_total.load(Ordering::SeqCst) >= self.config.max_unauthenticated_total {
-            return false;
-        }
-        let n = m.entry(ip_key(ip)).or_default();
-        if *n >= self.config.max_unauthenticated_per_ip {
-            return false;
-        }
-        *n += 1;
-        self.unauth_total.fetch_add(1, Ordering::SeqCst);
-        true
-    }
-
-    fn unauth_dec(&self, ip: IpAddr) {
-        let mut m = self.unauth_per_ip.lock().unwrap();
+    /// A new connection takes an unauthenticated slot, closing another one if the address
+    /// or the server is full (see `ServerConfig`)
+    fn pending_add(&self, id: u64, ip: IpAddr, close: CancellationToken) {
         let key = ip_key(ip);
-        if let Some(n) = m.get_mut(&key) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                m.remove(&key);
-            }
-            self.unauth_total.fetch_sub(1, Ordering::SeqCst);
+        let per_ip = self.config.max_unauthenticated_per_ip.max(1);
+        let total = self.config.max_unauthenticated_total.max(1);
+        let mut p = self.pending.lock().unwrap();
+        if p.count(key) >= per_ip {
+            p.close_oldest(key);
         }
+        if p.conns.len() >= total {
+            let heaviest = p.heaviest(key);
+            p.close_oldest(heaviest);
+        }
+        *p.per_ip.entry(key).or_default() += 1;
+        p.conns.insert(
+            id,
+            PendingConn {
+                key,
+                since: Instant::now(),
+                close,
+            },
+        );
     }
 
-    /// Failed-auth limiting per IP (per /64 for IPv6), across all its connections: past
-    /// `failed_auth_per_minute`, each failure waits for its own 1 s slot, so parallel
-    /// connections don't multiply the rate. Returns when this failure may be answered.
-    fn note_failed_auth(&self, ip: IpAddr) -> Option<Instant> {
-        let mut m = self.failed_auth.lock().unwrap();
-        let now = Instant::now();
-        let minute = Duration::from_secs(60);
-        // Bounded: forget addresses with nothing recent
-        if m.len() > 1024 {
-            m.retain(|_, f| {
-                f.next_slot > now
-                    || f.times
-                        .back()
-                        .is_some_and(|t| now.duration_since(*t) < minute)
-            });
-        }
-        let f = m.entry(ip_key(ip)).or_insert_with(|| FailedAuth {
-            times: VecDeque::new(),
-            next_slot: now,
-        });
-        while f
-            .times
-            .front()
-            .is_some_and(|t| now.duration_since(*t) >= minute)
-        {
-            f.times.pop_front();
-        }
-        f.times.push_back(now);
-        if f.times.len() > self.config.failed_auth_per_minute {
-            f.times.pop_front(); // the list never needs more than the threshold
-            let slot = f.next_slot.max(now) + Duration::from_secs(1);
-            f.next_slot = slot;
-            return Some(slot);
-        }
-        None
+    /// The connection authenticated, has a session or closed: its slot is free
+    fn pending_remove(&self, id: u64) {
+        self.pending.lock().unwrap().remove(id);
     }
 
     async fn connection(
@@ -223,13 +210,13 @@ impl Server {
         cancel: CancellationToken,
     ) {
         let ip = peer.ip();
-        if self.connections.fetch_add(1, Ordering::SeqCst) >= self.config.max_connections
-            || !self.unauth_inc(ip)
-        {
+        if self.connections.fetch_add(1, Ordering::SeqCst) >= self.config.max_connections {
             let _ = stream.write_all(&Response::new(503).to_bytes(None)).await;
             self.connections.fetch_sub(1, Ordering::SeqCst);
             return;
         }
+        let id = self.next_connection.fetch_add(1, Ordering::Relaxed);
+        self.pending_add(id, ip, cancel.clone());
         set_socket_options(&stream, self.config.send_buffer);
         let local_ip = stream
             .local_addr()
@@ -243,23 +230,21 @@ impl Server {
         let writer_done = CancellationToken::new();
         let writer = tokio::spawn({
             let (done, cancel) = (writer_done.clone(), writer_cancel.clone());
-            let (stall, sr, epoch) = (
-                self.config.write_stall_timeout,
-                self.config.rtcp_sr,
-                self.ntp_epoch_us,
-            );
+            let (stall, sr) = (self.config.write_stall_timeout, self.config.rtcp_sr);
             async move {
-                writer(write, ctl_rx, cancel, stall, sr, epoch).await;
+                writer(write, ctl_rx, cancel, stall, sr).await;
                 done.cancel();
             }
         });
         let mut conn = Conn {
             server: self.clone(),
+            id,
             ip,
             local_ip,
             ctl: ctl_tx,
             session: None,
             authenticated: false,
+            users: vec![],
             tokens: self.config.request_burst,
             last_refill: Instant::now(),
             described: HashMap::new(),
@@ -269,6 +254,8 @@ impl Server {
         // Only complete requests (or client RTCP) count as activity, and a started request
         // must complete within first_request_timeout: trickled bytes extend nothing
         let connected = Instant::now();
+        // Since when the connection has had neither credentials nor a session
+        let mut bare_since = connected;
         let mut seen_request = false;
         let mut last_activity = connected;
         let mut partial_since: Option<Instant> = None;
@@ -283,10 +270,11 @@ impl Server {
             if let Some(t) = partial_since {
                 idle_deadline = idle_deadline.min(t + self.config.first_request_timeout);
             }
-            // With users configured, authenticate within a bound (playing an anonymous
-            // mount is exempt): unauthenticated clients can't hold slots forever
-            if !conn.authenticated && !conn.playing() && self.auth().have_users() {
-                idle_deadline = idle_deadline.min(connected + self.config.unauthenticated_lifetime);
+            // Authenticate or set up a session within a bound: unauthenticated clients
+            // can't hold connections forever, with or without users configured
+            if !conn.authenticated && conn.session.is_none() {
+                idle_deadline =
+                    idle_deadline.min(bare_since + self.config.unauthenticated_lifetime);
             }
             let n = tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -317,9 +305,13 @@ impl Server {
                             let _ = conn.send(Response::new(503), req.cseq()).await;
                             continue;
                         }
+                        let had_session = conn.session.is_some();
                         if !conn.handle(req).await {
                             close = true;
                             break;
+                        }
+                        if had_session && conn.session.is_none() {
+                            bare_since = Instant::now();
                         }
                     }
                     Err(e) => {
@@ -344,9 +336,7 @@ impl Server {
         conn.teardown().await;
         let _ = conn.ctl.send(WriterCmd::Close).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
-        if !conn.authenticated {
-            self.unauth_dec(ip);
-        }
+        self.pending_remove(id);
         self.connections.fetch_sub(1, Ordering::SeqCst);
         log::info!("rtsp: connection from {peer} closed");
     }
@@ -359,9 +349,174 @@ type Routed = (
     Option<String>,
 );
 
+/// Unauthenticated connections: no credentials accepted yet and no session. Every
+/// connection starts here; it leaves when it authenticates or sets up a session (an
+/// anonymous mount), so playing clients never count, and a full table closes old entries
+/// instead of refusing new ones (`ServerConfig`)
+#[derive(Default)]
+struct Pending {
+    /// By `ip_key`
+    per_ip: HashMap<IpAddr, usize>,
+    conns: HashMap<u64, PendingConn>,
+}
+
+struct PendingConn {
+    key: IpAddr,
+    since: Instant,
+    /// Cancelled to close the connection
+    close: CancellationToken,
+}
+
+impl Pending {
+    fn count(&self, key: IpAddr) -> usize {
+        self.per_ip.get(&key).copied().unwrap_or(0)
+    }
+
+    /// The address holding the most entries; `key` itself if it is among them
+    fn heaviest(&self, key: IpAddr) -> IpAddr {
+        let max = self.per_ip.values().copied().max().unwrap_or(0);
+        if self.count(key) >= max {
+            return key;
+        }
+        self.per_ip
+            .iter()
+            .find(|(_, n)| **n == max)
+            .map(|(k, _)| *k)
+            .unwrap_or(key)
+    }
+
+    fn close_oldest(&mut self, key: IpAddr) {
+        let oldest = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.key == key)
+            .min_by_key(|(id, c)| (c.since, **id))
+            .map(|(id, _)| *id);
+        if let Some(id) = oldest {
+            log::debug!("rtsp: unauthenticated limit: closing an old connection from {key}");
+            if let Some(c) = self.remove(id) {
+                c.close.cancel();
+            }
+        }
+    }
+
+    fn remove(&mut self, id: u64) -> Option<PendingConn> {
+        let c = self.conns.remove(&id)?;
+        if let Some(n) = self.per_ip.get_mut(&c.key) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_ip.remove(&c.key);
+            }
+        }
+        Some(c)
+    }
+}
+
+/// Failed-auth limiting. Failures count per (address, username), where the address is
+/// `ip_key` and the username is the one the credentials claim (known or not), and per
+/// address across all usernames. Past `failed_auth_per_minute` for the pair, or
+/// `SPRAY_FACTOR` times that for the address (many usernames: spraying), credentials for
+/// that username from that address get the answer wrong ones would (`gate`). So a client
+/// with a stale password for one user doesn't throttle another user on the same address
+/// (rootless podman or docker-proxy show every LAN client as one address), and nobody gets
+/// unthrottled guesses at any user. Nothing waits.
+#[derive(Default)]
 struct FailedAuth {
-    times: VecDeque<Instant>,
-    next_slot: Instant,
+    /// The most recent failures per (address, claimed username), at most the limit
+    per_user: HashMap<(IpAddr, String), VecDeque<Instant>>,
+    /// The most recent failures per address, at most the limit × SPRAY_FACTOR
+    per_addr: HashMap<IpAddr, VecDeque<Instant>>,
+}
+
+/// The per-address failed-auth ceiling, as a multiple of the per-username limit
+const SPRAY_FACTOR: usize = 5;
+/// Usernames are kept for limiting up to this many bytes
+const MAX_NAME: usize = 64;
+
+/// `limit` failures within the last minute
+fn over<K: std::hash::Hash + Eq>(m: &HashMap<K, VecDeque<Instant>>, k: &K, limit: usize) -> bool {
+    m.get(k).is_some_and(|f| {
+        f.len() >= limit
+            && f.front()
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+    })
+}
+
+/// Record a failure, keeping the last `limit`; bounded: forget keys with nothing recent
+fn record<K: std::hash::Hash + Eq>(m: &mut HashMap<K, VecDeque<Instant>>, k: K, limit: usize) {
+    if m.len() > 4096 {
+        m.retain(|_, f| {
+            f.back()
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+        });
+    }
+    let f = m.entry(k).or_default();
+    f.push_back(Instant::now());
+    while f.len() > limit {
+        f.pop_front();
+    }
+}
+
+impl FailedAuth {
+    fn key(ip: IpAddr, user: &str) -> (IpAddr, String) {
+        let mut end = user.len().min(MAX_NAME);
+        while !user.is_char_boundary(end) {
+            end -= 1;
+        }
+        (ip_key(ip), user[..end].to_string())
+    }
+
+    fn limited(&self, ip: IpAddr, user: &str, limit: usize) -> bool {
+        let limit = limit.max(1);
+        over(&self.per_user, &Self::key(ip, user), limit)
+            || over(&self.per_addr, &ip_key(ip), limit * SPRAY_FACTOR)
+    }
+
+    fn fail(&mut self, ip: IpAddr, user: &str, limit: usize) {
+        let limit = limit.max(1);
+        record(&mut self.per_user, Self::key(ip, user), limit);
+        record(&mut self.per_addr, ip_key(ip), limit * SPRAY_FACTOR);
+    }
+}
+
+/// The username credentials claim, before they are checked ("" if none)
+fn claimed_user(header: &str) -> String {
+    match authorization(header) {
+        Some(Authorization::Basic { user, .. }) => user,
+        Some(Authorization::Digest(p)) => p.get("username").cloned().unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+/// The failed-auth limit applied to a decision on a request whose credentials' username
+/// is limited from this address. Only a user this connection already authenticated as
+/// (`authenticated_here`: its session's keepalives, its SETUP after DESCRIBE) gets
+/// through; anything else gets exactly what wrong credentials would (`as_wrong`: the
+/// decision without credentials), so a guess that hits looks like one that missed, also
+/// through a stale Digest nonce or a valid user without access to the mount
+fn gate(
+    d: Decision,
+    authenticated_here: impl Fn(&str) -> bool,
+    as_wrong: impl FnOnce() -> Decision,
+) -> Decision {
+    match d {
+        Decision::Ok(Some(ref u)) if authenticated_here(u) => d,
+        Decision::Failed(_) => d,
+        _ => match as_wrong() {
+            // Wrong credentials on a mount that needs them fail (and count)
+            Decision::Challenge(c) => Decision::Failed(c),
+            other => other,
+        },
+    }
+}
+
+/// accept() errors that are about one connection, not the listener
+fn is_connection_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        ConnectionRefused | ConnectionAborted | ConnectionReset | Interrupted
+    )
 }
 
 /// The key for per-address limits: IPv4 (also when IPv4-mapped), or the IPv6 /64, which is
@@ -405,11 +560,15 @@ struct TrackState {
 
 struct Conn {
     server: Arc<Server>,
+    /// Its key in `Pending`
+    id: u64,
     ip: IpAddr,
     local_ip: String,
     ctl: mpsc::Sender<WriterCmd>,
     session: Option<SessionState>,
     authenticated: bool,
+    /// The users this connection authenticated as (`gate`)
+    users: Vec<String>,
     tokens: f64,
     last_refill: Instant,
     /// mount → desc gen at DESCRIBE time
@@ -499,18 +658,34 @@ impl Conn {
         req: &Request,
         allowed: Allowed,
     ) -> Result<Option<String>, Response> {
-        match self.server.auth().check(
-            &allowed,
-            &req.method,
-            &req.uri,
-            req.header("Authorization"),
-            self.ip,
-        ) {
+        let auth = self.server.auth();
+        let header = req.header("Authorization");
+        let check = |h| auth.check(&allowed, &req.method, &req.uri, h, self.ip);
+        let mut decision = check(header);
+        let limit = self.server.config.failed_auth_per_minute;
+        let claimed = header.map(claimed_user).unwrap_or_default();
+        if header.is_some()
+            && self
+                .server
+                .failed_auth
+                .lock()
+                .unwrap()
+                .limited(self.ip, &claimed, limit)
+        {
+            let here = |u: &str| self.users.iter().any(|v| v == u);
+            decision = gate(decision, here, || check(None));
+        }
+        match decision {
             Decision::Ok(user) => {
-                // Only real credentials lift the per-IP limit; anonymous access doesn't
-                if user.is_some() && !self.authenticated {
-                    self.authenticated = true;
-                    self.server.unauth_dec(self.ip);
+                if let Some(u) = &user {
+                    if !self.users.contains(u) {
+                        self.users.push(u.clone());
+                    }
+                    // Only real credentials make a connection authenticated
+                    if !self.authenticated {
+                        self.authenticated = true;
+                        self.server.pending_remove(self.id);
+                    }
                 }
                 Ok(user)
             }
@@ -524,9 +699,8 @@ impl Conn {
             }
             Decision::Failed(c) => {
                 log::info!("rtsp: auth failure from {}", self.ip);
-                if let Some(slot) = self.server.note_failed_auth(self.ip) {
-                    tokio::time::sleep_until(slot).await;
-                }
+                let mut fa = self.server.failed_auth.lock().unwrap();
+                fa.fail(self.ip, &claimed, limit);
                 let mut r = Response::new(401);
                 for v in c {
                     r = r.header("WWW-Authenticate", v);
@@ -710,6 +884,8 @@ impl Conn {
                 playing: false,
                 closed: CancellationToken::new(),
             });
+            // A session (on a mount this client may open) ends the unauthenticated state
+            self.server.pending_remove(self.id);
         }
         let s = self.session.as_mut().unwrap();
         // Unique channel pairs per connection
@@ -919,9 +1095,10 @@ async fn writer(
     cancel: CancellationToken,
     stall: Duration,
     rtcp_sr: bool,
-    ntp_epoch_us: u64,
 ) {
     let mut sub: Option<Subscription> = None;
+    // NTP = the Hub's NTP epoch + wire time (DESIGN §5.3), from the subscription at PLAY
+    let mut ntp_epoch_us = 0u64;
     let mut tracks: HashMap<Track, WriterTrack> = HashMap::new();
     let mut sr = tokio::time::interval(Duration::from_secs(2));
     let mut last_wire_seen = 0u64;
@@ -951,6 +1128,7 @@ async fn writer(
                 done,
                 reply,
             }) => {
+                ntp_epoch_us = s.ntp_epoch_us;
                 tracks = t
                     .into_iter()
                     .map(|(k, state)| {
@@ -1193,6 +1371,120 @@ mod tests {
             content_base("rtsp://h:1/argus/main/stream=1"),
             "rtsp://h:1/argus/main/"
         );
+    }
+
+    /// Past the failed-auth limit, only a user the connection already authenticated as
+    /// gets through; everything else gets what wrong credentials would, so no answer tells
+    /// a right guess from a wrong one
+    #[test]
+    fn test_gate() {
+        let challenge = || Decision::Challenge(vec!["Basic realm=\"neolink\"".into()]);
+        let failed = Decision::Failed(vec!["Basic realm=\"neolink\"".into()]);
+        let here = |u: &str| u == "alice";
+        let alice = Decision::Ok(Some("alice".into()));
+        assert_eq!(gate(alice.clone(), here, challenge), alice);
+        // Right password, but not for a user this connection authenticated as
+        let bob = Decision::Ok(Some("bob".into()));
+        assert_eq!(gate(bob.clone(), here, challenge), failed);
+        // On an anonymous mount, wrong credentials fall back to anonymous: so do right ones
+        assert_eq!(gate(bob, here, || Decision::Ok(None)), Decision::Ok(None));
+        // A stale Digest nonce is only answered stale for the right password
+        let stale = Decision::Challenge(vec!["Digest stale=TRUE".into()]);
+        assert_eq!(gate(stale, here, challenge), failed);
+        // A valid user without access to the mount (404) would reveal the password too
+        assert_eq!(gate(Decision::NotFound, here, challenge), failed);
+        // Wrong credentials stay a failure
+        assert_eq!(gate(failed.clone(), here, challenge), failed);
+    }
+
+    /// Failures limit their (address, username) pair; many usernames from one address hit
+    /// the address ceiling; IPv6 counts per /64
+    #[test]
+    fn test_failed_auth_per_user_and_address() {
+        let mut fa = FailedAuth::default();
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        for _ in 0..3 {
+            fa.fail(a, "alice", 4);
+        }
+        assert!(!fa.limited(a, "alice", 4));
+        fa.fail(a, "alice", 4);
+        assert!(fa.limited(a, "alice", 4));
+        assert!(!fa.limited(a, "bob", 4), "another user on the same address");
+        assert!(
+            !fa.limited(b, "alice", 4),
+            "the same user from another address"
+        );
+        // Spraying: 4 + 15 more failures over other names stay under 4 × 5 = 20
+        for i in 0..15 {
+            fa.fail(a, &format!("u{i}"), 4);
+        }
+        assert!(!fa.limited(a, "bob", 4));
+        fa.fail(a, "u99", 4);
+        assert!(fa.limited(a, "bob", 4), "the address ceiling");
+        // Long names are cut (and keep counting as one), char boundaries respected
+        let long = "é".repeat(100);
+        for _ in 0..4 {
+            fa.fail(b, &long, 4);
+        }
+        assert!(fa.limited(b, &format!("{long}x"), 4));
+        // IPv6 per /64
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let v6b: IpAddr = "2001:db8::2".parse().unwrap();
+        for _ in 0..4 {
+            fa.fail(v6, "alice", 4);
+        }
+        assert!(fa.limited(v6b, "alice", 4));
+    }
+
+    #[test]
+    fn test_claimed_user() {
+        assert_eq!(claimed_user("Basic YWxpY2U6d3Jvbmc="), "alice");
+        assert_eq!(
+            claimed_user("Digest username=\"bob\", realm=\"neolink\", nonce=\"x\""),
+            "bob"
+        );
+        assert_eq!(claimed_user("Bearer x"), "");
+    }
+
+    /// A full table closes the oldest entry of the address holding the most, or the
+    /// newcomer's own if it holds as many
+    #[test]
+    fn test_pending_heaviest() {
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        let c: IpAddr = "10.0.0.3".parse().unwrap();
+        let mut p = Pending::default();
+        let add = |p: &mut Pending, id: u64, key: IpAddr| {
+            *p.per_ip.entry(key).or_default() += 1;
+            p.conns.insert(
+                id,
+                PendingConn {
+                    key,
+                    since: Instant::now() + Duration::from_millis(id),
+                    close: CancellationToken::new(),
+                },
+            );
+        };
+        for id in 0..3 {
+            add(&mut p, id, a);
+        }
+        add(&mut p, 3, b);
+        assert_eq!(p.heaviest(c), a);
+        assert_eq!(p.heaviest(b), a);
+        assert_eq!(p.heaviest(a), a);
+        let first = p.conns[&0].close.clone();
+        p.close_oldest(a);
+        assert!(first.is_cancelled());
+        assert_eq!(p.count(a), 2);
+        assert!(!p.conns.contains_key(&0));
+        add(&mut p, 4, b);
+        // Tied: the newcomer's own
+        assert_eq!(p.heaviest(b), b);
+        p.remove(1);
+        p.remove(2);
+        assert_eq!(p.count(a), 0);
+        assert!(!p.per_ip.contains_key(&a));
     }
 
     #[test]

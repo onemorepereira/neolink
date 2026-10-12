@@ -38,6 +38,7 @@ pub fn fixture(name: &str) -> Vec<neolink_rtsp::source::FixtureUnit> {
 
 pub struct Harness {
     pub addr: SocketAddr,
+    pub server: Arc<Server>,
     pub cancel: CancellationToken,
     pub sources: Vec<Arc<FixtureSource>>,
     pub hubs: Vec<HubHandle>,
@@ -160,9 +161,10 @@ pub async fn start_with(setup: Setup) -> Harness {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let cancel = CancellationToken::new();
-    tokio::spawn(server.serve(listener, cancel.clone()));
+    tokio::spawn(server.clone().serve(listener, cancel.clone()));
     Harness {
         addr,
+        server,
         cancel,
         sources,
         hubs: handles,
@@ -205,6 +207,11 @@ impl Client {
             packets: vec![],
             arrivals: vec![],
         }
+    }
+
+    /// Connect from a chosen source address (any of 127.0.0.0/8 on Linux): another "host"
+    pub async fn connect_from(addr: SocketAddr, src: &str) -> Self {
+        Self::from_stream(connect_from(addr, src).await)
     }
 
     pub fn from_stream(s: TcpStream) -> Self {
@@ -364,6 +371,26 @@ impl Client {
                 Ok(Ok(n)) if n > 0 => self.buf.extend_from_slice(&chunk[..n]),
                 _ => break,
             }
+        }
+    }
+}
+
+/// A TCP connection from a chosen source address (any of 127.0.0.0/8 on Linux)
+pub async fn connect_from(addr: SocketAddr, src: &str) -> TcpStream {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind(SocketAddr::new(src.parse().unwrap(), 0)).unwrap();
+    sock.connect(addr).await.unwrap()
+}
+
+/// True if the peer closed the connection within `d` (anything it sent is discarded)
+pub async fn closed_within(s: &mut TcpStream, d: Duration) -> bool {
+    let end = tokio::time::Instant::now() + d;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tokio::time::timeout_at(end, s.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return true,
+            Ok(Ok(_)) => {}
+            Err(_) => return false,
         }
     }
 }

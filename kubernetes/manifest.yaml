@@ -27,7 +27,7 @@ spec:
         ports:
           - containerPort: 8554
         command: ["/bin/sh", "-c"]
-        args: ["cp /config/neolink.toml /etc/neolink.toml && /usr/local/bin/neolink rtsp --config /etc/neolink.toml"]
+        args: ["cp /config/neolink.toml /etc/neolink.toml && exec /usr/local/bin/neolink rtsp --config /etc/neolink.toml"]
         volumeMounts:
           - name: config-volume
             mountPath: /config

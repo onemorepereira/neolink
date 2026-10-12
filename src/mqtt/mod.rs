@@ -34,6 +34,9 @@
 //! `/query/preview` Request that the camera post a base64 encoded jpeg
 //!    of the stream to `/status/preview`
 //!
+//! On a sleeping camera queries answer from its last wake and wake it only for the payload
+//! `fresh`, and `/control/wakeup` is bounded (see `power.rs`).
+//!
 //!
 //! # Usage
 //!
@@ -68,17 +71,19 @@ use tokio::{
 };
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use tokio_util::sync::CancellationToken;
-use validator::Validate;
 
 use neolink_core::bc_protocol::{Direction as BcDirection, LightState};
 
 mod cmdline;
+mod configwrite;
 mod discovery;
 mod mqttc;
+mod power;
+#[cfg(test)]
+mod tests;
 
 use crate::{
-    common::{MdState, NeoInstance, NeoReactor, StateFile},
-    config::Config,
+    common::{unix_now, BatteryReading, MdState, NeoInstance, NeoReactor, StateFile},
     AnyResult,
 };
 use anyhow::{anyhow, Context, Result};
@@ -88,24 +93,15 @@ use log::*;
 use mqttc::{Mqtt, MqttReplyRef};
 
 use self::{
+    configwrite::{prepare_config_write, ConfigWrite},
     discovery::enable_discovery,
     mqttc::{MqttInstance, MqttReply},
+    power::{wants_fresh, CamPower, FRESH_MAX_AGE_S},
 };
 
 /// Entry point for the mqtt subcommand
 ///
 /// Opt is the command line options
-/// A config parse error without the quoted source line (SPEC R25)
-fn redacted_parse_error(text: &str, e: &toml::de::Error) -> String {
-    let line = e
-        .span()
-        .map(|s| text[..s.start.min(text.len())].matches('\n').count() + 1);
-    match line {
-        Some(l) => format!("Failed to parse the config at line {l}: {}", e.message()),
-        None => format!("Failed to parse the config: {}", e.message()),
-    }
-}
-
 pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
     let global_cancel = CancellationToken::new();
@@ -115,8 +111,9 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
         let c = config.borrow();
         if c.mqtt_config_writes && !c.users.is_empty() {
             log::warn!(
-                "MQTT clients can rewrite the config, including users and permitted_users, \
-                 on the neolink/config topic; set mqtt_config_writes = false to prevent that"
+                "MQTT clients can rewrite the config, including camera addresses (but not \
+                 users, permitted_users or power settings), on the neolink/config topic; \
+                 set mqtt_config_writes = false to prevent that"
             );
         }
     }
@@ -213,6 +210,9 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
 
     // This threads checks for config changes on the mqtt
     let thread_config = config.clone();
+    // Only the config file sets power settings: MQTT is the only other writer, and this
+    // copy is taken before it can write (SPEC P14)
+    let file_config = config.borrow().clone();
     let mut thread_instance = mqtt.subscribe("").await?;
     let thread_reactor = reactor.clone();
     let thread_cancel = global_cancel.clone();
@@ -222,7 +222,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
             v = async {
                 while let Ok(msg) = thread_instance.recv().await {
                     if msg.topic == "config" {
-                        // SPEC R29: the topic can rewrite users and permissions
+                        // SPEC R29: the topic can rewrite addresses and streams (not users or power)
                         if !thread_config.borrow().mqtt_config_writes {
                             log::warn!("Ignored a config write over MQTT: mqtt_config_writes = false");
                             thread_instance
@@ -234,72 +234,15 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                                 .await?;
                             continue;
                         }
-                        crate::config::warn_unknown_keys(&msg.message, "MQTT neolink/config");
-                        let config = match toml::from_str::<Config>(&msg.message) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                // The parse error quotes the offending line, which may hold
-                                // a password: report only the message and the line
-                                thread_instance
-                                    .send_message("config/status", &redacted_parse_error(&msg.message, &e), false)
-                                    .await?;
+                        let current = thread_config.borrow().clone();
+                        let config = match prepare_config_write(&msg.message, &file_config, &current) {
+                            ConfigWrite::Unchanged => continue,
+                            ConfigWrite::Refused(why) => {
+                                thread_instance.send_message("config/status", &why, false).await?;
                                 continue;
                             }
+                            ConfigWrite::Apply(config) => *config,
                         };
-                        let curr_config = thread_config.borrow().clone();
-                        let mut config = config;
-
-                        // Fill in skipped passwords, but only for the same broker and the same
-                        // camera address: a write that points elsewhere must not receive the
-                        // current secrets
-                        if let (Some(mqtt), Some(curr_mqtt)) = (config.mqtt.as_mut(), curr_config.mqtt.as_ref()) {
-                            let same_broker = mqtt.broker_addr == curr_mqtt.broker_addr && mqtt.port == curr_mqtt.port;
-                            if mqtt.credentials.is_none() && same_broker {
-                                mqtt.credentials = curr_mqtt.credentials.clone();
-                            }
-                            if mqtt.ca.is_none() && same_broker {
-                                mqtt.ca = curr_mqtt.ca.clone();
-                            }
-                            if mqtt.client_auth.is_none() && same_broker {
-                                mqtt.client_auth = curr_mqtt.client_auth.clone();
-                            }
-                        }
-                        for cam in config.cameras.iter_mut() {
-                            let name = cam.name.clone();
-                            let cur_cam = curr_config.cameras.iter().find(|c| c.name == name);
-                            if let Some(cur_cam) = cur_cam.as_ref() {
-                                let same_camera = cam.camera_addr == cur_cam.camera_addr
-                                    && cam.camera_uid == cur_cam.camera_uid;
-                                if cam.password.is_none() && same_camera {
-                                    cam.password = cur_cam.password.clone();
-                                }
-                            }
-                        }
-                        for user in config.users.iter_mut() {
-                            let name = user.name.clone();
-                            let cur_user = curr_config.users.iter().find(|c| c.name == name);
-                            if let Some(cur_user) = cur_user.as_ref() {
-                                if user.pass.is_none() {
-                                    user.pass = cur_user.pass.clone();
-                                }
-                            }
-                        }
-                        // Passwords should now be restored if they were not set
-
-                        let validate = config.validate().with_context(|| {
-                            format!("Failed to validate the MQTT {:?} config file", msg.topic)
-                        });
-                        if let Err(e) = validate {
-                            thread_instance
-                                .send_message("config/status", &format!("{:?}", e), false)
-                                .await?;
-                            continue;
-                        }
-
-                        if (*thread_config.borrow()) == config {
-                            continue;
-                        }
-
                         let result = thread_reactor.update_config(config).await;
                         thread_instance
                             .send_message("config/status", &format!("{:?}", result), false)
@@ -385,6 +328,13 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                 let camera_floodlight_tasks = camera.clone();
                 let mqtt_floodlight_tasks = mqtt_instance.resubscribe().await?;
 
+                // control/wakeup and coalesced queries: ends with this listener
+                let power = std::sync::Arc::new(CamPower::new());
+                let camera_wakeup = camera.clone();
+
+                let mut wakes = camera.wakes().await?;
+                let mqtt_wakes = mqtt_instance.resubscribe().await?;
+
                 tokio::select! {
                     _ = cancel.cancelled() => AnyResult::Ok(()),
                     // Handles incomming requests
@@ -398,11 +348,12 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                     let camera_msg = camera_msg.clone();
                                     let tx = tx.clone();
                                     let cancel_msg = cancel_msg.clone();
+                                    let power = power.clone();
                                     set_msg.spawn(async move {
                                         tokio::select!{
                                             _ = cancel_msg.cancelled() => AnyResult::Ok(()),
                                             v = async {
-                                                let res = handle_mqtt_message(msg, &mqtt_msg, &camera_msg).await;
+                                                let res = handle_mqtt_message(msg, &mqtt_msg, &camera_msg, &power).await;
                                                 if res.is_err() {
                                                     tx.send(res).await?;
                                                 }
@@ -420,6 +371,20 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                             },
                         }?;
                         AnyResult::Ok(())
+                    } => v,
+                    v = power.run_wakeups(&camera_wakeup, &camera_name) => v,
+                    // The wake ledger (SPEC P6), retained so it survives HA restarts
+                    v = async {
+                        loop {
+                            let status = wakes.borrow_and_update().clone();
+                            if status.since.is_some() {
+                                mqtt_wakes
+                                    .send_message("status/wakes", &serde_json::to_string(&status)?, true)
+                                    .await
+                                    .with_context(|| format!("{}: Failed to publish the wake ledger", camera_name))?;
+                            }
+                            wakes.changed().await.with_context(|| format!("{}: Ledger Watch Dropped", camera_name))?;
+                        }
                     } => v,
                     // Handle camera disconnect/connect
                     v = async {
@@ -500,7 +465,10 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                 mqtt_motion.send_message("status/motion", "on", true).await.with_context(|| {
                                     format!("{}: Failed to publish motion start", camera_name)
                                 })?;
-                                md.wait_for(|state| matches!(state, MdState::Stop(_))).await.with_context(|| {
+                                // Stop, or Unknown when the camera went to sleep or dropped
+                                // mid-motion: nothing reports the end then, and a stuck `on`
+                                // makes automations wake the camera again
+                                md.wait_for(|state| !matches!(state, MdState::Start(_))).await.with_context(|| {
                                     format!("{}: MdStop Watch Dropped", camera_name)
                                 })?;
                                 mqtt_motion.send_message("status/motion", "off", true).await.with_context(|| {
@@ -719,7 +687,11 @@ async fn handle_mqtt_message(
     msg: MqttReply,
     mqtt: &MqttInstance,
     camera: &NeoInstance,
+    power: &CamPower,
 ) -> Result<()> {
+    // The ledger names the topic that woke the camera (SPEC P6)
+    let reason = format!("mqtt:{}", msg.topic);
+    let reason = reason.as_str();
     match msg.as_ref() {
         MqttReplyRef {
             topic: _,
@@ -741,7 +713,7 @@ async fn handle_mqtt_message(
             message: "on",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.set_floodlight_manual(true, 180).await?;
                         AnyResult::Ok(())
@@ -764,7 +736,7 @@ async fn handle_mqtt_message(
             message: "off",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.set_floodlight_manual(false, 180).await?;
                         AnyResult::Ok(())
@@ -787,7 +759,7 @@ async fn handle_mqtt_message(
             message: "on",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.led_light_set(true).await?;
                         AnyResult::Ok(())
@@ -810,7 +782,7 @@ async fn handle_mqtt_message(
             message: "off",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.led_light_set(false).await?;
                         AnyResult::Ok(())
@@ -833,7 +805,7 @@ async fn handle_mqtt_message(
             message: "on",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.irled_light_set(LightState::On).await?;
                         AnyResult::Ok(())
@@ -856,7 +828,7 @@ async fn handle_mqtt_message(
             message: "off",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.irled_light_set(LightState::Off).await?;
                         AnyResult::Ok(())
@@ -879,7 +851,7 @@ async fn handle_mqtt_message(
             message: "auto",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.irled_light_set(LightState::Auto).await?;
                         AnyResult::Ok(())
@@ -902,7 +874,7 @@ async fn handle_mqtt_message(
             ..
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.reboot().await?;
                         AnyResult::Ok(())
@@ -926,7 +898,7 @@ async fn handle_mqtt_message(
         } => {
             let reply = if let Ok(amount) = message.parse::<f32>() {
                 if let Err(e) = camera
-                    .run_task(|cam| {
+                    .run_task_for(reason, |cam| {
                         Box::pin(async move {
                             cam.zoom_to((amount * 1000.0) as u32).await?;
                             AnyResult::Ok(())
@@ -996,7 +968,7 @@ async fn handle_mqtt_message(
                             Duration::from_millis(100),
                         );
                         if let Err(e) = camera
-                            .run_task(|cam| {
+                            .run_task_for(reason, |cam| {
                                 Box::pin(async move {
                                     cam.send_ptz(bc_direction, speed).await?;
                                     sleep(Duration::from_secs_f32(seconds)).await;
@@ -1034,7 +1006,7 @@ async fn handle_mqtt_message(
         } => {
             let reply = if let Ok(id) = message.parse::<u8>() {
                 let res = camera
-                    .run_task(|cam| {
+                    .run_task_for(reason, |cam| {
                         Box::pin(async move {
                             cam.moveto_ptz_preset(id).await?;
                             AnyResult::Ok(())
@@ -1067,7 +1039,7 @@ async fn handle_mqtt_message(
             let reply = if let (Some(Ok(id)), Some(name)) = (id.map(|id| id.parse::<u8>()), name) {
                 let name = name.to_owned();
                 let res = camera
-                    .run_task(|cam| {
+                    .run_task_for(reason, |cam| {
                         let name = name.clone();
                         Box::pin(async move {
                             cam.set_ptz_preset(id, name).await?;
@@ -1100,7 +1072,7 @@ async fn handle_mqtt_message(
             message: "on",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.pir_set(true).await?;
                         AnyResult::Ok(())
@@ -1123,7 +1095,7 @@ async fn handle_mqtt_message(
             message: "off",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.pir_set(false).await?;
                         AnyResult::Ok(())
@@ -1145,35 +1117,8 @@ async fn handle_mqtt_message(
             topic: "control/wakeup",
             message,
         } => {
-            let reply = match message.parse::<u64>() {
-                Ok(secs) => {
-                    if let Ok(permit) = camera.permit("mqtt:control/wakeup").await {
-                        // This task waits for the `run_task` to send the OK then starts the countdown
-                        // to drop the permit
-                        let camera = camera.clone();
-                        tokio::task::spawn(async move {
-                            // Wait for connection then start the countdown
-                            // By using a run_task we can delay the countdown until AFTER we are connected
-                            let _ = camera
-                                .run_task(|_cam| Box::pin(async move { AnyResult::Ok(()) }))
-                                .await;
-
-                            sleep(Duration::from_secs(secs * 60)).await;
-
-                            drop(permit);
-                        });
-                        "OK"
-                    } else {
-                        "FAIL: Camera shutting down"
-                    }
-                    .to_string()
-                }
-                Err(e) => {
-                    error!("Failed to parse minutes: {:?}", e);
-                    format!("FAIL: '{message}' => {e:?}")
-                }
-            };
-
+            let name = camera.config().await?.borrow().name.clone();
+            let reply = power.wakeup(&name, message);
             mqtt.send_message("control/wakeup", &reply, false)
                 .await
                 .with_context(|| "Failed to publish wakeup")?;
@@ -1194,7 +1139,7 @@ async fn handle_mqtt_message(
             let reply = match state {
                 Ok(state) => {
                     if let Err(e) = camera
-                        .run_task(|cam| {
+                        .run_task_for(reason, |cam| {
                             Box::pin(async move {
                                 cam.flightlight_tasks_enable(state).await?;
                                 AnyResult::Ok(())
@@ -1219,7 +1164,7 @@ async fn handle_mqtt_message(
             message: "on",
         } => {
             let res = camera
-                .run_task(|cam| {
+                .run_task_for(reason, |cam| {
                     Box::pin(async move {
                         cam.siren().await?;
                         AnyResult::Ok(())
@@ -1239,175 +1184,54 @@ async fn handle_mqtt_message(
         }
         MqttReplyRef {
             topic: "query/battery",
-            ..
+            message,
         } => {
-            let res = camera
-                .run_task(|cam| {
-                    Box::pin(async move {
-                        let xml = cam.battery_info().await?;
-                        AnyResult::Ok(xml)
-                    })
-                })
-                .await;
-            let reply = match res {
-                Err(e) => {
-                    error!("Failed to get battery xml: {:?}", e);
-                    "FAIL"
-                }
-                Ok(xml) => {
-                    let ser_xml = {
-                        let mut buf = bytes::BytesMut::new();
-                        quick_xml::se::to_writer(&mut buf, &xml).map(|_| buf.to_vec())
-                    };
-                    match ser_xml {
-                        Ok(bytes) => match String::from_utf8(bytes) {
-                            Ok(str) => {
-                                mqtt.send_message("status/battery", &str, false)
-                                    .await
-                                    .with_context(|| "Failed to publish battery info")?;
-                                "OK"
-                            }
-                            Err(_) => {
-                                error!("Failed to encode battery status");
-                                "FAIL"
-                            }
-                        },
-                        Err(_) => {
-                            error!("Failed to serialise battery status");
-                            "FAIL"
-                        }
-                    }
-                }
-            }
-            .to_string();
+            let reply = query_battery(camera, mqtt, power, wants_fresh(message)).await?;
             mqtt.send_message("query/battery", &reply, false)
                 .await
                 .with_context(|| "Failed to publish battery query")?;
         }
         MqttReplyRef {
-            topic: "query/pir", ..
+            topic: "query/pir",
+            message,
         } => {
-            let res = camera
-                .run_task(|cam| {
-                    Box::pin(async move {
-                        let xml = cam.get_pirstate().await?;
-                        AnyResult::Ok(xml)
-                    })
-                })
-                .await;
-            let reply = match res {
-                Err(e) => {
-                    error!("Failed to get pir xml: {:?}", e);
-                    "FAIL"
-                }
-                Ok(xml) => {
-                    let ser_xml = {
-                        let mut buf = bytes::BytesMut::new();
-                        quick_xml::se::to_writer(&mut buf, &xml).map(|_| buf.to_vec())
-                    };
-                    match ser_xml {
-                        Ok(bytes) => match String::from_utf8(bytes) {
-                            Ok(str) => {
-                                mqtt.send_message("status/pir", &str, false)
-                                    .await
-                                    .with_context(|| "Failed to publish pir info")?;
-                                "OK"
-                            }
-                            Err(_) => {
-                                error!("Failed to encode pir status");
-                                "FAIL"
-                            }
-                        },
-                        Err(_) => {
-                            error!("Failed to serialise pir status");
-                            "FAIL"
-                        }
-                    }
-                }
-            }
-            .to_string();
+            let reply = match live_query(camera, power, "query/pir", wants_fresh(message), |cam| {
+                Box::pin(async move { Ok(cam.get_pirstate().await?) })
+            })
+            .await
+            {
+                Answer::Value(xml) => publish_xml(mqtt, "status/pir", &xml).await?,
+                Answer::Reply(r) => r,
+            };
             mqtt.send_message("query/pir", &reply, false)
                 .await
                 .with_context(|| "Failed to publish pir query")?;
         }
         MqttReplyRef {
             topic: "query/ptz/preset",
-            ..
+            message,
         } => {
-            let res = camera
-                .run_task(|cam| {
-                    Box::pin(async move {
-                        let xml = cam.get_ptz_preset().await?;
-                        AnyResult::Ok(xml)
-                    })
-                })
-                .await;
-            let reply = match res {
-                Err(e) => {
-                    error!("Failed to get ptz xml: {:?}", e);
-                    "FAIL"
-                }
-                Ok(xml) => {
-                    let ser_xml = {
-                        let mut buf = bytes::BytesMut::new();
-                        quick_xml::se::to_writer(&mut buf, &xml).map(|_| buf.to_vec())
-                    };
-                    match ser_xml {
-                        Ok(bytes) => match String::from_utf8(bytes) {
-                            Ok(str) => {
-                                mqtt.send_message("status/ptz", &str, false)
-                                    .await
-                                    .with_context(|| "Failed to publish ptz info")?;
-                                "OK"
-                            }
-                            Err(_) => {
-                                error!("Failed to encode ptz status");
-                                "FAIL"
-                            }
-                        },
-                        Err(_) => {
-                            error!("Failed to serialise ptz status");
-                            "FAIL"
-                        }
-                    }
-                }
-            }
-            .to_string();
+            let reply = match live_query(
+                camera,
+                power,
+                "query/ptz/preset",
+                wants_fresh(message),
+                |cam| Box::pin(async move { Ok(cam.get_ptz_preset().await?) }),
+            )
+            .await
+            {
+                Answer::Value(xml) => publish_xml(mqtt, "status/ptz", &xml).await?,
+                Answer::Reply(r) => r,
+            };
             mqtt.send_message("query/ptz", &reply, false)
                 .await
                 .with_context(|| "Failed to publish ptz query")?;
         }
         MqttReplyRef {
             topic: "query/preview",
-            ..
+            message,
         } => {
-            let res = camera
-                .run_task(|cam| {
-                    Box::pin(async move {
-                        let data = cam.get_snapshot().await?;
-                        AnyResult::Ok(data)
-                    })
-                })
-                .await;
-            let reply = match res {
-                Err(e) => {
-                    error!("Failed to get snapshot: {:?}", e);
-                    "FAIL"
-                }
-                Ok(bytes) => {
-                    if let Err(e) = mqtt
-                        .send_message("status/preview", BASE64.encode(bytes).as_str(), true)
-                        .await
-                        .with_context(|| "Failed to publish preview")
-                    {
-                        error!("Failed to send preview: {e:?}");
-                        "FAIL"
-                    } else {
-                        "OK"
-                    }
-                }
-            }
-            .to_string();
+            let reply = query_preview(camera, mqtt, power, wants_fresh(message)).await?;
             mqtt.send_message("query/preview", &reply, false)
                 .await
                 .with_context(|| "Failed to publish preview query")?;
@@ -1417,6 +1241,177 @@ async fn handle_mqtt_message(
     Ok(())
 }
 
+/// What a query came to
+enum Answer<T> {
+    /// The camera's answer, to publish
+    Value(T),
+    /// No answer: the reply to send instead
+    Reply(String),
+}
+
+/// A live read for a query. On a sleeping camera it never wakes it without `fresh`: it
+/// reads only if the camera is awake anyway, without keeping it awake. Concurrent `fresh`
+/// queries on a topic share one wake (SPEC P11)
+async fn live_query<T, F>(
+    camera: &NeoInstance,
+    power: &CamPower,
+    topic: &str,
+    fresh: bool,
+    task: F,
+) -> Answer<T>
+where
+    F: for<'a> Fn(
+        &'a neolink_core::bc_protocol::BcCamera,
+    )
+        -> std::pin::Pin<Box<dyn futures::Future<Output = AnyResult<T>> + Send + 'a>>,
+{
+    let sleeps = match camera.config().await {
+        Ok(c) => c.borrow().sleeps(),
+        Err(e) => return Answer::Reply(format!("FAIL: {e:#}")),
+    };
+    let reason = format!("mqtt:{topic}");
+    let awake = camera.camera().borrow().upgrade().is_some();
+    let result = if !sleeps {
+        camera.run_task_for(&reason, task).await
+    } else if !fresh {
+        if !awake {
+            return Answer::Reply(format!(
+                "FAIL: the camera is asleep and nothing saved answers {topic}; send `fresh` to wake it"
+            ));
+        }
+        // Awake for something else: read without holding it awake
+        match tokio::time::timeout(Duration::from_secs(10), camera.run_passive_task(task)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow!("the camera went to sleep before answering")),
+        }
+    } else {
+        let Some(_in_flight) = power.begin(topic) else {
+            return Answer::Reply(
+                "OK: a fresh query is already waking the camera; its answer follows".to_string(),
+            );
+        };
+        camera.run_task_for(&reason, task).await
+    };
+    match result {
+        Ok(v) => Answer::Value(v),
+        Err(e) => {
+            error!("{topic} failed: {e:?}");
+            Answer::Reply(format!("FAIL: {e:#}"))
+        }
+    }
+}
+
+/// Publishes `value` as XML on `topic`; returns the reply
+async fn publish_xml<T: serde::Serialize>(
+    mqtt: &MqttInstance,
+    topic: &str,
+    value: &T,
+) -> Result<String> {
+    let mut buf = bytes::BytesMut::new();
+    let xml = match quick_xml::se::to_writer(&mut buf, value)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| Ok(String::from_utf8(buf.to_vec())?))
+    {
+        Ok(xml) => xml,
+        Err(e) => {
+            error!("Failed to serialise {topic}: {e:?}");
+            return Ok("FAIL: could not serialise the reply".to_string());
+        }
+    };
+    mqtt.send_message(topic, &xml, false)
+        .await
+        .with_context(|| format!("Failed to publish {topic}"))?;
+    Ok("OK".to_string())
+}
+
+/// `query/battery`: a sleeping camera answers from its last wake (SPEC P7)
+async fn query_battery(
+    camera: &NeoInstance,
+    mqtt: &MqttInstance,
+    power: &CamPower,
+    fresh: bool,
+) -> Result<String> {
+    let config = camera.config().await?.borrow().clone();
+    let state = StateFile::for_camera(&config);
+    if config.sleeps() {
+        let saved = state.load().last_battery;
+        if let Some(b) = saved.filter(|b| !fresh || b.age() <= FRESH_MAX_AGE_S) {
+            let reply = publish_xml(mqtt, "status/battery", &b.to_info(config.channel_id)).await?;
+            return Ok(saved_reply(reply, b.age(), fresh));
+        }
+    }
+    let info = match live_query(camera, power, "query/battery", fresh, |cam| {
+        Box::pin(async move { Ok(cam.battery_info().await?) })
+    })
+    .await
+    {
+        Answer::Value(info) => info,
+        Answer::Reply(r) => return Ok(r),
+    };
+    if config.sleeps() {
+        if let Err(e) = state.update(|s| {
+            s.battery = Some(true);
+            s.last_battery = Some(BatteryReading::now(&info));
+        }) {
+            warn!("{}: could not save the battery reading: {e:?}", config.name);
+        }
+    }
+    publish_xml(mqtt, "status/battery", &info).await
+}
+
+/// `query/preview`: a sleeping camera answers with the snapshot of its last wake (SPEC P5)
+async fn query_preview(
+    camera: &NeoInstance,
+    mqtt: &MqttInstance,
+    power: &CamPower,
+    fresh: bool,
+) -> Result<String> {
+    let config = camera.config().await?.borrow().clone();
+    let state = StateFile::for_camera(&config);
+    let publish = |jpeg: Vec<u8>| async move {
+        mqtt.send_message("status/preview", BASE64.encode(jpeg).as_str(), true)
+            .await
+            .with_context(|| "Failed to publish preview")
+    };
+    if config.sleeps() {
+        if let Some((jpeg, at)) = state.snapshot() {
+            let age = unix_now().saturating_sub(at);
+            if !fresh || age <= FRESH_MAX_AGE_S {
+                publish(jpeg).await?;
+                return Ok(saved_reply("OK".to_string(), age, fresh));
+            }
+        }
+    }
+    let jpeg = match live_query(camera, power, "query/preview", fresh, |cam| {
+        Box::pin(async move { Ok(cam.get_snapshot().await?) })
+    })
+    .await
+    {
+        Answer::Value(jpeg) => jpeg,
+        Answer::Reply(r) => return Ok(r),
+    };
+    if config.sleeps() {
+        if let Err(e) = state.save_snapshot(&jpeg) {
+            warn!("{}: could not save the snapshot: {e:?}", config.name);
+        }
+    }
+    publish(jpeg).await?;
+    Ok("OK".to_string())
+}
+
+/// The reply for an answer from the state file: its age, and how to get a new one
+fn saved_reply(published: String, age: u64, fresh: bool) -> String {
+    if published != "OK" {
+        published
+    } else if fresh {
+        format!(
+            "OK: saved {age} s ago (fresh queries reuse a reading up to {FRESH_MAX_AGE_S} s old)"
+        )
+    } else {
+        format!("OK: saved {age} s ago (send `fresh` to wake the camera for a new one)")
+    }
+}
+
 /// Wait up to 60 s for the wake reads to update the state file
 async fn wait_for_state(updated: impl Fn() -> bool) {
     for _ in 0..120 {
@@ -1424,19 +1419,5 @@ async fn wait_for_state(updated: impl Fn() -> bool) {
             return;
         }
         sleep(Duration::from_millis(500)).await;
-    }
-}
-
-#[cfg(test)]
-mod redaction_tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_error_does_not_echo_the_line() {
-        let text = "bind = \"0.0.0.0\"\n[[cameras]]\nname = \"a\"\npassword = \"s3cret\" oops\n";
-        let e = toml::from_str::<Config>(text).unwrap_err();
-        let msg = redacted_parse_error(text, &e);
-        assert!(!msg.contains("s3cret"), "{}", msg);
-        assert!(msg.contains("line 4"), "{}", msg);
     }
 }

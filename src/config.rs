@@ -98,6 +98,12 @@ pub(crate) struct LimitsConfig {
     #[validate(range(min = 1, max = 4096))]
     #[serde(default = "default_max_connections")]
     pub(crate) max_connections: usize,
+    /// Connections from one address (IPv4, or IPv6 /64) that have neither authenticated
+    /// nor set up a session. Past it, that address's own oldest one is closed. All
+    /// addresses together hold at most max_connections / 2; past that, the oldest one of
+    /// the address holding the most is closed, so a flood from one address (or a few)
+    /// can't lock others out. Clients that authenticated or set up a session never count, so
+    /// this doesn't limit Frigate, go2rtc or Home Assistant on one address
     #[validate(range(min = 1, max = 4096))]
     #[serde(default = "default_max_unauthenticated_per_ip")]
     pub(crate) max_unauthenticated_per_ip: usize,
@@ -110,6 +116,11 @@ pub(crate) struct LimitsConfig {
     #[validate(range(min = 1, max = 1000))]
     #[serde(default = "default_requests_per_second")]
     pub(crate) requests_per_second: u32,
+    /// Wrong credentials per (address, username) per minute; an address may fail 5 × this
+    /// across all usernames. Past either, that username's (or every username's)
+    /// credentials from that address are refused (401, at once, right or wrong) until a
+    /// minute passes without that many failures. RTSP connections already authenticated
+    /// as that user are not affected. The snapshot endpoint applies the same limits
     #[validate(range(min = 1, max = 1000))]
     #[serde(default = "default_failed_auth_per_minute")]
     pub(crate) failed_auth_per_minute: usize,
@@ -132,7 +143,7 @@ const fn default_max_connections() -> usize {
     128
 }
 const fn default_max_unauthenticated_per_ip() -> usize {
-    64
+    32
 }
 const fn default_first_request_timeout_s() -> u64 {
     10
@@ -425,6 +436,43 @@ impl CameraConfig {
             Some(idle) => idle,
             None => self.battery != Some(false),
         }
+    }
+
+    /// The power settings, those that decide whether and for how long the camera is woken,
+    /// that differ from `file`: this camera's entry in the config file, or `None` for a
+    /// camera the file doesn't have, which must keep the defaults. Turning the camera off
+    /// (`enabled = false`) only means fewer wakes, so it is not a change here (SPEC P14).
+    pub(crate) fn power_changes(&self, file: Option<&CameraConfig>) -> Vec<&'static str> {
+        let checks = [
+            ("battery", self.battery != file.and_then(|f| f.battery)),
+            (
+                "idle_disconnect",
+                self.idle_disconnect != file.and_then(|f| f.idle_disconnect),
+            ),
+            (
+                "idle_grace_s",
+                self.idle_grace_s != file.map_or(default_idle_grace_s(), |f| f.idle_grace_s),
+            ),
+            (
+                "motion_hold_max_s",
+                self.motion_hold_max_s
+                    != file.map_or(default_motion_hold_max_s(), |f| f.motion_hold_max_s),
+            ),
+            (
+                "snapshot_fresh",
+                self.snapshot_fresh != file.map_or(default_false(), |f| f.snapshot_fresh),
+            ),
+            (
+                "pause.on_motion",
+                self.pause.on_motion != file.map_or(default_on_motion(), |f| f.pause.on_motion),
+            ),
+            ("enabled", self.enabled && file.is_some_and(|f| !f.enabled)),
+        ];
+        checks
+            .iter()
+            .filter(|(_, changed)| *changed)
+            .map(|(key, _)| *key)
+            .collect()
     }
 }
 

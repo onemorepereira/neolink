@@ -391,6 +391,63 @@ pub(crate) struct MqttInstance {
 }
 
 impl MqttInstance {
+    /// An instance for `name` without a broker. Messages sent on the returned sender arrive
+    /// as if from the broker (topic without the `neolink/` prefix); what neolink publishes
+    /// arrives on the receiver as (topic, message, retained). Last wills are not supported
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        name: &str,
+    ) -> (
+        Self,
+        BroadcastSender<MqttReply>,
+        MpscReceiver<(String, String, bool)>,
+    ) {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::<MqttRequest>(100);
+        let (published_tx, published_rx) = mpsc(10000);
+        let (incoming_tx, _) = broadcast::<MqttReply>(1000);
+        let thread_outgoing_tx = outgoing_tx.clone();
+        let thread_incoming_tx = incoming_tx.clone();
+        tokio::spawn(async move {
+            while let Some(req) = outgoing_rx.recv().await {
+                let (msg, tx, retained) = match req {
+                    MqttRequest::Send(msg, tx) => (msg, tx, false),
+                    MqttRequest::SendRetained(msg, tx) => (msg, tx, true),
+                    MqttRequest::Subscribe(name, reply) => {
+                        let _ = reply.send(Ok(MqttInstance {
+                            name,
+                            incomming_rx: BroadcastStream::new(thread_incoming_tx.subscribe()),
+                            outgoing_tx: thread_outgoing_tx.clone(),
+                        }));
+                        continue;
+                    }
+                    MqttRequest::LastWill { reply, .. } => {
+                        let _ = reply.send(Ok(LastWillMqtt {
+                            cancel: CancellationToken::new(),
+                        }));
+                        continue;
+                    }
+                    MqttRequest::HangUp(reply) => {
+                        let _ = reply.send(());
+                        continue;
+                    }
+                };
+                let _ = published_tx
+                    .send((msg.topic.clone(), (*msg.message).clone(), retained))
+                    .await;
+                let _ = tx.send(Ok(()));
+            }
+        });
+        (
+            Self {
+                incomming_rx: BroadcastStream::new(incoming_tx.subscribe()),
+                outgoing_tx,
+                name: name.to_string(),
+            },
+            incoming_tx,
+            published_rx,
+        )
+    }
+
     pub(crate) fn get_name(&self) -> &str {
         &self.name
     }
@@ -522,7 +579,7 @@ pub(crate) struct MqttReply {
 }
 
 impl MqttReply {
-    pub(crate) fn as_ref(&self) -> MqttReplyRef {
+    pub(crate) fn as_ref(&self) -> MqttReplyRef<'_> {
         MqttReplyRef {
             topic: &self.topic,
             message: &self.message,

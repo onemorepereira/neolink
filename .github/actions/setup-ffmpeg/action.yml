@@ -1,0 +1,44 @@
+name: Pinned ffmpeg
+description: >-
+  The static ffmpeg/ffprobe build that every ffmpeg-based test and the fixture generation
+  use (request shapes, error strings and encoder output differ between ffmpeg versions).
+  Cached, checked against its sha256, put on PATH and in NEOLINK_FFMPEG.
+inputs:
+  url:
+    description: Release tarball (BtbN/FFmpeg-Builds, a dated autobuild)
+    default: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-10-13-04/ffmpeg-n8.1.3-17-gc389840894-linux64-gpl-8.1.tar.xz
+  sha256:
+    description: sha256 of the tarball
+    default: fc332aa9e6d204ea674432c9e2c53696f75ff6d7d11de337b286bde494d7c583
+outputs:
+  dir:
+    description: The directory with bin/ffmpeg and bin/ffprobe
+    value: ${{ steps.env.outputs.dir }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: cache
+      with:
+        path: ~/ffmpeg
+        key: ffmpeg-${{ inputs.sha256 }}
+    - name: Fetch the pinned ffmpeg
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        URL: ${{ inputs.url }}
+        SHA256: ${{ inputs.sha256 }}
+      run: |
+        mkdir -p ~/ffmpeg
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/ffmpeg.tar.xz" "$URL"
+        echo "$SHA256  $RUNNER_TEMP/ffmpeg.tar.xz" | sha256sum -c -
+        tar -xJf "$RUNNER_TEMP/ffmpeg.tar.xz" -C ~/ffmpeg --strip-components=1
+        rm "$RUNNER_TEMP/ffmpeg.tar.xz"
+    - name: Use the pinned ffmpeg
+      id: env
+      shell: bash
+      run: |
+        echo "NEOLINK_FFMPEG=$HOME/ffmpeg/bin/ffmpeg" >> "$GITHUB_ENV"
+        echo "$HOME/ffmpeg/bin" >> "$GITHUB_PATH"
+        echo "dir=$HOME/ffmpeg" >> "$GITHUB_OUTPUT"
+        "$HOME/ffmpeg/bin/ffmpeg" -version | head -1

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Frigate's ffmpeg command lines against the native server (PLAN 5.1, 5.2; SPEC A3, A12's
 # Frigate tolerance). Frigate itself is not needed: these are its preset input arguments
 # and its record/detect outputs.
@@ -10,7 +10,9 @@
 #   0.2): Frigate's -timeout 5000000 must not fire.
 # Runs in the dev container with ffmpeg on PATH after `cargo build --release -p xtask`.
 # E2E_WORK must be a fresh directory.
-set -u
+# Exit status: the number of failed checks; 1 when the run itself broke.
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 W=${E2E_WORK:-$(mktemp -d)}
@@ -29,15 +31,20 @@ serve() { # port extra-args...; sets SRV
   p=$1; shift; N=$((N+1))
   "$BIN/xtask" rtsp-serve --bind 127.0.0.1:$p --main "$F/plain_h265.bcm" --sub "$F/plain_h264.bcm" \
     --loop --ready-file "$W/ready.$N" "$@" > "$W/server.$N.log" 2>&1 &
-  SRV=$!
-  i=0; until [ -e "$W/ready.$N" ] || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
+  SRV=$!; track $SRV
+  wait_until 10 $SRV "rtsp-serve start (see $W/server.$N.log)" test -e "$W/ready.$N"
 }
 errors() { # log: error lines other than ffmpeg's known startup notes
   # With -use_wallclock_as_timestamps ffmpeg leaves the first packet unset and normalises
   # the next to 0 as well ("Non-monotonic DTS; previous: 0, current: 0; changing to 1"):
   # a one-off at startup that ffmpeg corrects itself. Any other non-monotonic DTS counts.
-  grep -i -E "error|invalid|non.monoton|timed out|connection refused|broken pipe" "$1" \
-    | grep -v -i -E "deprecated|Timestamps are unset|previous: 0, current: 0; changing to 1" | wc -l
+  need_log "$1"
+  { grep -i -E "error|invalid|non.monoton|timed out|connection refused|broken pipe" "$1" || [ $? = 1 ]; } \
+    | { grep -v -i -E "deprecated|Timestamps are unset|previous: 0, current: 0; changing to 1" || [ $? = 1 ]; } | wc -l
+}
+need_log() { [ -f "$1" ] || die "no ffmpeg log $1"; }
+segments() { # dir: number of segment files (0 when the directory is missing)
+  if [ -d "$1" ]; then find "$1" -name '*.mp4' -size +0 | wc -l; else echo 0; fi
 }
 frigate_generic() { # url secs name
   mkdir -p "$W/$3.rec"
@@ -58,20 +65,21 @@ if want A3; then
   serve $PORT --wrap-in 300
   url=rtsp://127.0.0.1:$PORT/argus/main
   t0=$(date +%s)
-  frigate_generic "$url" "$A3_SECS" a3.generic & G=$!
-  frigate_restream "$url" "$A3_SECS" a3.restream & R=$!
-  wait $G; gx=$?; wait $R; rx=$?
+  frigate_generic "$url" "$A3_SECS" a3.generic & G=$!; track $G
+  frigate_restream "$url" "$A3_SECS" a3.restream & R=$!; track $R
+  gx=0; wait_pid $G $((A3_SECS + 120)) "A3 generic client" || gx=$?
+  rx=0; wait_pid $R $((A3_SECS + 120)) "A3 restream client" || rx=$?
   took=$(( $(date +%s) - t0 ))
-  segs=$(ls "$W/a3.generic.rec" | wc -l)
+  segs=$(segments "$W/a3.generic.rec")
   ge=$(errors "$W/a3.generic.log"); re=$(errors "$W/a3.restream.log")
   minsegs=$(( A3_SECS / 10 - 2 ))
   msg="${A3_SECS}s across the wrap: generic exit=$gx errors=$ge segments=$segs (min $minsegs); restream exit=$rx errors=$re; took ${took}s"
   if [ $gx = 0 ] && [ $rx = 0 ] && [ "$ge" = 0 ] && [ "$re" = 0 ] && [ "$segs" -ge $minsegs ] && [ $took -le $((A3_SECS + 30)) ]; then
     echo "PASS A3 $msg"
   else
-    echo "FAIL A3 $msg"; sed 's/^/    /' "$W/a3.generic.log" | head -10; FAILS=$((FAILS+1))
+    echo "FAIL A3 $msg"; head -10 "$W/a3.generic.log" | sed 's/^/    /'; FAILS=$((FAILS+1))
   fi
-  kill -TERM $SRV; wait $SRV
+  stop_pid $SRV rtsp-serve
 fi
 
 if want bridge; then
@@ -80,13 +88,13 @@ if want bridge; then
     # shellcheck disable=SC2086
     serve $((PORT+1)) --stall-at 20 --stall-for 60 --bridge-fps "$BRIDGE_FPS" $extra
     url=rtsp://127.0.0.1:$((PORT+1))/argus/main
-    frigate_generic "$url" 100 bridge.$audio; gx=$?
-    segs=$(ls "$W/bridge.$audio.rec" | wc -l); ge=$(errors "$W/bridge.$audio.log")
+    gx=0; frigate_generic "$url" 100 bridge.$audio || gx=$?
+    segs=$(segments "$W/bridge.$audio.rec"); ge=$(errors "$W/bridge.$audio.log")
     msg="60 s stall, $audio audio, bridge_fps=$BRIDGE_FPS: exit=$gx errors=$ge segments=$segs"
     if [ $gx = 0 ] && [ "$ge" = 0 ] && [ "$segs" -ge 8 ]; then echo "PASS bridge $msg"
-    else echo "FAIL bridge $msg"; sed 's/^/    /' "$W/bridge.$audio.log" | head -10; FAILS=$((FAILS+1)); fi
-    kill -TERM $SRV; wait $SRV
+    else echo "FAIL bridge $msg"; head -10 "$W/bridge.$audio.log" | sed 's/^/    /'; FAILS=$((FAILS+1)); fi
+    stop_pid $SRV rtsp-serve
   done
 fi
-[ $FAILS = 0 ] && echo "ALL PASSED" || echo "$FAILS FAILED"
+if [ $FAILS = 0 ]; then echo "ALL PASSED"; else echo "$FAILS FAILED"; fi
 exit $FAILS

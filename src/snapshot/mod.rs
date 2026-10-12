@@ -14,7 +14,8 @@
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,6 +57,7 @@ pub(crate) async fn serve(reactor: NeoReactor, cancel: CancellationToken) -> Res
     log::info!("Snapshots available at http://{addr}/<camera>/snapshot.jpg");
     let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let fresh_at: Arc<Mutex<HashMap<String, Instant>>> = Default::default();
+    let failed: Arc<Mutex<FailedAuth>> = Default::default();
     loop {
         let (stream, _) = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -76,10 +78,12 @@ pub(crate) async fn serve(reactor: NeoReactor, cancel: CancellationToken) -> Res
             });
             continue;
         };
-        let (reactor, fresh_at) = (reactor.clone(), fresh_at.clone());
+        let (reactor, fresh_at, failed) = (reactor.clone(), fresh_at.clone(), failed.clone());
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = tokio::time::timeout(RESPONSE_TIMEOUT, handle(stream, reactor, fresh_at)).await;
+            let _ =
+                tokio::time::timeout(RESPONSE_TIMEOUT, handle(stream, reactor, fresh_at, failed))
+                    .await;
         });
     }
 }
@@ -107,7 +111,9 @@ async fn handle(
     mut stream: TcpStream,
     reactor: NeoReactor,
     fresh_at: Arc<Mutex<HashMap<String, Instant>>>,
+    failed: Arc<Mutex<FailedAuth>>,
 ) -> Result<()> {
+    let peer = stream.peer_addr()?.ip();
     let mut buf = vec![];
     let mut chunk = [0u8; 1024];
     let read = tokio::time::timeout(REQUEST_TIMEOUT, async {
@@ -138,7 +144,7 @@ async fn handle(
         }
     };
     let config = reactor.config().await?.borrow().clone();
-    let response = respond(&head, &config, &reactor, &fresh_at).await;
+    let response = respond(&head, &config, &reactor, &fresh_at, peer, &failed).await;
     write(&mut stream, response).await
 }
 
@@ -164,6 +170,8 @@ async fn respond(
     config: &Config,
     reactor: &NeoReactor,
     fresh_at: &Mutex<HashMap<String, Instant>>,
+    peer: IpAddr,
+    failed: &Mutex<FailedAuth>,
 ) -> Response {
     let mut lines = head.split("\r\n");
     let mut request = lines.next().unwrap_or("").split_whitespace();
@@ -177,12 +185,9 @@ async fn respond(
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
         .map(|(_, v)| v.trim().to_string());
     // Authenticate before looking at the path, so camera names can't be probed
-    let user = match authenticate(config, authorization.as_deref()) {
+    let user = match authorize(config, authorization.as_deref(), peer, failed) {
         Ok(user) => user,
         Err(()) => {
-            if authorization.is_some() {
-                pace_failed_auth(config.limits.failed_auth_per_minute).await;
-            }
             let mut r = Response::text("401 Unauthorized", "");
             r.headers
                 .push(("WWW-Authenticate", "Basic realm=\"neolink\"".to_string()));
@@ -255,35 +260,115 @@ async fn take_fresh(reactor: &NeoReactor, name: &str, state: &StateFile) -> Resu
     state.save_snapshot(&jpeg)
 }
 
-/// Failed logins, across all clients: past `per_minute` in a minute each failure waits for
-/// its own 1 s slot, like the RTSP server, so the endpoint can't be used to guess the RTSP
-/// passwords quickly
-async fn pace_failed_auth(per_minute: usize) {
-    use std::collections::VecDeque;
-    static FAILS: Mutex<Option<(VecDeque<Instant>, Instant)>> = Mutex::new(None);
-    let wait = {
-        let mut g = FAILS.lock().unwrap();
-        let now = Instant::now();
-        let (times, next) = g.get_or_insert_with(|| (VecDeque::new(), now));
-        while times
-            .front()
-            .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
-        {
-            times.pop_front();
-        }
-        times.push_back(now);
-        if times.len() > per_minute {
-            times.pop_front();
-            let slot = (*next).max(now) + Duration::from_secs(1);
-            *next = slot;
-            Some(slot)
-        } else {
-            None
-        }
-    };
-    if let Some(slot) = wait {
-        tokio::time::sleep_until(slot.into()).await;
+/// Failed-auth limiting, as the native RTSP server does it (`neolink_rtsp`'s
+/// `FailedAuth`, which this mirrors because that crate is optional): failures count per
+/// (address, claimed username) and per address across usernames. Past
+/// `failed_auth_per_minute` for the pair, or `SPRAY_FACTOR` times that for the address,
+/// that username's credentials from there are refused like wrong ones, right or wrong, so
+/// the endpoint can't be used to guess the RTSP passwords; one client's stale password
+/// doesn't lock out another user on the same address. Nothing waits.
+#[derive(Default)]
+struct FailedAuth {
+    per_user: HashMap<(IpAddr, String), VecDeque<Instant>>,
+    per_addr: HashMap<IpAddr, VecDeque<Instant>>,
+}
+
+/// The per-address ceiling, as a multiple of the per-username limit
+const SPRAY_FACTOR: usize = 5;
+/// Usernames are kept for limiting up to this many bytes
+const MAX_NAME: usize = 64;
+
+/// `limit` failures within the last minute
+fn over<K: std::hash::Hash + Eq>(m: &HashMap<K, VecDeque<Instant>>, k: &K, limit: usize) -> bool {
+    m.get(k).is_some_and(|f| {
+        f.len() >= limit
+            && f.front()
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+    })
+}
+
+/// Record a failure, keeping the last `limit`; bounded: forget keys with nothing recent
+fn record<K: std::hash::Hash + Eq>(m: &mut HashMap<K, VecDeque<Instant>>, k: K, limit: usize) {
+    if m.len() > 4096 {
+        m.retain(|_, f| {
+            f.back()
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+        });
     }
+    let f = m.entry(k).or_default();
+    f.push_back(Instant::now());
+    while f.len() > limit {
+        f.pop_front();
+    }
+}
+
+/// IPv4 (also IPv4-mapped), or the IPv6 /64
+fn ip_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+    }
+}
+
+impl FailedAuth {
+    fn key(ip: IpAddr, user: &str) -> (IpAddr, String) {
+        let mut end = user.len().min(MAX_NAME);
+        while !user.is_char_boundary(end) {
+            end -= 1;
+        }
+        (ip_key(ip), user[..end].to_string())
+    }
+
+    fn limited(&self, ip: IpAddr, user: &str, limit: usize) -> bool {
+        let limit = limit.max(1);
+        over(&self.per_user, &Self::key(ip, user), limit)
+            || over(&self.per_addr, &ip_key(ip), limit * SPRAY_FACTOR)
+    }
+
+    fn fail(&mut self, ip: IpAddr, user: &str, limit: usize) {
+        let limit = limit.max(1);
+        record(&mut self.per_user, Self::key(ip, user), limit);
+        record(&mut self.per_addr, ip_key(ip), limit * SPRAY_FACTOR);
+    }
+}
+
+/// The username Basic credentials claim, before they are checked ("" if none)
+fn claimed_user(authorization: &str) -> String {
+    authorization
+        .strip_prefix("Basic ")
+        .and_then(|b| BASE64.decode(b.trim()).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.split_once(':').map(|(u, _)| u.to_string()))
+        .unwrap_or_default()
+}
+
+/// `authenticate` behind the failed-auth limit. Only requests that carried credentials
+/// count; a limited username is refused whether its password is right or not (and the
+/// password is still checked, so timing doesn't tell either)
+fn authorize(
+    config: &Config,
+    authorization: Option<&str>,
+    ip: IpAddr,
+    failed: &Mutex<FailedAuth>,
+) -> Result<Option<String>, ()> {
+    let result = authenticate(config, authorization);
+    let Some(header) = authorization.filter(|_| !config.users.is_empty()) else {
+        return result;
+    };
+    let claimed = claimed_user(header);
+    let limit = config.limits.failed_auth_per_minute;
+    let mut f = failed.lock().unwrap();
+    if f.limited(ip, &claimed, limit) || result.is_err() {
+        f.fail(ip, &claimed, limit);
+        return Err(());
+    }
+    result
 }
 
 /// The authenticated user: `Ok(None)` when no users are configured (anyone may fetch)
@@ -413,6 +498,47 @@ mod tests {
         users.cameras[0].permitted_users = Some(vec!["alice".to_string()]);
         assert!(!permitted(&users.cameras[0], Some("bob")));
         assert!(permitted(&users.cameras[0], Some("alice")));
+    }
+
+    /// Failed auth is limited per (address, username) with a per-address ceiling; past it
+    /// the right password is refused too; requests without credentials don't count
+    #[test]
+    fn test_failed_auth_limit() {
+        let mut users = config(
+            "[[users]]\nname = \"alice\"\npass = \"alicepw\"\n[[users]]\nname = \"bob\"\npass = \"bobpw\"",
+        );
+        users.limits.failed_auth_per_minute = 4;
+        let basic = |u: &str| format!("Basic {}", BASE64.encode(u));
+        let failed = Mutex::new(FailedAuth::default());
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        let try_ = |ip, cred: &str| authorize(&users, Some(&basic(cred)), ip, &failed);
+        let alice = Ok(Some("alice".to_string()));
+        let bob = Ok(Some("bob".to_string()));
+        // No credentials: 401, never counted
+        for _ in 0..10 {
+            assert_eq!(authorize(&users, None, a, &failed), Err(()));
+        }
+        for _ in 0..3 {
+            assert_eq!(try_(a, "alice:wrong"), Err(()));
+        }
+        assert_eq!(try_(a, "alice:alicepw"), alice);
+        assert_eq!(try_(a, "alice:wrong"), Err(()));
+        // alice is limited from a: the right password is refused like a wrong one
+        assert_eq!(try_(a, "alice:alicepw"), Err(()));
+        // Not bob from a, not alice from b
+        assert_eq!(try_(a, "bob:bobpw"), bob);
+        assert_eq!(try_(b, "alice:alicepw"), alice);
+        // Spraying from b: 20 failures over many usernames limit every username there
+        for i in 0..20 {
+            assert_eq!(try_(b, &format!("user{i}:x")), Err(()));
+        }
+        assert_eq!(try_(b, "bob:bobpw"), Err(()));
+        // Without users anyone may fetch, credentials or not
+        let open = config("");
+        for _ in 0..10 {
+            assert_eq!(authorize(&open, Some(&basic("x:y")), a, &failed), Ok(None));
+        }
     }
 
     #[test]

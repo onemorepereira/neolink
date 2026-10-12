@@ -1,64 +1,123 @@
 name: Nightly
 
-# PLAN 5.5/5.6: long fuzzing, the 90 min Frigate and A/V runs, and the soak. Hosted
-# runners stop a job after 6 h, so the soak runs 5 h here; the 24 h soak (A15 surrogate)
-# needs a self-hosted runner: SOAK_SECS=86400.
+# PLAN 5.5/5.6: long fuzzing, the 15 and 90 min Frigate and A/V runs, the soak, the full
+# client gate, and the advisory check. Each long run is its own job, so they run in
+# parallel and each stays well under its timeout and the 6 h limit of hosted runners. The
+# soak runs 5 h here; the 24 h soak (A15 surrogate) needs a self-hosted runner:
+# SOAK_SECS=86400.
 on:
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
-  FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-10-13-04/ffmpeg-n8.1.3-17-gc389840894-linux64-gpl-8.1.tar.xz
-  FFMPEG_SHA256: fc332aa9e6d204ea674432c9e2c53696f75ff6d7d11de337b286bde494d7c583
+  CARGO_TERM_COLOR: always
 
 jobs:
   fuzz:
     name: Fuzz ${{ matrix.target }} (30 min)
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         target: [annexb, adts, sps, rtsp_msg, rtsp_headers]
     steps:
-      - uses: actions/checkout@v4
-      - run: |
-          rustup toolchain install nightly --profile minimal
-          cargo +nightly install cargo-fuzz --locked
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # cargo-fuzz needs nightly: a dated one, so a nightly regression cannot fail the run
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: nightly-2026-10-01
+      - name: Install cargo-fuzz 0.13.2
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
       - working-directory: crates/rtsp/fuzz
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=1800
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=1800
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-${{ matrix.target }}
           path: crates/rtsp/fuzz/artifacts
+          if-no-files-found: ignore
 
   long:
-    name: Frigate 90 min, A/V 90 min, soak 5 h
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    # Build (≤ 15 min cold) + the run + 20 min
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Frigate A3, 90 min across the wrap
+            run: E2E_WORK=$(mktemp -d) A3_SECS=5400 TESTS=A3 tests/e2e/frigate.sh
+            timeout: 130
+          - name: A/V sync A16 through rtsp-serve, 15 min
+            run: E2E_WORK=$(mktemp -d) AV_SECS=900 tests/e2e/avsync.sh
+            timeout: 55
+          - name: A/V sync A16 through neolink, 15 min and 90 min
+            run: E2E_WORK=$(mktemp -d) AV_SECS="900 5400" SERVER=neolink tests/e2e/avsync.sh
+            timeout: 145
+          - name: Soak, 5 h through neolink
+            run: E2E_WORK=$(mktemp -d) SOAK_SECS=18000 tests/e2e/soak.sh
+            timeout: 340
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: apt install gstreamer and deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libgstrtspserver-1.0-dev \
             libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
-      - name: Fetch pinned ffmpeg
+      - uses: ./.github/actions/setup-ffmpeg
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Fixtures, neolink and xtask (release)
         run: |
-          mkdir -p ~/ffmpeg
-          curl -sSL -o /tmp/ffmpeg.tar.xz "$FFMPEG_URL"
-          echo "$FFMPEG_SHA256  /tmp/ffmpeg.tar.xz" | sha256sum -c -
-          tar -xJf /tmp/ffmpeg.tar.xz -C ~/ffmpeg --strip-components=1
-          echo "NEOLINK_FFMPEG=$HOME/ffmpeg/bin/ffmpeg" >> "$GITHUB_ENV"
-          echo "$HOME/ffmpeg/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
-      - run: |
           cargo xtask mkfixture --standard --out fixtures/synth
-          cargo build --release --features native-rtsp -p neolink -p xtask
-      - name: A3, Frigate presets for 90 min across the wrap
-        run: E2E_WORK=$(mktemp -d) A3_SECS=5400 TESTS=A3 tests/e2e/frigate.sh
-      - name: A16 for 90 min, through neolink
-        run: E2E_WORK=$(mktemp -d) AV_SECS=5400 SERVER=neolink tests/e2e/avsync.sh
-      - name: Soak, 5 h through neolink
-        run: E2E_WORK=$(mktemp -d) SOAK_SECS=18000 tests/e2e/soak.sh
+          cargo build --locked --release --features native-rtsp -p neolink -p xtask
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.run }}
+
+  clients:
+    name: Client matrix, full gate (A5 for 300 s)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ffmpeg
+        id: ffmpeg
+      - name: Build the dev and client images
+        run: |
+          podman build -t localhost/neolink-dev:ci -f tests/e2e/dev/Containerfile tests/e2e/dev
+          podman build -t localhost/neolink-clients:ci --build-arg DEV_IMAGE=localhost/neolink-dev:ci \
+            -f tests/e2e/clients/Containerfile tests/e2e/clients
+      - name: Fixtures, xtask and the client matrix
+        env:
+          FFMPEG_DIR: ${{ steps.ffmpeg.outputs.dir }}
+        run: |
+          podman run --rm --network host -v "$PWD:/src:z" -v "$FFMPEG_DIR:/ffmpeg:ro,z" \
+            -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -e PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/ffmpeg/bin \
+            -e A5_SECS=300 -w /src localhost/neolink-clients:ci sh -c \
+            'set -e; cargo xtask mkfixture --standard --out fixtures/synth && cargo build --locked --release --features native-rtsp -p neolink -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh && E2E_WORK=$(mktemp -d) SERVER=neolink sh tests/e2e/clients.sh'
+
+  advisories:
+    name: cargo-deny advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
+      - name: Install cargo-deny 0.20.2 (release binary, sha256-checked)
+        run: |
+          v=0.20.2; f=cargo-deny-$v-x86_64-unknown-linux-musl
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$f.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/$v/$f.tar.gz"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $RUNNER_TEMP/$f.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/$f/cargo-deny" ~/.cargo/bin/cargo-deny
+      - run: cargo deny --locked check advisories

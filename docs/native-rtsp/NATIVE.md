@@ -36,8 +36,11 @@ podman run -d --network host -v ./neolink.toml:/etc/neolink.toml:ro \
 It keeps the old image's conventions: `NEO_LINK_MODE` (`rtsp`, `mqtt`, `mqtt-rtsp`, …), the
 config at `/etc/neolink.toml`, and state in `/var/lib/neolink`. Differences from the
 GStreamer image:
-- **No shell, no `/entrypoint.sh`.** neolink is PID 1 and stops cleanly on `docker stop`
-  (BYE to clients, camera logout, under 1 s).
+- **No shell, no `/entrypoint.sh`.** In both images neolink is PID 1 and stops cleanly on
+  `docker stop` (BYE to clients, camera logout, under 1 s), but only the GStreamer image can
+  run another program as its command (`sh -c "..."`, a script). Here the command must be
+  neolink's own arguments (`rtsp --config /etc/neolink.toml`, `neolink mqtt ...`); a shell
+  command fails at startup with "no program of that name in PATH".
 - **Runs as root by default**, so existing root-owned `0600` configs still work. Set
   `PUID`/`PGID` to drop to that user once the config is read:
   - neolink first hands the state directory to that user;
@@ -72,8 +75,8 @@ The URLs are the same 19 aliases per camera (`/Cam`, `/Cam/main`, `/Cam/mainStre
 | `rtsp_backend` | top | GStreamer if built in | `gstreamer` or `native` |
 | `rtsp_auth` | top | `["digest", "basic"]` | Schemes offered. Basic sends passwords in clear text (there is no TLS yet), so prefer `["digest"]` when every client supports it |
 | `rtp_mtu` | top | 1400 | 576–9000 |
-| `limits.*` | top | see below | `max_connections` 128, `max_unauthenticated_per_ip` 64, `first_request_timeout_s` 10, `idle_timeout_s` 60, `requests_per_second` 20, `failed_auth_per_minute` 10 |
-| `mqtt_config_writes` | top | `true` | Set `false` to stop MQTT clients rewriting the config |
+| `limits.*` | top | see below | `max_connections` 128, `max_unauthenticated_per_ip` 32, `first_request_timeout_s` 10, `idle_timeout_s` 60, `requests_per_second` 20, `failed_auth_per_minute` 10. Unauthenticated means no credentials accepted and no session yet; past the per-IP cap (or `max_connections / 2` in all) an old unauthenticated connection is closed, so a flood can't lock others out, and authenticated or playing clients never count. Past `failed_auth_per_minute` wrong passwords for one user from one IP (or 5 × that across all usernames), that user's credentials from that IP get 401, right or wrong, until a minute passes; sessions already playing as that user are not affected. The snapshot endpoint applies the same limits |
+| `mqtt_config_writes` | top | `true` | Set `false` to stop MQTT clients rewriting the config. Even when `true`, they can't change power settings (SPEC P14), users or `permitted_users` (R29) |
 | `audio` | camera | `aac` | `aac` or `none` |
 | `pacing_latency_ms` | camera | 1500 | 0–3000: the jitter buffer that smooths the camera's bursty Wi-Fi delivery |
 | `parameter_sets` | camera | `strip` | `strip`, `passthrough` or `inject`. Keep `strip` if you re-publish to go2rtc (Home Assistant): go2rtc 1.9.14 can't read ffmpeg's re-published in-band parameter sets |
@@ -87,25 +90,38 @@ topic (in memory: the file is not rewritten and there is no file watch). Through
 - users, permitted users and cameras added or removed apply at once;
 - stream settings apply at once, restarting that camera's sessions;
 - `rtp_mtu` applies when a camera's streams are next recreated;
-- `bind`, `bind_port`, `limits` and `rtcp_sr` need a restart.
+- `bind`, `bind_port`, `limits` and `rtcp_sr` need a restart;
+- power settings (`battery`, `idle_disconnect`, `idle_grace_s`, `motion_hold_max_s`,
+  `snapshot_fresh`, `pause.on_motion`, and enabling a camera the file disables) can't be
+  changed there at all (SPEC P14).
 
-A config sent there with `certificate` or `tls_client_auth` is refused as a whole: RTSPS
-is not supported yet. Otherwise, edit the file and restart (`docker restart` takes under
+A config sent there with `certificate` or `tls_client_auth`, or one that changes a power
+setting, is refused as a whole: RTSPS is not supported yet, and power settings come only
+from the config file. Otherwise, edit the file and restart (`docker restart` takes under
 a second).
 
-**Settings from before the native backend that matter here:**
+**Power and snapshot settings.** These are shared with the GStreamer backend (see the
+README's [Power section](../../README.md#power-sleeping-and-always-on-cameras)):
 
 | Key | Where | Default | What |
 |---|---|---|---|
-| `idle_grace_s` | camera | 10 | How long the camera stays connected after the last use |
-| `battery` | camera | auto | `false` marks a mains camera (it may then stay connected) |
-| `idle_disconnect` | camera | sleep if battery or unknown | Force sleeping or always-on |
+| `battery` | camera | unset, treated as battery | `false` marks a mains camera, which then stays connected. Not detected automatically |
+| `idle_disconnect` | camera | unset: follows `battery` | `true` forces sleeping, `false` forces always-on (with a warning unless `battery = false`) |
+| `idle_grace_s` | camera | 10 | How long a sleeping camera stays connected after the last use |
 | `motion_hold_max_s` | camera | 120 | Longest a motion event keeps the camera awake |
 | `snapshot_port` | top | `bind_port + 1` | The snapshot endpoint (below); `0` turns it off |
 | `snapshot_fresh` | camera | `false` | Allow `?fresh=1`, which wakes the camera for a new picture |
 
-**The snapshot endpoint.** It is on by default at `http://<bind>:<bind_port+1>/<camera>/snapshot.jpg`.
-- It serves the last picture taken at a wake, without waking a sleeping camera.
+**A camera with neither `battery` nor `idle_disconnect` set sleeps**, whatever its real
+power source, with either backend. Before this work every camera stayed connected. Set
+`battery = false` on mains, PoE and NVR-channel cameras to keep that behaviour.
+
+**The snapshot endpoint.** It is on by default at `http://<bind>:<bind_port+1>/<camera>/snapshot.jpg`,
+in `rtsp` and `mqtt-rtsp` modes, with either backend.
+- It serves the last picture taken at a wake, without waking a sleeping camera. Until the
+  first wake it serves a grey placeholder (HTTP 200).
+- `?fresh=1` takes a new picture, waking the camera: only with `snapshot_fresh = true`
+  (otherwise 403), and at most once a minute per camera.
 - With no `[[users]]`, anyone who can reach the port may fetch it. With users, it takes
   HTTP Basic only, even when `rtsp_auth` is digest-only. Failed logins are paced like
   RTSP's.
@@ -114,7 +130,10 @@ a second).
 
 ## Battery cameras
 
-The native backend is built for cameras that must sleep:
+A camera sleeps when `idle_disconnect = true`, or when `idle_disconnect` is unset and
+`battery` is not `false`, so **by default**. Sleeping itself (no contact at boot, release
+after `idle_grace_s`) is the same with both backends. The native backend adds what keeps
+probes from waking the camera:
 - **No contact at boot.** A sleeping camera is not contacted until a client plays.
 - **Probes don't wake it.** After the first time, `DESCRIBE` (health checks, Home
   Assistant probes) is answered from a cache in the state directory.
@@ -124,15 +143,19 @@ The native backend is built for cameras that must sleep:
 - **It sleeps again soon.** The camera is released `idle_grace_s` after the last viewer
   leaves.
 - **One wake per 10 minutes for learning.** A stream that has never been seen is learned
-  at most once per camera per 10 minutes. One wake teaches every stream kind.
-- `battery` unknown is treated as battery.
+  at most once per camera per 10 minutes. One wake teaches every stream kind. A camera
+  that is already connected is not limited, and neither is an always-on camera.
+- `battery` unknown is treated as battery: neolink never decides on its own that a camera
+  is on mains power.
 
 `pause.on_motion` needs motion events, and a camera sends those only over an open
 connection. **On a sleeping camera, `pause.on_motion` cannot start the stream on motion.**
-The native build has no push notifications, which would go through Google's and
-Reolink's cloud. Neolink warns about this at startup. Use it only on a camera that stays
-connected (`idle_disconnect = false`, which costs battery), or let clients wake the camera
-by playing.
+The native build has no push notifications (the optional `pushnoti` feature is not in
+it), which would go through Google's and Reolink's cloud. Neolink warns about this at
+startup. Use it only on a camera that stays connected (`battery = false` on mains, or
+`idle_disconnect = false`, which costs battery), or let clients wake the camera by
+playing. The same holds for MQTT motion and floodlight status: they are reported only
+while the camera is awake.
 
 ## What behaves differently from the GStreamer backend
 
@@ -160,18 +183,20 @@ These are the SPEC §5 deltas:
 
 ## Privacy and trust
 
-- **`irap.bin`** (in the state directory, one per camera stream) holds the last keyframe:
+- **`irap.bin`** (in the state directory as `cache/<hash>-<stream>/irap.bin`, one per
+  camera stream) holds the last keyframe:
   an image of what the camera last saw. Set `persist_irap = false` to keep it only in
   memory, and protect the state directory like the config.
-- **MQTT.** The `neolink/config` topic can rewrite the whole config, including users,
-  `permitted_users` and camera addresses. Anyone who can publish to your broker can do
-  that. Set `mqtt_config_writes = false` unless you use it.
+- **MQTT.** The `neolink/config` topic can rewrite most of the config, including camera
+  addresses, but not users, `permitted_users` or power settings. Anyone who can publish
+  to your broker can do that. Set `mqtt_config_writes = false` unless you use it.
   - Passwords left out of a config sent there are filled in from the running config only
     when the camera's address (and UID) and the MQTT broker are unchanged. A config that
     points a camera or the broker elsewhere doesn't get the current secrets.
   - A malformed config is answered with the line number only, never the line's text.
-- **Snapshots.** `<camera>.jpg` in the state directory is the last picture of each camera;
-  treat it like `irap.bin`.
+- **Snapshots.** `camera/<name>-<hash>.jpg` in the state directory (next to that camera's
+  `<name>-<hash>.json` state file) is the last picture of each camera; treat it like
+  `irap.bin`.
 - **Logs** never contain passwords, `Authorization` headers or `user:pass@` URLs, at any
   level.
 - **Bridged media during outages is synthetic** (a repeated keyframe and silence). A

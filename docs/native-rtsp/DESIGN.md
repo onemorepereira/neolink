@@ -165,7 +165,7 @@ replaces v1's "drop the receiver / AbortHandle" ambiguity (F-int 5).
 | Backend select | `rtsp_backend` key plus `--rtsp-backend` CLI. Default `gstreamer` when both are compiled in during beta, `native` after the flip. Choosing a backend that isn't compiled in is a startup error. |
 | Config | New keys (§7). The R14 dead-key warnings come from a second pass over `toml::Value`, applied to file **and** MQTT-provided configs (`main.rs:77-81`, `mqtt/mod.rs:205`) (F-int 17). Redacting `Debug` for `CameraConfig`, `UserConfig` and `MqttServerConfig` (F-int 16). The trace at `camthread.rs:40` logs the redacted form. The MQTT `config/status` error echo is redacted. |
 | Shutdown (R27, F-int 3) | New `NeoReactor::shutdown(deadline)`: HangUp to each `NeoCam`, await the JoinSet. `camthread` logout gets `timeout(2 s)`. `main` sets up `tokio::signal` (unix SIGTERM/SIGINT; Windows ctrl_c and ctrl_break), then a root `CancellationToken`, then RTSP server shutdown (BYE, `shutdown(Write)`, drain ≤ 1 s, close), then `reactor.shutdown(3 s)`, then exit 0. A hard deadline of 5 s → `exit(0)`. The `mqtt-rtsp` `select!` gets the same token, so one side finishing shuts the other down gracefully (F-int 21). The root tokio features now list `signal`, `net` and `time` explicitly (F-int 20). |
-| MQTT | `mqtt_config_writes` (R29) gates the `config` topic handler (`mqtt/mod.rs:194-268`). When it is false, the handler rejects the write and publishes a redacted reason. |
+| MQTT | `mqtt_config_writes` (R29) gates the `config` topic handler (`mqtt/mod.rs:194-268`). When it is false, the handler rejects the write and publishes a redacted reason. When it is true, `mqtt/configwrite.rs` still refuses a write that changes a camera's power settings from the config file (`CameraConfig::power_changes`, SPEC P14), or the users or any camera's `permitted_users` (SPEC R29). |
 | Docker | **CMD exec form** that keeps `/usr/local/bin/neolink` (F-int 14). `NEO_LINK_MODE` is honoured by argv pre-processing in `main`: if no subcommand is given and the env var is set, it is inserted (clap `env` can't pick a subcommand). `FROM scratch` + CA certs + a `/state` volume. **The image runs as root by default for compatibility (F-ds 15)**: existing setups mount root-owned 0600 configs. `PUID`/`PGID` env vars make the binary drop privileges after reading the config. An unreadable config gives a clear EACCES error that names the file and mode. `state_dir` defaults to `/state` when `NEO_IN_CONTAINER=1`, which the image sets. The `ulimit -n 65535` from `entrypoint.sh` becomes a `setrlimit` call in the binary. `/entrypoint.sh` is kept as a tiny shim in the `:native-debug` (busybox) variant only. Release notes list the removal of `/entrypoint.sh` and the shell. |
 | build.rs | Gated on `CARGO_FEATURE_GSTREAMER` and `CARGO_CFG_TARGET_OS`; today it checks the host OS (F-int 19). |
 | Release profile | `[profile.release] strip = "symbols"`, keeping `panic = "unwind"`. musl via `cross` with `JEMALLOC_SYS_WITH_LG_PAGE=16` on aarch64. |
@@ -246,6 +246,22 @@ The MediaClock is per Hub and lives as long as the Hub, **across Idle** (F-cc 16
   recorded for the *next* DESCRIBE and existing sessions are not touched.
 - **Codec / resolution / params change**: `gen += 1`. Sessions on the old gen are closed via
   their cancel token (BYE, then close).
+- **Changes are debounced; learning is not.** The first desc is learned at once (readiness
+  above). After that, a new video identity is adopted only when **2 IRAPs in a row** carry
+  it, and a new audio ASC only after **8 ADTS frames in a row**. One corrupt or odd frame
+  never closes every session. Until a new video identity is confirmed, video is held back
+  (sessions on the current desc never decode the new parameter sets with the old ones), and
+  audio frames with an unconfirmed config are dropped and don't touch the audio clock. An
+  ADTS frame is validated in full (length, blocks) before its header is learned from. A real
+  change costs one GOP (video) or 8 AUs (audio) of delay.
+- **The video hold is bounded.** It ends as a glitch (logged at info) when an IRAP carries
+  the current parameter sets again, when an IRAP carries no usable parameter sets (nothing
+  could confirm the new ones), or after `max(2 × GOP, 5 s)` without a decision. After an
+  expiry mid-GOP, video resumes at the next IRAP. A hold longer than the bridge threshold
+  (3 s + latency, e.g. after a lost IRAP) is bridged like an outage, with the current
+  stream's cached IRAP.
+- NALs with a corrupt header (`forbidden_zero_bit` set, or H.265 `nuh_temporal_id_plus1 =
+  0`) fail the R2 whitelist.
 
 **Cache** (`{state_dir}/cache/{sha256(camera)[..16]}-{kind}`; the same file name rule
 everywhere, F-int R11)
@@ -277,6 +293,12 @@ moves therefore never show up as RTP or NTP steps (F-cc 7).
 - **First frame after (re)start** is released immediately. It is an IRAP, because the
   ingest gate drops video until the first IRAP. The anchor is set so this frame is due now,
   which gives clients data at once (F-cc 11). Subsequent frames are spaced by media time.
+  A "start" is a source start after `stop_source`, which empties the queue.
+- **MediaClock discontinuity** (counter jump, `Restarted`): the anchor is kept. Media time
+  stays continuous (one frame on), so the frame is due one frame after the last one
+  queued, or on arrival if it is late (an underrun). Restarting the anchor here would
+  release every queued frame at once, up to `latency` ahead of its time, and the
+  re-latch (§4.5) would keep that lead on the wire for good, more at each discontinuity.
 - **Underrun** (`arrival > due + 1 frame`): the anchor moves forward so the frame is due on
   arrival. Delivery latency grows; timestamps are unaffected.
 - **Excess latency recovery (F-cc 8)**:
@@ -319,6 +341,12 @@ There is one wire clock per Hub, in µs, monotonic, shared by all tracks and ses
 | Bridge engaged, then live resumes | `offset = virtual_now − media_us(first live frame)`, where `virtual_now = last_wire_out + (now − last_wire_out_wall)`. Applied to all tracks. Live video is dropped until the next IRAP (that IRAP *is* the "first live frame"). |
 | MediaClock discontinuity flag | Same formula as resume |
 | Otherwise | unchanged |
+
+A re-latch also keeps the frame at least one frame interval + 1 ms after the last *video*
+frame (and after a late joiner's restamp), so a client counting in frame ticks never sees
+two video frames at the same time. Not after the last audio AU: that one was usually sent
+moments before, and the step would push wire time ahead of wall time at every
+discontinuity. Live audio that would not follow its last AU is dropped.
 
 **Monotonic guard.** Per track, `wire_ts = max(wire_ts, last_out + 1 tick)`. This is
 enforced after the offset is applied. The guard is a safety net; any time it engages it is
@@ -639,19 +667,58 @@ The connection task owns the read half. A writer task owns the write half.
 - A user with no password matches only the empty password.
 
 **Failed-auth limiting (F-cc 5)**: only requests that carried credentials and failed count.
-The initial no-credentials 401 does not.
+The initial no-credentials 401 does not. Failures count per (address, username), where
+the address is the IP or IPv6 /64 and the username is the one the credentials claim (known
+or not; unparseable credentials count as the empty name), and per address across all
+usernames. A username is *limited* from an address after 10 failures for that pair in the
+last minute, or after 50 (5 × 10) for the address in all, which stops username spraying.
+Credentials for a limited username get exactly the answer wrong ones would (401 with a
+fresh challenge, or anonymous access on an anonymous mount), also where a right password
+would have earned `stale=true` or a 404, so a guesser can't tell a hit from a miss.
+
+Why per username: under rootless podman (slirp4netns, pasta) or docker-proxy, every LAN
+client can appear as one address. A client with a stale password for one user then
+throttles only that user, not Frigate's; and nobody gets unthrottled guesses at any user.
+The one exception is a connection that already authenticated as that user: its session's
+keepalives (which carry credentials and are re-authorized, R23) and its SETUP after
+DESCRIBE go through, so a brute force of user X from Frigate's address doesn't break
+Frigate's running session as X. It does refuse Frigate's *new* connections as X while it
+lasts: from one address a guesser and a reconnecting client are indistinguishable.
+
+Nothing sleeps: an earlier design delayed each failure past the limit by its own 1 s slot
+inside the request handler, which held the connection's slots, stalled shutdown, and
+still answered a right guess at once.
 
 ### 6.6 Limits (R24, revised, F-cc 5)
 
 | Limit | Value | Over-limit behaviour |
 |---|---|---|
 | Global connections | 128 | 503, then close |
-| Per IP: **unauthenticated** connections (no successful auth yet, or an anonymous mount with no request yet) | 64 | 503, then close |
-| Per IP: authenticated connections | not limited separately (only by the global limit) | — |
+| Per IP (IPv6: /64): **unauthenticated** connections (no credentials accepted and no session yet) | 32 | the IP's own oldest unauthenticated connection is closed |
+| All **unauthenticated** connections | `max_connections / 2` = 64 | the oldest unauthenticated connection of the IP holding the most is closed (the new connection's own IP if it holds as many) |
+| Unauthenticated lifetime (with or without users) | 30 s from connect, or from losing a session | close |
+| Per IP: authenticated connections, and connections with a session (also anonymous) | not limited separately (only by the global limit) | — |
 | First request | within 10 s | close |
-| Request rate | 20/s, burst 40, per connection | 503, then close |
+| Request rate | 20/s, burst 40, per connection | 503 |
 | Bodies | Content-Length ≤ 4 KiB | 413 |
-| Failed auth | 10/min per IP | 1 s response delay |
+| Failed auth | 10/min per (IP, username), 50/min per IP | that username's credentials (every username's, past the per-IP ceiling) from that IP are answered as wrong, except on connections already authenticated as that user (§6.5) |
+| accept() errors (EMFILE, ENOMEM) | — | retry after 100 ms |
+
+Why close an old connection instead of refusing the new one: every client starts
+unauthenticated, so a full table that refuses newcomers locks everyone out, and a flood
+that keeps it full needs no more than it already holds. Closing the heaviest address's
+oldest connection means a flood only displaces itself; an attacker would need as many
+addresses (or /64s) as there are slots to displace other clients, and even then only
+clients still authenticating: authenticated and playing clients are never closed this way.
+Legitimate clients are unauthenticated for a round trip or two (Digest 401, then
+credentials), or until SETUP on an anonymous mount, so the caps don't touch Frigate,
+go2rtc or HA on one IP, behind Docker NAT included.
+
+What stays open: with no users configured (or an anonymous mount), any client can take
+up to `max_connections` with real sessions, as many legitimate players could. Anonymous
+access means trusting the network; configure users to limit it. IPv6 addresses are keyed
+per /64, so devices of one home LAN share an address's caps and failed-auth limit; keying
+per /128 would let anyone with a /64 (everyone) bypass both.
 
 ## 7. New config keys (schema, F-int §5.2)
 
@@ -667,7 +734,7 @@ The initial no-credentials 401 does not.
 | `pacing_latency_ms` | camera | 0–3000, auto (§4.4) | |
 | `parameter_sets` | camera | `"strip"\|"passthrough"\|"inject"`, `"strip"` (A4b, Gate 3) | |
 | `bridge_fps` | camera | 0.1–2, `0.2` | |
-| `battery` | camera | bool, auto-detected (`None` → battery) | Overrides detection |
+| `battery` | camera | bool, unset (`None` → battery) | Not auto-detected: the state file records a successful battery read, but only the config decides whether a camera sleeps. `false` makes the camera always-on unless `idle_disconnect = true` |
 | `rtcp_sr` | camera | bool, `true` | |
 | `bridge_max_s` | camera | 10–3600, `120` | |
 | `persist_irap` | camera | bool, `true` | |
@@ -759,7 +826,8 @@ backends.
   drop, not only after the first use. This fixes `neocam.rs:357-366`.
 - `idle_disconnect` keeps its meaning but changes its default:
   - unset and battery/unknown → sleep;
-  - unset and mains → always-on, as today;
+  - unset and mains (`battery = false` in the config; mains is never detected) →
+    always-on, as today;
   - explicitly `false` → always-on, with a warning on battery cameras.
 
 **Passive tasks (P3)**
@@ -775,11 +843,15 @@ backends.
 
 **Wake ledger (P6)**
 - A `Vec` ring of the last 1000 wakes per camera, in memory.
-- Each permit carries a reason string, which `run_task` callers pass. Today permits have
-  no reason, so this is a signature change on `NeoInstance::permit`/`run_task`.
+- Each permit carries a reason string: `stream:<kind>`, `cli:<cmd>`, `mqtt:<topic>` for
+  every MQTT task, and so on.
+- The current state and the day's totals are published retained on
+  `neolink/<camera>/status/wakes`; the 13th wake within an hour logs a warning naming the
+  reasons (at most once an hour).
 
 **Snapshot endpoint (P5)**
-- A minimal HTTP/1.1 GET server on `snapshot_port` (same limits as §6.6).
+- A minimal HTTP/1.1 GET server on `snapshot_port` (same limits as §6.6; failed auth as
+  §6.5, per (address, username) with its own counters, answered at once).
 - Auth is the shared module from §6.5.
 - It serves the cached JPEG and never takes a permit unless `?fresh=1` is allowed by
   config.

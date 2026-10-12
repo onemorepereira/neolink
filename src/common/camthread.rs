@@ -5,7 +5,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{config::CameraConfig, utils::connect_and_login, AnyResult};
+use crate::{
+    config::CameraConfig,
+    utils::{connect, login},
+    AnyResult,
+};
 use neolink_core::bc_protocol::BcCamera;
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
@@ -39,37 +43,71 @@ impl NeoCamThread {
         }
     }
     /// Connect, log in, and serve the camera until it fails, the config changes, or it is
-    /// released (state goes `Disconnected`). Every exit after login logs out (SPEC P13).
+    /// released (state goes `Disconnected`). Every exit once the login request is sent logs
+    /// out (SPEC P13), a login still in progress first being given [`LOGIN_GRACE`].
     async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<Exit> {
         let name = config.name.clone();
         log::trace!("Attempting connection with config: {config:?}");
-        // Until logged in, a release or config change just abandons the attempt
+        // Until connected, a shutdown, release or config change just abandons the attempt
         let mut state = self.state.clone();
         let mut config_rec = self.config.clone();
         config_rec.borrow_and_update();
         let cancel = self.cancel.clone();
         let camera = tokio::select! {
-            v = connect_and_login(config) => Arc::new(v?),
+            v = connect(config) => v?,
             _ = cancel.cancelled() => return Ok(Exit::Shutdown),
             Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
                 return Ok(Exit::Released);
             }
             Ok(_) = config_rec.wait_for(|new| connection_changed(new, config)) => return Ok(Exit::Released),
         };
+        {
+            let login = login(&camera, config);
+            tokio::pin!(login);
+            let interrupted = tokio::select! {
+                v = &mut login => {
+                    v?;
+                    None
+                }
+                _ = cancel.cancelled() => Some(Exit::Shutdown),
+                Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {
+                    Some(Exit::Released)
+                }
+                Ok(_) = config_rec.wait_for(|new| connection_changed(new, config)) => Some(Exit::Released),
+            };
+            if let Some(exit) = interrupted {
+                // The camera has the login request, so it is awake and opens a session as
+                // it answers: let it answer (briefly), then log that session out instead
+                // of leaving it open until the camera times it out
+                if let Ok(Ok(())) = timeout(LOGIN_GRACE, &mut login).await {
+                    release(&camera).await;
+                } else {
+                    let _ = timeout(Duration::from_secs(1), camera.shutdown()).await;
+                }
+                return Ok(exit);
+            }
+        }
+        let camera = Arc::new(camera);
         log::trace!("  - Connected");
         self.logged_in = true;
 
         // Some calls answer 400 while the camera wakes up; retry those instead of sleeping a
-        // fixed time before every use (SPEC P13)
-        for attempt in 0..3 {
-            match update_camera_time(&camera, &name, config.update_time).await {
-                Err(e) if is_busy(&e) && attempt < 2 => sleep(Duration::from_secs(1)).await,
-                Err(e) => {
-                    log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
-                    break;
+        // fixed time before every use (SPEC P13). A shutdown meanwhile goes straight to the
+        // logout below
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = async {
+                for attempt in 0..3 {
+                    match update_camera_time(&camera, &name, config.update_time).await {
+                        Err(e) if is_busy(&e) && attempt < 2 => sleep(Duration::from_secs(1)).await,
+                        Err(e) => {
+                            log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
+                            break;
+                        }
+                        Ok(()) => break,
+                    }
                 }
-                Ok(()) => break,
-            }
+            } => {}
         }
 
         self.camera_watch.send_replace(Arc::downgrade(&camera));
@@ -247,10 +285,16 @@ fn is_busy(e: &anyhow::Error) -> bool {
     )
 }
 
-/// Log out and close, bounded so that a dead camera can't hold us (SPEC P13)
+/// When a shutdown or release interrupts a login, how long the login (which the camera
+/// already has) may take to complete, so that its session can be logged out. With
+/// [`release`], a camera's shutdown takes at most 4.5 s, inside `NeoCam::shutdown`'s 5 s
+const LOGIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Log out (the camera's answer is awaited, ≤ 1 s) and close; ≤ 2.5 s, so that a dead
+/// camera can't hold us (SPEC P13)
 async fn release(camera: &BcCamera) {
-    let _ = timeout(Duration::from_secs(2), camera.logout()).await;
-    let _ = timeout(Duration::from_secs(2), camera.shutdown()).await;
+    let _ = timeout(Duration::from_millis(1500), camera.logout()).await;
+    let _ = timeout(Duration::from_secs(1), camera.shutdown()).await;
 }
 
 impl Drop for NeoCamThread {

@@ -5,6 +5,7 @@
 # Runs in the neolink-clients image (tests/e2e/clients/Containerfile) with --network host,
 # the pinned static ffmpeg on PATH (/ffmpeg/bin) and a built xtask:
 #   cargo build --release -p xtask && sh tests/e2e/clients.sh
+# Exit status: the number of failed checks; 2 when a server or go2rtc did not start.
 # E2E_WORK must be a fresh directory (nothing in it is deleted or reused).
 # Env: TESTS (default "A1 A2 A2b A4 A4b A5 A10"), A2_SECS (120), A2B_SECS (20),
 #      A5_SECS (60; the full gate is 300), PSETS (the --parameter-sets mode for the main
@@ -93,6 +94,11 @@ serve() { # port name extra-args...; sets SRV
   wait_for "$W/ready.$n" || { echo "server $n did not start:"; cat "$W/server.$n.log"; exit 2; }
 }
 stop() { kill -TERM "$1" 2>/dev/null; wait "$1" 2>/dev/null; }
+# A server must still be running when its tests end: one that died mid-run fails the run
+stop_server() { # pid name
+  if ! kill -0 "$1" 2>/dev/null; then fail "$2: the server exited during the run"; return; fi
+  stop "$1"
+}
 url() { echo "rtsp://${2:-}127.0.0.1:$PORT/argus/$1"; }
 count() { grep -c -E "$1" "$2" 2>/dev/null || true; } # pattern file -> number of lines
 
@@ -195,6 +201,7 @@ go2rtc_start() {
   go2rtc -config "$W/go2rtc.yaml" > "$W/go2rtc.log" 2>&1 &
   G2R=$!; PIDS="$PIDS $G2R"
   i=0; until curl -s -o /dev/null "http://127.0.0.1:$G2R_API/api" || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
+  curl -s -o /dev/null "http://127.0.0.1:$G2R_API/api" || { echo "go2rtc did not start:"; tail -20 "$W/go2rtc.log"; exit 2; }
 }
 frame() { # src out -> 0 if a JPEG came back; sets JSIZE, JCODE
   JSIZE=0; JCODE=000
@@ -232,7 +239,7 @@ if want A4b; then
       fi
       stop $RP
     done
-    stop $S4; p=$((p+1))
+    stop_server $S4 "a4b.$m"; p=$((p+1))
   done
 fi
 
@@ -321,9 +328,9 @@ if want A10; then
     else got=${last:-none}; fi
     a10_result vlc "$R_EXP" "$got"
   done
-  stop $A1S; stop $A2S; stop $A3S; stop $A4S
+  stop_server $A1S a10.both; stop_server $A2S a10.basic; stop_server $A3S a10.digest; stop_server $A4S a10.anyone
 fi
 
-stop $MAIN_SRV
-[ $FAILS = 0 ] && echo "ALL PASSED" || echo "$FAILS FAILED"
+stop_server $MAIN_SRV main
+if [ $FAILS = 0 ]; then echo "ALL PASSED"; else echo "$FAILS FAILED"; fi
 exit $FAILS

@@ -29,6 +29,8 @@ features not yet in upstream master.
 - Motion Detection
 - Paused Streams (when no rtsp client or no motion detected)
 - Save a still image to disk
+- Power management: cameras are connected only while in use, so battery cameras
+  can sleep (see [Power](#power-sleeping-and-always-on-cameras))
 
 **Minor Features**:
 
@@ -85,6 +87,16 @@ Make a config file see below.
 
 ## Config/Usage
 
+> **Upgrading? Cameras now sleep by default.** A camera with neither `battery` nor
+> `idle_disconnect` in its config is no longer connected at startup or kept connected:
+> neolink connects only while something uses it (an RTSP viewer, an MQTT command, a CLI
+> command) and disconnects 10 s after. While it sleeps, MQTT motion and floodlight status
+> aren't reported and `pause.on_motion` can't start the stream. This holds for both RTSP
+> backends. **For every mains, PoE or NVR camera, add `battery = false`** to keep it
+> connected as before. Battery and solar cameras need no change. Details:
+> [Power: sleeping and always-on cameras](#power-sleeping-and-always-on-cameras) and
+> [CHANGELOG.md](CHANGELOG.md).
+
 ### RTSP
 
 To use `neolink` you need a config file.
@@ -108,7 +120,11 @@ username = "admin"
 password = "password"
 uid = "BCDEF0123456789A"
 address = "192.168.1.10"
+battery = false # a mains camera: stay connected
 ```
+
+`Camera01` sets nothing about power, so it sleeps (is connected only while in use), which
+suits a battery camera. `Camera02` is on mains power and stays connected.
 
 Create a text file called `neolink.toml` in the same folder as the
 neolink binary. With your config options.
@@ -161,6 +177,13 @@ In the `[[cameras]]` section of the toml.
 
 Possible values are `local`, `remote`, `map`, `relay` later values implictly
 enable prior methods.
+
+Local discovery always runs first, on its own. The Reolink cloud methods are tried
+only if it fails, and never at the same time: a cloud registration can wake a
+battery camera through Reolink's servers. When a cloud method is allowed, local
+discovery gives up after 8 s, so a camera reachable only through the cloud connects
+up to 8 s later than when the methods ran in parallel. Discovery runs at every
+connection, so for a sleeping camera at every wake.
 
 #### Cellular
 
@@ -235,38 +258,76 @@ Control messages:
 - `/control/floodlight [on|off]` Turns floodlight (if equipped) on/off
 - `/control/floodlight_tasks [on|off]` Turns floodlight (if equipped) tasks on/off
   This is the automatic tasks such as on motion and night triggers
-- `/control/wakeup (mins)` For cameras that are using `idle_disconnect` this will
-  force a wakeup for at least the given minutes
+- `/control/wakeup (mins)` Keep a sleeping camera (the default, see
+  [Power](#power-sleeping-and-always-on-cameras)) awake for the given whole
+  minutes, at most 30 (larger values are capped, anything else is rejected with a
+  `FAIL:` reply). A new wakeup replaces the pending one instead of adding to it, and
+  `0` cancels it. It also ends when neolink stops or the camera is removed
 - `/control/siren on` Signal the siren, the message is always "on" as there is no
   "off" signal for the siren
 
+Every `/control/*` message needs the camera, so it wakes a sleeping camera for as
+long as the command runs (each is recorded as `mqtt:<topic>` in `/status/wakes`).
+`/query/*` messages don't wake a sleeping camera unless the payload is `fresh`; see
+Query Messages below. Publish them without the retain flag: retained `/control/*` and `/query/*` messages are ignored with a warning, so
+that a broker reconnect doesn't replay them and wake the camera.
+
 Status Messages:
 
-- `/status disconnected` Sent when the camera goes offline
+- `/status connected|disconnected` Whether neolink is connected to the camera
+  right now. A sleeping camera is `disconnected` until something wakes it, so
+  read this as "awake", not "working"
 - `/status/battery` Sent in reply to a `/query/battery` an XML encoded version
-  of the battery status
+  of the battery status. For a sleeping camera this is the reading from its last
+  wake; the reply on `/query/battery` gives its age
 - `/status/battery_level` A simple % value of current battery level, only
-  published when `enable_battery` is true in the config
+  published when `enable_battery` is true in the config. For a sleeping camera
+  it is published once per wake, not every `battery_update` ms
 - `/status/pir` Sent in reply to a `/query/pir` an XML encoded version of the
   pir status
 - `/status/motion` Contains the motion detection alarm status. `on` for motion
-  and `off` for still, only published when `enable_moton` is true in the config
+  and `off` for still, only published when `enable_motion` is true in the config.
+  The camera sends motion events only over an open connection, so for a sleeping
+  camera this stays `unknown` until a wake and is updated only while it is awake.
+  Motion that is `on` when the camera goes to sleep (or its connection drops) is
+  published as `off`
 - `/status/ptz/preset` Sent in reply to a `/query/ptz/preset` an XML encoded
   version of the PTZ presets
 - `/status/preview` a base64 encoded camera image updated every 2s. Not
   every camera supports the snapshot command needed for this. In such cases
   there will be no `/status/preview` message. Only published when
-  `enable_preview` is true in the config
+  `enable_preview` is true in the config. For a sleeping camera it is the
+  snapshot taken at each wake, published once per wake
 - `/status/floodlight_tasks` The current status of the floodlight tasks
-  used updated every 2s by default
+  used updated every 2s by default (for a sleeping camera, only while it is
+  awake)
+- `/status/wakes` The wake ledger, retained, published whenever the camera wakes
+  or goes back to sleep: JSON with `awake`, `reason` (what woke it, e.g.
+  `mqtt:control/wakeup`, `mqtt:query/battery` or `stream:Main`), `since` (Unix seconds),
+  `last_awake_s`, `today_wakes`, `today_awake_s` and `last_hour_wakes`. A camera
+  woken more than 12 times in an hour is also logged as a warning, with the reasons
 
 Query Messages:
 
-- `/query/battery` Request that the camera reports its battery level
-- `/query/pir` Request that the camera reports its pir status
-- `/query/ptz/preset` Request that the camera reports its PTZ presets
+Each query is answered on its own topic with `OK` or `FAIL: <why>`. A query never
+wakes a sleeping (battery) camera unless its payload is `fresh`; always-on
+cameras answer every query live.
+
+- `/query/battery` Request that the camera reports its battery level. A sleeping
+  camera answers with the reading from its last wake (`OK: saved 120 s ago ...`),
+  or `FAIL` if there is none yet. With the payload `fresh` it wakes the camera,
+  unless the saved reading is at most 60 s old
+- `/query/pir` Request that the camera reports its pir status. On a sleeping
+  camera this needs the payload `fresh`, unless the camera is awake anyway
+- `/query/ptz/preset` Request that the camera reports its PTZ presets (as
+  `/query/pir` for sleeping cameras)
 - `/query/preview` Request that the camera post a base64 encoded jpeg
-  of the stream to `/status/preview` now, ignoring the timer
+  of the stream to `/status/preview` now, ignoring the timer. A sleeping camera
+  posts the snapshot from its last wake; `fresh` wakes it as for `/query/battery`
+
+Concurrent `fresh` queries on the same topic share one wake: the extra ones are
+answered `OK: a fresh query is already waking the camera; its answer follows`.
+Retained `control` and `query` messages are ignored.
 
 ### Controlling RTSP from MQTT
 
@@ -309,11 +370,36 @@ Setting a value of `None` will disable the stream
   enabled = false
 ```
 
+**Power settings come only from the config file.** A config published to
+`neolink/config` must leave each camera's `battery`, `idle_disconnect` (or its aliases
+`idle`, `idle_disc`), `idle_grace_s`, `motion_hold_max_s`, `snapshot_fresh` and
+`pause.on_motion` as the config file has them, and may not enable a camera that the
+file disables (disabling one is allowed). Leaving a key out counts as changing it when
+the file sets it. A camera that the file doesn't have may be added, but with
+those keys unset: it sleeps, with the default timings. A write that breaks this is
+refused whole, with nothing applied: `neolink/config/status` gets
+`FAIL: power settings can only be changed in the config file, and this write changes
+<camera> (<keys>); ...` and neolink logs a warning per camera. Edit the config file and
+restart neolink to change them. So anyone who can publish to the broker can't keep a
+battery camera awake. Writes that keep these values, such as toggling
+`[cameras.mqtt]` features, apply as before.
+
+The same goes for access: a write that adds, removes or re-passwords a `[[users]]` entry,
+or changes any camera's `permitted_users`, is refused whole with
+`FAIL: users and permitted_users can only be changed in the config file, ...`. Order
+doesn't matter, and passwords left out (as neolink publishes the config) are kept. The
+rest of the config (addresses, streams, `[cameras.mqtt]` features) can still be
+rewritten unless `mqtt_config_writes = false`.
+
 ### MQTT Disable Features
 
 Certain features like preview and motion detection may not be desired
 you can disable them with the following config options.
-Disabling these may help to conserve battery
+
+None of these wake a sleeping camera: they only listen or poll while the camera
+is already awake for another reason (see
+[Power](#power-sleeping-and-always-on-cameras)). On an always-on camera they run
+all the time, so disabling them saves a little traffic.
 
 ```toml
 bind = "0.0.0.0"
@@ -330,22 +416,24 @@ password = "password"
 uid = "ABCDEF0123456789"
 [cameras.mqtt]
 enable_motion = false        # motion detection
-                             # (limited battery drain since it
-                             # is a passive listening connection)
+                             # (passive: only while the camera is connected)
                              #
 enable_light = false         # flood lights only available on some camera
-                             # (limited battery drain since it
-                             # is a passive listening connection)
+                             # (passive: only while the camera is connected)
                              #
 enable_battery = false       # battery updates in `/status/battery_level`
                              #
 enable_preview = false       # preview image in `/status/preview`
                              #
-enable_floodlight = false    # preview image in `/status/floodlight_tasks`
+enable_floodlight = false    # floodlight tasks status in `/status/floodlight_tasks`
                              #
 battery_update = 2000        # Number of ms between `/status/battery_level` updates
+                             # (always-on cameras; a sleeping camera
+                             # publishes once per wake)
                              #
 preview_update = 2000        # Number of ms between `/status/preview` updates
+                             # (always-on cameras; a sleeping camera
+                             # publishes once per wake)
                              #
 floodlight_update = 2000     # Number of ms between `/status/floodlight_tasks` updates
 ```
@@ -381,6 +469,11 @@ Available features are:
   camera
 - `battery`: This adds a battery level sensor to home assistant
 - `siren`: Adds a siren button to home assistant
+
+With discovery on, every camera also gets an **Awake** binary sensor, driven by
+`neolink/<camera>/status`: on while neolink is connected to the camera. The
+entities' availability follows `neolink/status` (whether neolink itself is
+running), so a sleeping camera is not shown as unavailable.
 
 ### Extra Camera Settings
 
@@ -424,6 +517,7 @@ name = "Camera01"
 username = "admin"
 password = "password"
 uid = "ABCDEF0123456789"
+battery = false # on_motion needs a connected camera, see below
   [cameras.pause]
   on_motion = true # Should pause when no motion
   on_client = true # Should pause when no rtsp client
@@ -436,52 +530,216 @@ Then start the rtsp server as usual:
 ./neolink rtsp --config=neolink.toml
 ```
 
-### Idle Disconnects
+`on_motion` needs motion events, and a camera sends those only while neolink is
+connected to it. On a camera that sleeps (the default, see
+[Power](#power-sleeping-and-always-on-cameras)) it **cannot start the stream on
+motion**, and neolink warns about it at startup. Use it on a mains camera with
+`battery = false`, or on a battery camera with `idle_disconnect = false`, which keeps
+it connected and drains its battery. Each motion event keeps the camera connected for
+at most `motion_hold_max_s` seconds (default 120).
 
-To really save battery we need to disconnect the camera when it is idle.
+### Power: sleeping and always-on cameras
 
-To acheieve this you can add `idle_disconnect = true` to the `[[cameras]]`
-section
+> **Changed in this version.** Neolink used to stay connected to every camera all the
+> time unless you set `idle_disconnect = true`. Now a camera **sleeps by default**:
+> neolink connects to it only while something needs it. That is the right default for
+> battery and solar cameras. A mains, PoE or NVR camera needs `battery = false` to stay
+> connected as before. See
+> [Upgrading: cameras now connect on demand](#upgrading-cameras-now-connect-on-demand).
 
-```toml
-bind = "0.0.0.0"
+This applies to both RTSP backends (GStreamer and native) and to every mode (`rtsp`,
+`mqtt`, `mqtt-rtsp` and the CLI commands).
 
-[[cameras]]
-name = "Camera01"
-username = "admin"
-password = "password"
-uid = "ABCDEF0123456789"
-idle_disconnect = true
-[cameras.pause]
-  on_client = true # Should pause when no rtsp client
-  timeout = 2.1 # How long to wait after motion stops before pausing
+#### Sleeping or always-on
+
+Each `[[cameras]]` entry is either **sleeping** (connected on demand) or **always-on**.
+Two keys decide which:
+
+| `idle_disconnect` | `battery` | Result |
+|---|---|---|
+| unset | unset | **Sleeps** (unknown power is treated as battery) |
+| unset | `true` | Sleeps |
+| unset | `false` | Always-on |
+| `true` | any | Sleeps |
+| `false` | any | Always-on (logs a warning unless `battery = false`) |
+
+`idle_disconnect` (aliases `idle`, `idle_disc`) wins when it is set; otherwise `battery`
+decides. Neolink does not detect mains power by itself. It records in its state file that
+a camera has a battery once a battery read succeeds, but that never changes whether the
+camera sleeps: only the config does.
+
+**What to set, by camera type:**
+
+| Camera | Set | What you get |
+|---|---|---|
+| Battery (Argus, Go, …) | Nothing (or `battery = true`) | Sleeps. Wakes for a viewer, a command or a `?fresh=1` snapshot, and sleeps again `idle_grace_s` after the last one |
+| Solar-charged battery | Nothing (or `battery = true`) | Same as battery |
+| Mains or PoE | `battery = false` | Always connected, as before this change: MQTT motion, floodlight status and the timed preview and battery updates all work |
+| NVR channel (`channel_id`) of a wired camera | `battery = false` | Always connected, as before. Each `[[cameras]]` entry has its own connection to the NVR and follows these rules by itself |
+| Battery camera you want connected anyway (24/7 recording, `pause.on_motion`) | `idle_disconnect = false` | Always connected; a battery-drain warning at startup; drains the battery |
+| Mains camera you want on demand | `idle_disconnect = true` (or leave both unset) | Sleeps like a battery camera |
+
+#### What wakes a sleeping camera
+
+A sleeping camera is **not contacted at startup**. It is connected only while something
+uses it, and released `idle_grace_s` seconds (default 10) after the last use ends:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Asleep: startup, no contact
+    Asleep --> Awake: demand
+    Awake --> Grace: last user gone
+    Grace --> Awake: new demand
+    Grace --> Asleep: idle_grace_s elapsed, logout
 ```
 
-When `idle_disconnect = true` neolink will disconnect from the camera 30s
-after it stops being used.
+These wake it:
+- **An RTSP client.** With the GStreamer backend, any client that connects starts the
+  camera stream and so wakes it, including a `DESCRIBE`-only health check. The native
+  backend answers `DESCRIBE` from a cache and wakes the camera only on `PLAY`, or to
+  learn a stream it has never seen (at most once per camera per 10 minutes).
+- **MQTT `control/*` messages**, while the command runs (at most 60 s each).
+  `control/wakeup <minutes>` keeps the camera awake for that many minutes, at most 30;
+  a new one replaces the pending one and `0` cancels it.
+- **MQTT `query/*` messages with the payload `fresh`** (several at once share one wake;
+  a battery or preview reading at most 60 s old is answered without waking). Without
+  `fresh`, queries are answered from the last wake and never wake the camera.
+- **CLI commands**: `pir`, `ptz`, `reboot`, `status-light`, `talk` and so on.
+  `battery` and `image` print what was saved at the last wake without waking the camera;
+  `--fresh`, or having nothing saved yet, wakes it (`image --use-stream` always does).
+- **`/<camera>/snapshot.jpg?fresh=1`** on the snapshot endpoint, only when the camera has
+  `snapshot_fresh = true`, and at most once a minute.
 
-Neolink considers it as being used if there is an active stream running, or
-if there is motion being detected or an mqtt command being run
+These **never** wake it:
+- the snapshot endpoint without `?fresh=1` (it serves the picture saved at the last wake);
+- the MQTT preview, battery and floodlight timers;
+- motion (the camera sends motion events only over an open connection, see below).
 
-[Because google remove the api for the push notifications we cannot
-reliably use push notifications to wake up, so motion won't wake
-up neolink anymore]
+Each time a sleeping camera is released, neolink logs one line at info level, for example
+`argus: awake 23.4 s for stream:Main; today: 3 wakes, 71 s awake`. With MQTT, the same
+ledger is published retained on `neolink/<camera>/status/wakes`, and a camera woken more
+than 12 times in an hour is logged as a warning naming what woke it.
 
-You can make neolink stop active streams when there are no rtsp clients using
+#### What changes for a sleeping camera
 
-```toml
-[cameras.pause]
-  on_client = true # Should pause when no rtsp client
-```
+While a camera sleeps, neolink has no connection to it, so anything that relies on the
+camera sending data stops until the next wake:
 
-Once in the disconnected state. Neolink will stay disconnected until there is a
-new requested activation such as a client connecting or an mqtt command
+- **MQTT motion** (`status/motion`) is reported only while the camera is awake. It reads
+  `unknown` until then: a sleeping camera can't tell neolink about motion.
+- **`pause.on_motion` can't start the stream** on a sleeping camera, for the same reason.
+  Neolink logs a warning at startup for such a camera. Set `idle_disconnect = false` (or
+  `battery = false` on a mains camera) if you need it. A motion event keeps an awake
+  camera connected for at most `motion_hold_max_s` seconds (default 120).
+- **Floodlight status** (`status/floodlight`, `status/floodlight_tasks`) is updated only
+  while the camera is awake.
+- **MQTT preview and battery level** (`status/preview`, `status/battery_level`) are
+  published once per wake, from the snapshot and battery reading taken during that wake,
+  not every `preview_update`/`battery_update` ms.
+- **`neolink/<camera>/status`** is `disconnected` while the camera sleeps and `connected`
+  while it is awake: it now means "awake", not "working". Home Assistant availability
+  comes from `neolink/status` (see [MQTT Discovery](#mqtt-discovery)).
+- **Push notifications** (only in builds with the optional `pushnoti` feature, which the
+  default and native builds leave out) wake a sleeping camera only when
+  `pause.on_motion` is set. Google removed the API they relied on, so don't count on
+  them.
+- **`update_time`** and the camera clock check run when neolink connects, so on a
+  sleeping camera only at a wake.
+- **The first viewer waits** for the camera to wake. On an Argus PT Ultra this measured
+  under 1 s when it was awake, about 2 s from a light sleep and about 7 s from deep sleep.
+  With the native backend the client sees the last keyframe meanwhile.
 
-~Neolink will also wake up on push notifications from the camera. These are usually
-sent by the camera on motion or PIR alarms. To disable this you can set
-`push_notifications = false` in the `[[cameras]]` config~
+#### Settings
 
-[Google removed the apis we were using for push notifications]
+| Key | Where | Default | What |
+|---|---|---|---|
+| `battery` | camera | unset (treated as battery) | `false` marks a mains camera, which then stays connected |
+| `idle_disconnect` | camera | unset (follows `battery`) | `true` forces sleeping, `false` forces always-on |
+| `idle_grace_s` | camera | `10` | Seconds a sleeping camera stays connected after its last use |
+| `motion_hold_max_s` | camera | `120` | Longest a motion event keeps the camera connected (with `pause.on_motion`) |
+| `snapshot_fresh` | camera | `false` | Allow `?fresh=1` on the snapshot endpoint, which wakes the camera |
+| `snapshot_port` | top level | `bind_port + 1` | The snapshot endpoint; `0` turns it off |
+
+These keys, and `pause.on_motion`, come only from the config file: a config published to
+`neolink/config` over MQTT that changes them (or enables a camera the file disables) is
+refused whole (see [Controlling RTSP from MQTT](#controlling-rtsp-from-mqtt)). To change
+them, edit the file and restart neolink.
+
+#### What neolink logs about it
+
+| Level | When | Message |
+|---|---|---|
+| info | Startup, for a camera with neither `battery` nor `idle_disconnect` set | ``<camera>: connects only while in use (battery or unknown power); set `battery = false` to keep a mains camera connected as before`` |
+| warn | Startup, `idle_disconnect = false` without `battery = false` | `<camera>: idle_disconnect is off: keeps the camera awake; expect battery drain on battery cameras` |
+| warn | Startup, `pause.on_motion` on a sleeping camera | `<camera>: pause.on_motion on a camera that sleeps: motion events arrive only over an open connection, …` |
+| warn | A sleeping camera has streamed for 30 min straight | `<camera> has streamed continuously for 30 min; battery cameras are not designed for continuous recording` |
+| info | Each time a sleeping camera is released | `<camera>: awake <s> s for <reasons>; today: <n> wakes, <s> s awake` |
+| warn | A second neolink process uses the same camera | `Another neolink process (pid <pid>) uses this camera too; each one wakes it separately` |
+
+The default log level is info, so all of these show without `RUST_LOG`. If you see the
+30-minute warning for a mains camera, set `battery = false` on it.
+
+#### The snapshot endpoint
+
+In `rtsp` and `mqtt-rtsp` modes neolink serves
+`http://<bind>:<bind_port + 1>/<camera>/snapshot.jpg`: the picture taken during the
+camera's last wake. Fetching it never wakes the camera. Until the first wake it returns a
+grey placeholder (HTTP 200).
+- With no `[[users]]`, anyone who can reach the port may fetch it. Otherwise it takes HTTP
+  Basic auth, and honours `permitted_users`.
+- `?fresh=1` takes a new picture, waking the camera. It is refused (403) unless the camera
+  has `snapshot_fresh = true`, and it runs at most once a minute per camera.
+- Set `snapshot_port = 0` to turn it off, or another port if `bind_port + 1` is taken
+  (8555 is also go2rtc's WebRTC port).
+
+#### State directory
+
+What neolink learns at each wake (UID, model, firmware, streams, the last battery reading
+and the last snapshot) is kept per camera in `<state dir>/camera/<name>-<hash>.json`, with
+the snapshot next to it as `<name>-<hash>.jpg`. The native backend also keeps its stream
+cache (`cache/`) and learning-limit files there. The state directory is the first of:
+
+1. `$NEOLINK_STATE_DIR` (the Docker images set it to `/var/lib/neolink`);
+2. `$XDG_STATE_HOME/neolink`;
+3. `~/.local/state/neolink`;
+4. `/tmp/neolink`.
+
+Keep it across restarts (in Docker, mount a volume on `/var/lib/neolink`). Without it,
+neolink forgets the last snapshot and battery reading, and the native backend wakes a
+battery camera more often to relearn its streams. The snapshot is a picture of what the
+camera saw: protect the directory like the config.
+
+#### Home Assistant and Frigate with battery cameras
+
+- Use the snapshot endpoint as the camera's still image URL.
+- Turn "Preload stream" off, and use `camera_view: auto`, not `live`.
+- Don't give the camera a go2rtc or Frigate `preload:`, `command_line` polling, or a ping
+  or nmap device tracker on its IP: each one keeps it awake or wakes it.
+- **Frigate records continuously**, so a camera Frigate records never sleeps. That is fine
+  for a mains camera (set `battery = false`) but drains a battery camera.
+
+#### Upgrading: cameras now connect on demand
+
+If you are upgrading from a version where every camera stayed connected:
+
+1. On every **mains, PoE or NVR-channel** camera, add `battery = false` to its
+   `[[cameras]]` entry. It then behaves as before.
+2. On **battery and solar** cameras, add nothing (or `battery = true`, which also silences
+   the startup info line). They now sleep between uses.
+3. If you had `idle_disconnect = true`, keep it: it still forces sleeping, even with
+   `battery = false`. On a battery camera you can also remove it, since sleeping is now
+   the default. Either way the camera is now released `idle_grace_s` (10 s) after the
+   last use instead of 30 s, and it is no longer connected at startup.
+4. If you rely on MQTT `status/motion`, floodlight status or `pause.on_motion` for a
+   battery camera, that camera now needs `idle_disconnect = false`, which drains its
+   battery.
+5. If you used `neolink/<camera>/status` as an "online" signal, it now means "awake". Use
+   `neolink/status` for availability.
+6. In Docker, mount a volume on `/var/lib/neolink` so the state directory survives
+   restarts.
+
+At startup neolink logs an info line for every camera that sleeps only because neither
+key is set: check that list after upgrading.
 
 ### Docker
 
@@ -502,12 +760,51 @@ docker pull quantumentangledandy/neolink
 docker run --network host --volume=$PWD/config.toml:/etc/neolink.toml quantumentangledandy/neolink
 ```
 
+An image built from this repository's `Dockerfile` also keeps what neolink learns about
+each camera (last snapshot, battery reading, streams) in `/var/lib/neolink`. Mount a
+volume there so it survives restarts:
+
+```bash
+docker run --network host \
+  --volume=$PWD/config.toml:/etc/neolink.toml \
+  --volume=neolink-state:/var/lib/neolink \
+  neolink
+```
+
 #### Environmental Variables
 
-There are currently 2 environmental variables available as part of the container:
+The container uses these environment variables:
 
-- `NEO_LINK_MODE`: defaults to `"rtsp"` if not set, other options are "mqtt" or "mqtt-rtsp".
-- `NEO_LINK_PORT`: defaults to `8554`, set this to your required port value.
+- `NEO_LINK_MODE`: defaults to `"rtsp"` if not set, other options are "mqtt" or
+  "mqtt-rtsp". It is used when the command has no subcommand of its own.
+- `NEO_LINK_PORT`: `8554`. It only documents the port the image exposes: the RTSP port
+  is `bind_port` in the config.
+- `NEOLINK_STATE_DIR`: `/var/lib/neolink`, a volume. Mount it to keep what neolink learns
+  about each camera (streams, battery, last snapshot) across restarts (see
+  [State directory](#state-directory)).
+- `PUID`/`PGID`: when set, neolink reads the config as root, hands the state directory
+  to that user and group and then runs as them. Without them it runs as root, as before.
+  With `--user`, the state directory must be writable by that user (neolink logs an
+  error at startup when it isn't).
+
+#### The container's command
+
+neolink is the image's entrypoint and runs as PID 1, so `docker stop` reaches it: it logs
+the cameras out and exits within a second (before, the stop waited 10 s and killed it).
+The command can be either form:
+
+- neolink's arguments: `--config /etc/neolink.toml` (the default), `rtsp --config
+  /etc/neolink.toml`, or with `neolink` first as in older compose files
+  (`neolink mqtt --config /etc/neolink.toml`);
+- any other program, run in neolink's place as the old `/entrypoint.sh` did:
+  `sh -c "cp /config/neolink.toml /etc/neolink.toml && exec neolink rtsp --config
+  /etc/neolink.toml"`, a script, `bash -lc ...`. End a shell command with `exec neolink
+  ...`: otherwise the shell is PID 1, it does not pass `docker stop`'s SIGTERM on, and
+  the container is killed after the timeout without logging the cameras out. If your
+  command leaves background processes behind, add `--init` (compose: `init: true`).
+
+A neolink subcommand wins over a program of the same name (`users`). `/entrypoint.sh` is
+still in the image and does the same. The native image (`Dockerfile.native`) has no shell.
 
 ### Image
 
@@ -523,10 +820,18 @@ the camera from the config to save the image from.
 File is always jpeg and the extension given in filepath will be added or changed
 to reflect this.
 
+By default this writes the snapshot taken during the camera's last wake, without
+waking it, and prints its age. Add `--fresh` to wake the camera for a new one
+(also done when nothing is saved yet). `--use-stream` always wakes the camera.
+
 Some cameras do not support the SNAP command that is used to generate the image
 on the camera. If this is the case with your camera you can try the
 `--use-stream` option which will instead create a jpeg by transcoding the video
 stream.
+
+This command always connects to the camera, so it wakes a sleeping one. To get the
+last picture without waking it, fetch it from the
+[snapshot endpoint](#the-snapshot-endpoint) instead.
 
 ### Battery Levels
 
@@ -536,7 +841,11 @@ You can get the battery level and status using
 neolink battery --config=config.toml CameraName
 ```
 
-This will produce an xml formatted battery status on stdout for processing
+This will produce an xml formatted battery status on stdout for processing.
+
+It prints the reading taken during the camera's last wake, with its age on stderr,
+and does not wake the camera. Add `--fresh` to wake the camera for a new reading.
+With no saved reading yet it wakes the camera anyway.
 
 ### PIR
 

@@ -34,14 +34,16 @@ fn free_port() -> u16 {
 /// A config serving `cam` as `name`; `top` goes before the camera, `extra` into it, `tail`
 /// after it (e.g. `[[users]]`)
 fn config(cam: &FakeCamera, port: u16, name: &str, top: &str, extra: &str, tail: &str) -> Config {
-    std::env::set_var(
-        "NEOLINK_STATE_DIR",
-        std::env::temp_dir().join(format!("neolink-native-tests-{}", std::process::id())),
-    );
+    // idle_grace_s = 1 unless `extra` sets it
+    let grace = if extra.contains("idle_grace_s") {
+        ""
+    } else {
+        "idle_grace_s = 1\n"
+    };
     let text = format!(
         "bind = \"127.0.0.1\"\nbind_port = {port}\nsnapshot_port = 0\nrtsp_backend = \"native\"\n{top}\n\
          [[cameras]]\nname = \"{name}\"\nusername = \"admin\"\npassword = \"fakepass\"\n\
-         address = \"{}\"\nidle_grace_s = 1\n{extra}\n{tail}\n",
+         address = \"{}\"\n{grace}{extra}\n{tail}\n",
         cam.addr()
     );
     toml::from_str(&text).unwrap()
@@ -56,6 +58,15 @@ struct Running {
 impl Drop for Running {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+impl Running {
+    /// What `main` does on a signal: drop the server's future (the abort lands once the
+    /// task has been dropped)
+    async fn drop_server(&mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
     }
 }
 
@@ -555,13 +566,13 @@ async fn test_native_snapshot_port_taken() {
 async fn test_native_shutdown_sends_bye() {
     let cam = fake().await;
     let port = free_port();
-    let r = run(config(&cam, port, "native-bye", "", "", "")).await;
+    let mut r = run(config(&cam, port, "native-bye", "", "", "")).await;
     let url = format!("rtsp://127.0.0.1:{}/native-bye/main", port);
     let mut c = Client::connect(r.port).await;
     c.play(&url, &[]).await;
     assert!(c.collect(Duration::from_secs(2)).await);
     // What main.rs does on SIGTERM: drop the server future, then wait for it to end
-    r.task.abort();
+    r.drop_server().await;
     shutdown().await;
     let mut all = c.buf.clone();
     let mut chunk = vec![0u8; 65536];
@@ -638,7 +649,7 @@ async fn test_native_cold_motion_paused_bridges() {
     // Learn once, so the next run starts from the cache
     {
         let port = free_port();
-        let r = run(config(&cam, port, "native-coldpause", "", "", "")).await;
+        let mut r = run(config(&cam, port, "native-coldpause", "", "", "")).await;
         let mut c = Client::connect(r.port).await;
         c.play(
             &format!("rtsp://127.0.0.1:{}/native-coldpause/main", port),
@@ -647,7 +658,7 @@ async fn test_native_cold_motion_paused_bridges() {
         .await;
         assert!(c.collect(Duration::from_secs(3)).await);
         drop(c);
-        r.task.abort();
+        r.drop_server().await;
         shutdown().await;
         r.reactor.shutdown().await;
     }
@@ -672,4 +683,162 @@ async fn test_native_cold_motion_paused_bridges() {
     let audio = c.packets.get(&2).copied().unwrap_or(0);
     assert!(video >= 2, "{} video packets while paused", video);
     assert!(audio > 100, "{} audio packets while paused", audio);
+}
+
+// ---------------------------------------------------------------------------------------
+// Shutdown logs every camera out, whatever its streams are doing (container red-team:
+// the native backend left a camera that was still learning its streams logged in)
+
+/// What `main` does on SIGTERM/SIGINT: drop the server future, wait for the native server
+/// to end, then shut the cameras down. Returns how long that took
+async fn stop_like_main(r: &mut Running) -> Duration {
+    let t = tokio::time::Instant::now();
+    r.drop_server().await;
+    shutdown().await;
+    r.reactor.shutdown().await;
+    t.elapsed()
+}
+
+/// Every login was matched by a logout by the time shutdown returned (the fake counts a
+/// message when it reads it: allow it a moment), and shutdown stayed well inside
+/// docker's 10 s stop timeout
+async fn assert_logged_out(cam: &FakeCamera, took: Duration, what: &str) {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let s = cam.stats();
+    eprintln!("{what}: shutdown took {took:?}; {s:?}");
+    assert!(
+        s.logins >= 1,
+        "{}: the camera never logged in: {:?}",
+        what,
+        s
+    );
+    assert_eq!(
+        s.logouts, s.logins,
+        "{what}: camera not logged out on shutdown: {s:?}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "{}: shutdown took {:?}",
+        what,
+        took
+    );
+}
+
+/// A camera with no media, so a learning start never learns the desc, that takes
+/// `msg_delay` over each request (a busy camera handles them in order)
+async fn fake_silent(login_delay: Duration, msg_delay: Duration) -> FakeCamera {
+    FakeCamera::start(FakeCameraConfig {
+        login_delay,
+        msg_delay,
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+
+/// Sends a DESCRIBE without waiting for its answer (it blocks while learning); the
+/// connection stays open until the task is aborted
+fn describe_in_background(port: u16, path: &str) -> tokio::task::JoinHandle<()> {
+    let url = format!("rtsp://127.0.0.1:{port}/{path}");
+    tokio::spawn(async move {
+        let mut c = Client::connect(port).await;
+        let req = format!("DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+        c.s.write_all(req.as_bytes()).await.unwrap();
+        let _ = c.response().await;
+        std::future::pending::<()>().await;
+    })
+}
+
+/// A mains camera connects at boot and every stream starts learning (P18); a signal
+/// before any desc is learned must still log it out. The camera is busy, so the stream
+/// stops that shutdown sends are still being handled when the logout follows them (what
+/// the container matrix hit, intermittently on the host)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_shutdown_while_learning_logs_out() {
+    let cam = fake_silent(Duration::ZERO, Duration::from_millis(30)).await;
+    let mut r = run(config(
+        &cam,
+        free_port(),
+        "native-sd-learn",
+        "",
+        "battery = false",
+        "",
+    ))
+    .await;
+    wait_stats(&cam, 10, |s| s.logins == 1 && s.video_starts >= 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let took = stop_like_main(&mut r).await;
+    assert_logged_out(&cam, took, "learning (mains)").await;
+}
+
+/// A sleeping (busy) camera woken by a DESCRIBE that is still learning the stream
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_shutdown_while_describe_learns_logs_out() {
+    let cam = fake_silent(Duration::ZERO, Duration::from_millis(30)).await;
+    let port = free_port();
+    let mut r = run(config(&cam, port, "native-sd-describe", "", "", "")).await;
+    let client = describe_in_background(port, "native-sd-describe/main");
+    wait_stats(&cam, 10, |s| s.logins == 1 && s.video_starts >= 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let took = stop_like_main(&mut r).await;
+    assert_logged_out(&cam, took, "learning (DESCRIBE)").await;
+    client.abort();
+}
+
+/// A signal while the camera is still answering the login of a wake: the session it
+/// opened is closed with a logout once the login completes, within the bound (2 s)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_shutdown_while_waking_logs_out() {
+    let cam = fake_silent(Duration::from_millis(1500), Duration::ZERO).await;
+    let port = free_port();
+    let mut r = run(config(&cam, port, "native-sd-wake", "", "", "")).await;
+    let client = describe_in_background(port, "native-sd-wake/main");
+    // The login request has arrived; its answer is 1.5 s away
+    wait_stats(&cam, 10, |s| s.logins == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let took = stop_like_main(&mut r).await;
+    assert_logged_out(&cam, took, "waking").await;
+    client.abort();
+}
+
+/// A signal while a client is playing
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_shutdown_while_playing_logs_out() {
+    let cam = fake().await;
+    let port = free_port();
+    let mut r = run(config(&cam, port, "native-sd-play", "", "", "")).await;
+    let mut c = Client::connect(port).await;
+    c.play(&format!("rtsp://127.0.0.1:{port}/native-sd-play/main"), &[])
+        .await;
+    assert!(c.collect(Duration::from_secs(1)).await);
+    let took = stop_like_main(&mut r).await;
+    assert_logged_out(&cam, took, "playing").await;
+}
+
+/// A signal while the camera is idle but still connected, inside idle_grace_s
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_shutdown_in_idle_grace_logs_out() {
+    let cam = fake().await;
+    let port = free_port();
+    let mut r = run(config(
+        &cam,
+        port,
+        "native-sd-idle",
+        "",
+        "idle_grace_s = 30",
+        "",
+    ))
+    .await;
+    let url = format!("rtsp://127.0.0.1:{port}/native-sd-idle/main");
+    let mut c = Client::connect(port).await;
+    c.play(&url, &[]).await;
+    assert!(c.collect(Duration::from_secs(1)).await);
+    assert_eq!(c.request("TEARDOWN", &url, &[]).await.status, 200);
+    drop(c);
+    // The streams stop (Hub linger, learning windows); the connection stays for the grace
+    wait_stats(&cam, 20, |s| s.video_stops >= s.video_starts).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cam.stats().open_connections, 1, "{:?}", cam.stats());
+    let took = stop_like_main(&mut r).await;
+    assert_logged_out(&cam, took, "idle grace").await;
 }

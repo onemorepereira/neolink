@@ -214,7 +214,8 @@ impl NeoReactor {
         sender_rx.await.unwrap_or_default()
     }
 
-    /// Stop every camera cleanly (logout, close), bounded to 6 s
+    /// Stop every camera cleanly (logout, close), in parallel, bounded to 5.5 s (each
+    /// camera's own bound is 5 s)
     pub(crate) async fn shutdown(&self) {
         let (sender_tx, sender_rx) = oneshot();
         if self
@@ -223,7 +224,7 @@ impl NeoReactor {
             .await
             .is_ok()
         {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(6), sender_rx).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(5500), sender_rx).await;
         }
     }
 

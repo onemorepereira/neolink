@@ -1,48 +1,49 @@
 name: CI
 
+# Release builds of the GStreamer backend for every platform upstream ships, as workflow
+# artifacts, and a draft GitHub release from them on a version tag. This fork pushes no
+# images: upstream's Docker Hub push (and the Docker Hub prune workflow) are removed.
 on:
   push:
+    branches: [master]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
+  # The cross builds use the MSRV, as upstream did
   rust_version: "1.82.0"
+  CARGO_TERM_COLOR: always
 
 jobs:
-  pre_job:
-    # continue-on-error: true # Uncomment once integration is finished
-    runs-on: ubuntu-latest
-    # Map a step output to a job output
-    outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }} && ! (startsWith(github.ref, 'refs/tags/') && github.event_name == 'push')
-    steps:
-      - id: skip_check
-        uses: fkirc/skip-duplicate-actions@v5
-        with:
-          # All of these options are optional, so you can remove them if you are happy with the defaults
-          concurrent_skipping: "same_content_newer"
-          skip_after_successful_duplicate: "false"
-
   native:
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'
-    name: native
+    name: native ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-12, macos-14] # macos-14+ is arm64
+        # macos-15: arm64; macos-15-intel: the last Intel macOS image (macos-12 and
+        # macos-13 are retired)
+        os: [ubuntu-22.04, windows-2022, macos-15-intel, macos-15]
     steps:
-      - uses: actions/checkout@v4
-        name: Checkout onto ${{ runner.os }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: runner.os == 'Linux'
         name: apt install linux deps
         run: |
-          sudo apt update
-          sudo apt install -y aptitude
-          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgstrtspserver-1.0-dev \
+            libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
       - if: runner.os == 'Windows'
         name: Install Windows deps
+        shell: pwsh
         run: |
           # Gstreamer
           choco install -y --no-progress gstreamer --version=1.24.2
@@ -86,51 +87,39 @@ jobs:
       - if: runner.os == 'macOS'
         name: Install macOS deps
         run: |
-          curl -L 'https://gstreamer.freedesktop.org/data/pkg/osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg' -o "$(pwd)/gstreamer-devel.pkg"
+          curl -fL 'https://gstreamer.freedesktop.org/data/pkg/osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg' -o "$(pwd)/gstreamer-devel.pkg"
           sudo installer -verbose -pkg "$(pwd)/gstreamer-devel.pkg" -target /
           PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           PKG_CONFIG_GSTREAMER_1_0_PREFIX="/Library/Frameworks/GStreamer.framework/Versions/1.0"
-          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}" >> "${GITHUB_ENV}"
-          echo "PKG_CONFIG_GSTREAMER_1_0_PREFIX=${PKG_CONFIG_GSTREAMER_1_0_PREFIX}" >> "${GITHUB_ENV}"
+          {
+            echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
+            echo "PKG_CONFIG_GSTREAMER_1_0_PREFIX=${PKG_CONFIG_GSTREAMER_1_0_PREFIX}"
+          } >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
-          brew install pkg-config protobuf openssl@1.1
-          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@1.1)/include/" >>  "${GITHUB_ENV}"
-          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@1.1)/lib/" >>  "${GITHUB_ENV}"
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-      - name: Cache cargo build
-        if: runner.os != 'macOS' # Random missing crates on macOS, unclear why
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          # openssl@1.1 is disabled in Homebrew; openssl-sys builds against 3.x
+          brew install pkg-config protobuf openssl@3
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "${GITHUB_ENV}"
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build
         shell: bash
         run: |
           echo "PATH=${PATH}"
-          echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=${GSTREAMER_1_0_ROOT_MSVC_X86_64}"
-          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
-          # pkg-config --variable pc_path pkg-config
+          echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=${GSTREAMER_1_0_ROOT_MSVC_X86_64:-}"
+          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-}"
           export JEMALLOC_SYS_WITH_LG_PAGE=16
-          cargo  build --release --features gstreamer,pushnoti
-      - uses: actions/upload-artifact@v4
+          cargo build --locked --release --features gstreamer,pushnoti
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.os }}
           path: "target/release/neolink*"
+          if-no-files-found: error
+
   cross:
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'
-    name: cross
-    runs-on: ubuntu-latest
-    container: "node:current-bookworm-slim"
+    name: cross ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: docker.io/library/debian:bookworm-20261005-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
     strategy:
       fail-fast: false
       matrix:
@@ -156,268 +145,96 @@ jobs:
             # on i686, the pkgconfig path doesn't match the prefix!
             pkgconfig: i386-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install basic tools
         run: |
           apt-get update
           apt-get install --assume-yes --no-install-recommends curl ca-certificates protobuf-compiler
       - name: Install ${{ matrix.arch }} cross compiler and gstreamer
-        id: setup
+        env:
+          ARCH: ${{ matrix.arch }}
+          GCC: ${{ matrix.gcc }}
         run: |
-          dpkg --add-architecture ${{ matrix.arch }}
+          dpkg --add-architecture "$ARCH"
           apt-get update
           apt-get install --assume-yes --no-install-recommends \
           build-essential \
-          gcc-${{ matrix.gcc }} \
-          g++-${{ matrix.gcc }} \
-          libgstrtspserver-1.0-dev:${{ matrix.arch }} \
-          libgstreamer1.0-dev:${{ matrix.arch }} \
-          libgtk2.0-dev:${{ matrix.arch }} \
-          libglib2.0-dev:${{ matrix.arch }} \
-          libssl-dev:${{ matrix.arch }}
-      - name: Install rustup
-        run: |
-          curl https://sh.rustup.rs -sSf | sh -s -- --no-modify-path --quiet -y
-          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
-      - name: Install ${{ matrix.arch }} Rust toolchain
-        run: |
-          rustup default "${{ env.rust_version }}"
-          rustup target add ${TARGET}
+          "gcc-$GCC" \
+          "g++-$GCC" \
+          "libgstrtspserver-1.0-dev:$ARCH" \
+          "libgstreamer1.0-dev:$ARCH" \
+          "libgtk2.0-dev:$ARCH" \
+          "libglib2.0-dev:$ARCH" \
+          "libssl-dev:$ARCH"
+      - name: Install rustup and the ${{ env.rust_version }} toolchain for ${{ matrix.target }}
         env:
           TARGET: ${{ matrix.target }}
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- --no-modify-path --quiet -y \
+            --profile minimal --default-toolchain "${rust_version}" --target "${TARGET}"
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
       - name: Build
         run: |
-          cargo build --release --verbose --features gstreamer,pushnoti --target=${TARGET}
+          cargo build --locked --release --verbose --features gstreamer,pushnoti --target="${TARGET}"
         env:
           # Retarget pkg-config as described in https://www.freedesktop.org/wiki/Software/pkg-config/CrossCompileProposal/
           PKG_CONFIG_ALLOW_CROSS: 1
           PKG_CONFIG_LIBDIR: /usr/lib/${{ matrix.pkgconfig }}/pkgconfig
           TARGET: ${{ matrix.target }}
           JEMALLOC_SYS_WITH_LG_PAGE: 16
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.arch }}-bookworm
           path: "target/${{ matrix.target }}/release/neolink*"
-
-  push_to_registry:
-    name: Build Docker image
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
-    runs-on: ubuntu-latest
-    needs:
-      - "cross"
-    steps:
-      - name: Check token is set
-        id: vars
-        shell: bash
-        run: |
-          unset HAS_SECRET
-          if [ -n $SECRET ]; then HAS_SECRET='true' ; fi
-          echo "HAS_SECRET_TOKEN=${HAS_SECRET}" >> $GITHUB_OUTPUT
-        env:
-          SECRET: "${{ secrets.DOCKER_TOKEN }}"
-      - name: Check out the repo
-        uses: actions/checkout@v4
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
-      - name: Convert username to lower case for docker
-        id: string_user
-        uses: ASzc/change-string-case-action@v6
-        with:
-          string: ${{ github.repository_owner }}
-      - name: Convert repo to lower case for docker
-        id: string_repo
-        uses: ASzc/change-string-case-action@v6
-        with:
-          string: ${{ github.repository }}
-      - name: Set up QEMU
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
-        uses: docker/setup-buildx-action@v3
-      - name: Login to Docker Hub
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ vars.DOCKER_USERNAME || steps.string_user.outputs.lowercase }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-      - name: Set Docker name with owner (package name) depending on if DOCKER_USERNAME is set
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
-        id: docker_repo
-        shell: bash
-        run: |
-          if [ -z $DOCKER_USERNAME ]; then
-            echo "DOCKER_NWO=${GITHUB_NWO}" >> $GITHUB_OUTPUT
-          else
-            IFS='/' read -ra NWO_SPLIT <<< "$GITHUB_NWO"
-            REPO_NAME=${NWO_SPLIT[1]}
-            echo "DOCKER_NWO=${DOCKER_USERNAME}/${REPO_NAME}" >> $GITHUB_OUTPUT
-          fi
-        env:
-          DOCKER_USERNAME: ${{ vars.DOCKER_USERNAME }}
-          GITHUB_NWO: ${{ steps.string_repo.outputs.lowercase }}
-      - name: Get tag name
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
-        id: tags
-        shell: bash
-        run: |
-          tags=( )
-          gittag="$(git tag --points-at HEAD)"
-          branch="$(git rev-parse --abbrev-ref HEAD)"
-
-          if [[ -n "${gittag}" ]]; then
-            tags=( "${tags[@]}" "${REPO_NAME}:${gittag}" )
-          fi
-          if [[ -n "${branch}" ]]; then
-            branch="$(echo "${branch}" | sed -E 's|[/]|-|g')"
-            tags=( "${tags[@]}" "${REPO_NAME}:${branch}" )
-            if [ "${branch}" == "master" ]; then
-              tags=( "${tags[@]}" "${tags},${REPO_NAME}:latest" )
-            fi
-          fi
-          function join_by {
-            local d=${1-} f=${2-}
-            if shift 2; then
-              printf %s "$f" "${@/#/$d}"
-            fi
-          }
-          tagstr="$(join_by "," "${tags[@]}")"
-          echo "TAGS=${tagstr}"
-          echo "TAGS=${tagstr}"  >> "${GITHUB_OUTPUT}"
-        env:
-          REPO_NAME: ${{ steps.docker_repo.outputs.DOCKER_NWO }}
-      - name: Install rust
-        run: |
-          rustup default "${{ env.rust_version }}"
-          rustup toolchain install stable
-      - name: Install toml-cli
-        run: |
-          cargo install toml-cli
-      - name: Get project version
-        id: toml
-        run: |
-          NEOLINK_VERSION="$(toml get Cargo.toml  package.version | sed 's|"||g')"
-          echo "version=${NEOLINK_VERSION}"  >> $GITHUB_OUTPUT
-      - name: Prepare directory
-        run: |
-          mkdir linux
-          mkdir linux/arm
-          mkdir linux/arm64
-      - name: Download Linux x86_64
-        uses: actions/download-artifact@v4
-        with:
-          name: release-amd64-bookworm
-          path: linux/amd64
-      - name: Download Linux armv7
-        uses: actions/download-artifact@v4
-        with:
-          name: release-armhf-bookworm
-          path: linux/arm/v7
-      - name: Download Linux arm64
-        uses: actions/download-artifact@v4
-        with:
-          name: release-arm64-bookworm
-          path: linux/arm64
-      - name: Download Linux i386
-        uses: actions/download-artifact@v4
-        with:
-          name: release-i386-bookworm
-          path: linux/386
-      - name: Push to Docker Hub
-        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
-        uses: docker/build-push-action@v5
-        with:
-          platforms: linux/amd64,linux/arm/v7,linux/arm64,linux/386
-          context: .
-          push: true
-          file: Dockerfile
-          tags: ${{ steps.tags.outputs.TAGS }}
-          build-args: VERSION=${{ steps.toml.outputs.version }}, REPO=${{ github.repository }}, OWNER=${{ vars.DOCKER_USERNAME || github.repository_owner }}
-        env:
-          DOCKER_BUILDKIT: 1
+          if-no-files-found: error
 
   create_release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') && github.event_name == 'push' # Ensure this only runs on a tag or expect issues
+    name: Create draft release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # A version tag pushed by hand only; native tags (v*-native*) are native-release.yml's
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push' && !contains(github.ref, '-native')
     needs:
       - "cross"
       - "native"
+    permissions:
+      # The one write permission in CI: creating the draft release on a tag
+      contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install rust
-        run: |
-          rustup default "${{ env.rust_version }}"
-          rustup toolchain install stable
-      - name: Install toml-cli
-        run: |
-          cargo install toml-cli
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
       - name: Get project version
-        id: toml
+        id: version
         run: |
-          NEOLINK_VERSION="$(toml get Cargo.toml  package.version | sed 's|"||g')"
-          echo "version=${NEOLINK_VERSION}"  >> $GITHUB_OUTPUT
-      - name: Download Windows
-        uses: actions/download-artifact@v4
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "neolink") | .version')
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+      - name: Download the build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-windows-2022
-          path: neolink_windows
-      - name: Download Macos
-        uses: actions/download-artifact@v4
-        with:
-          name: release-macos-12
-          path: neolink_macos_intel
-      - name: Download Macos arm64
-        uses: actions/download-artifact@v4
-        with:
-          name: release-macos-14
-          path: neolink_macos_m1
-      - name: Download Linux x86_64
-        uses: actions/download-artifact@v4
-        with:
-          name: release-ubuntu-22.04
-          path: neolink_linux_x86_64_ubuntu
-      - name: Download Linux x86_64
-        uses: actions/download-artifact@v4
-        with:
-          name: release-amd64-bookworm
-          path: neolink_linux_x86_64_bookworm
-      - name: Download Linux armhf
-        uses: actions/download-artifact@v4
-        with:
-          name: release-armhf-bookworm
-          path: neolink_linux_armhf
-      - name: Download Linux arm64
-        uses: actions/download-artifact@v4
-        with:
-          name: release-arm64-bookworm
-          path: neolink_linux_arm64
-      - name: Download Linux i386
-        uses: actions/download-artifact@v4
-        with:
-          name: release-i386-bookworm
-          path: neolink_linux_i386
+          path: artifacts
       - name: Prepare releases
         run: |
-          dirs=(
-            neolink_windows
-            neolink_macos_intel
-            neolink_macos_m1
-            neolink_linux_x86_64_ubuntu
-            neolink_linux_x86_64_bookworm
-            neolink_linux_armhf
-            neolink_linux_arm64
-            neolink_linux_i386
-          )
-          for d in "${dirs[@]}"; do
-            chmod +x "${d}/neolink"*
-            zip -r "${d}.zip" "${d}"
+          # artifact name -> release zip name
+          set -- \
+            release-windows-2022 neolink_windows \
+            release-macos-15-intel neolink_macos_intel \
+            release-macos-15 neolink_macos_m1 \
+            release-ubuntu-22.04 neolink_linux_x86_64_ubuntu \
+            release-amd64-bookworm neolink_linux_x86_64_bookworm \
+            release-armhf-bookworm neolink_linux_armhf \
+            release-arm64-bookworm neolink_linux_arm64 \
+            release-i386-bookworm neolink_linux_i386
+          while [ $# -gt 0 ]; do
+            mv "artifacts/$1" "$2"
+            chmod +x "$2/neolink"*
+            zip -r "$2.zip" "$2"
+            shift 2
           done
       - name: release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          name: Neolink ${{steps.toml.outputs.version}}
+          name: Neolink ${{ steps.version.outputs.version }}
           files: |
             neolink_windows.zip
             neolink_macos_intel.zip
@@ -428,6 +245,6 @@ jobs:
             neolink_linux_arm64.zip
             neolink_linux_i386.zip
           body: |
-            Neolink release ${{steps.toml.outputs.version}}
+            Neolink release ${{ steps.version.outputs.version }}
           draft: true
-          prerelease: ${{ contains(github.ref_name,  'rc') }}
+          prerelease: ${{ contains(github.ref_name, 'rc') }}

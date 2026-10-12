@@ -8,8 +8,9 @@
 //! Every connection, login, logout and message is counted ([`FakeStats`]), so power tests
 //! can assert that the camera was never contacted. Faults can be injected: dropping every
 //! connection, going unreachable (connections are accepted and closed at once, like a
-//! sleeping camera), and rejecting the first N battery reads with 400 (the Argus does
-//! this right after a wake).
+//! sleeping camera), rejecting the first N battery reads with 400 (the Argus does
+//! this right after a wake), a slow login answer, and a busy camera that takes a while
+//! over each request.
 //!
 //! ```no_run
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -64,6 +65,15 @@ pub struct FakeCameraConfig {
     pub chunk_size: usize,
     /// JPEG returned by snapshot requests; `None` answers them with 400
     pub snapshot: Option<Arc<Vec<u8>>>,
+    /// Message ids always answered with 500 (a read the camera won't serve)
+    pub fail_msgs: Vec<u32>,
+    /// How long a waking camera takes to answer a login it has accepted: the session is
+    /// open (and counted) from the moment the request arrives
+    pub login_delay: Duration,
+    /// How long the camera takes over each request (a busy camera). Requests are handled
+    /// one at a time, in order; like a camera, a reply that can't be written (the client
+    /// has gone) ends the session, and the requests queued behind it are never handled
+    pub msg_delay: Duration,
 }
 
 impl Default for FakeCameraConfig {
@@ -81,6 +91,9 @@ impl Default for FakeCameraConfig {
             loop_media: false,
             chunk_size: 40_000,
             snapshot: Some(Arc::new(b"\xff\xd8fake jpeg\xff\xd9".to_vec())),
+            fail_msgs: vec![],
+            login_delay: Duration::ZERO,
+            msg_delay: Duration::ZERO,
         }
     }
 }
@@ -367,6 +380,10 @@ impl Conn {
         out: &mpsc::Sender<Vec<u8>>,
         cancel: &CancellationToken,
     ) -> std::io::Result<()> {
+        let delay = self.shared.config.msg_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let meta = &msg.meta;
         *self
             .shared
@@ -384,6 +401,9 @@ impl Conn {
             _ => None,
         };
         let config = self.shared.config.clone();
+        if config.fail_msgs.contains(&meta.msg_id) {
+            return self.reply(meta, 500, None).await;
+        }
         match meta.msg_id {
             MSG_ID_LOGIN if meta.class == 0x6514 => {
                 // Legacy login (or the discovery probe): offer an unencrypted upgrade
@@ -414,6 +434,9 @@ impl Conn {
                 });
                 if ok {
                     self.shared.stats.lock().unwrap().logins += 1;
+                    if !config.login_delay.is_zero() {
+                        tokio::time::sleep(config.login_delay).await;
+                    }
                     let info = BcXml {
                         device_info: Some(DeviceInfo {
                             version: Some("1.1".to_string()),
@@ -841,14 +864,45 @@ mod tests {
             camera.get_snapshot().await.unwrap(),
             b"\xff\xd8fake jpeg\xff\xd9"
         );
+        // logout() returns once the camera has answered it
         camera.logout().await.unwrap();
-        // logout() only queues the message; give it time to reach the camera before the
-        // connection is shut down (PLAN 1.13 makes logout wait for the reply)
-        tokio::time::sleep(Duration::from_millis(100)).await;
         camera.shutdown().await.unwrap();
         let s = cam.stats();
         // The TCP discovery probe is a connection of its own
         assert_eq!((s.connections, s.logins, s.logouts), (2, 1, 1));
+    }
+
+    /// A busy camera handles requests in order and ends the session when a reply can't be
+    /// written. A logout queued behind other requests must still be handled: `logout()`
+    /// waits for the camera's answer, so the connection isn't closed under it
+    #[tokio::test]
+    async fn test_logout_reaches_a_busy_camera() {
+        let cam = FakeCamera::start(FakeCameraConfig {
+            msg_delay: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let camera = Arc::new(BcCamera::new(&cam.camera_opts("t")).await.unwrap());
+        camera.login().await.unwrap();
+        // Requests still being handled when the client logs out (stream stops, in neolink)
+        let pending: Vec<_> = (0..2)
+            .map(|_| {
+                let camera = camera.clone();
+                tokio::spawn(async move {
+                    let _ = camera.get_linktype().await;
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        camera.logout().await.unwrap();
+        camera.shutdown().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let s = cam.stats();
+        assert_eq!((s.logins, s.logouts), (1, 1), "{s:?}");
+        for p in pending {
+            p.abort();
+        }
     }
 
     #[tokio::test]

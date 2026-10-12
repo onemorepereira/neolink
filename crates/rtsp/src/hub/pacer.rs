@@ -66,8 +66,9 @@ impl<T: Paced> Pacer<T> {
         }
     }
 
-    /// Forget the anchor: the next frame is released at once (a source restart, or a
-    /// MediaClock discontinuity)
+    /// Forget the anchor: the next frame is released at once. Only with nothing queued
+    /// (see [`Self::clear`]): queued frames would all be released at once, ahead of their
+    /// time. A MediaClock discontinuity keeps the anchor (media time stays continuous)
     pub fn restart(&mut self) {
         self.anchor = None;
         self.leads.clear();
