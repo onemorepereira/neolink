@@ -33,7 +33,8 @@ XTASK=${XTASK:-$ROOT/target/release/xtask}
 HELPER=${HELPER:-docker.io/library/alpine:3.20}
 # MQTT broker for the mqtt modes (without one, neolink's MQTT mode exits)
 BROKER=${BROKER:-docker.io/library/eclipse-mosquitto:2.0.20}
-PORT_BASE=${PORT_BASE:-38800}
+# Below the ephemeral range (32768+), where outgoing connections could take a case's port
+PORT_BASE=${PORT_BASE:-18800}
 ONLY=${ONLY:-}
 # 0 skips the "camera logged out on stop" check (the native backend does not log out a
 # camera stopped while it is still learning its streams; that is not the entry path)
@@ -111,7 +112,7 @@ run_exit() {
   local want_code=$1 want=$2 deny=$3
   shift 4
   local out rc=0
-  out=$(timeout 60 podman run --name "$CNAME" --label "$TAG" --network host "$@" 2>&1) || rc=$?
+  out=$(timeout -k 10 60 podman run --name "$CNAME" --label "$TAG" --network host "$@" 2>&1) || rc=$?
   podman rm -f "$CNAME" >/dev/null 2>&1 || true
   local why=""
   [ "$rc" = "$want_code" ] || why="exit code $rc, want $want_code; "
@@ -134,7 +135,7 @@ serve() {
   local want=$1 deny=$2
   shift 3
   local stop=${STOP:-stop} stop_t=${STOP_T:-10} want_code=${WANT_CODE:-0} max_ms=${MAX_MS:-5000}
-  local logins0 logouts0 why="" logs i
+  local logins0 logouts0 why="" logs
   logins0=$(stat_of logins)
   logouts0=$(stat_of logouts)
   local err
@@ -145,7 +146,7 @@ serve() {
   fi
   IFS=$'\x1f' read -r -a wants <<<"${want//|||/$'\x1f'}"
   local ok=0
-  for i in $(seq 300); do
+  for _ in $(seq 300); do
     logs=$(podman logs "$CNAME" 2>&1 || true)
     ok=1
     for w in "${wants[@]}"; do grep -qE -- "$w" <<<"$logs" || ok=0; done
@@ -163,16 +164,16 @@ serve() {
   start=$(date +%s%N)
   if [ "$stop" = int ]; then
     podman kill -s INT "$CNAME" >/dev/null
-    timeout 30 podman wait "$CNAME" >/dev/null || true
+    timeout -k 5 30 podman wait "$CNAME" >/dev/null || true
   else
-    timeout 60 podman stop -t "$stop_t" "$CNAME" >/dev/null || true
+    timeout -k 5 60 podman stop -t "$stop_t" "$CNAME" >/dev/null || true
   fi
   ms=$((($(date +%s%N) - start) / 1000000))
   code=$(podman inspect "$CNAME" --format '{{.State.ExitCode}}')
   [ "$code" = "$want_code" ] || why+="exit code $code, want $want_code; "
   [ "$ms" -lt "$max_ms" ] || why+="stop took $ms ms, want < $max_ms; "
   local logins logouts
-  for i in $(seq 30); do
+  for _ in $(seq 30); do
     logins=$(stat_of logins)
     logouts=$(stat_of logouts)
     [ $((logouts - logouts0)) -ge $((logins - logins0)) ] && break
