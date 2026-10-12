@@ -394,9 +394,14 @@ async fn run(reactor: NeoReactor, cancel: CancellationToken) -> Result<()> {
                     });
                 }
                 tokio::select! {
+                    // Shutdown first: a camera task that ends because of it is not restarted
+                    biased;
                     _ = cancel.cancelled() => break,
                     r = rx.changed() => r.context("config watch")?,
                     Some(ended) = tasks.join_next(), if !tasks.is_empty() => {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
                         // Ended on its own (error, or its instance went away): forget it,
                         // so the loop starts it again if it is still configured
                         if let Ok(name) = ended {

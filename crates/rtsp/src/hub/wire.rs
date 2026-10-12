@@ -46,6 +46,9 @@ pub struct WireClock {
     pub stats: WireStats,
     /// The smallest step after a re-latch (about one frame interval)
     pub min_gap_us: u64,
+    /// The latest wire time given to a late joiner's restamped IRAP: it goes to one
+    /// session only, but whatever is latched next must come a real step after it
+    last_restamp: Option<u64>,
 }
 
 impl Default for WireClock {
@@ -62,6 +65,7 @@ impl WireClock {
             last_track: [None, None],
             stats: WireStats::default(),
             min_gap_us: RELATCH_MIN_GAP_US,
+            last_restamp: None,
         }
     }
 
@@ -84,10 +88,13 @@ impl WireClock {
         // After anything already sent by a real step, even when no wall time has passed
         // (frames released together after a camera reconnect): a 1 µs step is below the
         // 90 kHz RTP tick and the millisecond of recordings (duplicate DTS in ffmpeg)
-        let v = match self.last_out {
+        let mut v = match self.last_out {
             Some((wire, _)) => self.virtual_now(now_wall).max(wire + self.min_gap_us),
             None => self.virtual_now(now_wall),
         };
+        if let Some(r) = self.last_restamp {
+            v = v.max(r + self.min_gap_us);
+        }
         self.offset = Some(v as i64 - media_us as i64);
         self.stats.relatches += 1;
     }
@@ -114,6 +121,14 @@ impl WireClock {
             return None;
         }
         Some(self.out(track, wire, now_wall))
+    }
+
+    /// The wire time for a late joiner's restamped IRAP at `now_wall`: the wire time of
+    /// now, remembered so the next latch lands at least `min_gap_us` after it
+    pub fn restamp_now(&mut self, now_wall: u64) -> u64 {
+        let w = self.virtual_now(now_wall);
+        self.last_restamp = Some(self.last_restamp.map_or(w, |r| r.max(w)));
+        w
     }
 
     /// The wire time of a synthetic (bridge) frame released at `now_wall`
@@ -461,6 +476,17 @@ mod tests {
         let b = clock.stamp(Track::Video, 10_000, 5_000_000);
         assert!(b >= a + RELATCH_MIN_GAP_US, "{a} then {b}");
         assert_eq!(clock.stats.guard_engaged, 0);
+    }
+
+    /// A late joiner's restamped IRAP, then the source's first latch in the same instant
+    /// (a cold PLAY with a cached IRAP): live video comes a frame interval later, not
+    /// microseconds (duplicate timestamps in wall-clock clients like Frigate)
+    #[test]
+    fn test_latch_after_restamp_keeps_a_gap() {
+        let mut clock = WireClock::new();
+        let r = clock.restamp_now(5_000_000);
+        let live = clock.stamp(Track::Video, 123_456, 5_000_020);
+        assert!(live >= r + RELATCH_MIN_GAP_US, "{r} then {live}");
     }
 
     #[test]
