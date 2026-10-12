@@ -250,9 +250,25 @@ fn learn_gate(c: &CameraConfig) -> Arc<LearnGate> {
     )))
 }
 
-/// Servers still tearing down, for [`shutdown`] to await
-static STOPPING: std::sync::Mutex<Vec<(u64, tokio::task::JoinHandle<Result<()>>)>> =
+/// Servers whose `main` was dropped and that are still tearing down, for [`shutdown`]
+static STOPPING: std::sync::Mutex<Vec<tokio::task::JoinHandle<Result<()>>>> =
     std::sync::Mutex::new(Vec::new());
+
+/// Cancels a server when its `main` ends or is dropped; a server dropped while running is
+/// handed to [`shutdown`] to await
+struct StopOnDrop {
+    cancel: CancellationToken,
+    running: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(h) = self.running.take() {
+            STOPPING.lock().unwrap().push(h);
+        }
+    }
+}
 
 /// Runs the native backend. The work happens in a task of its own: dropping this future
 /// (a signal in `main`) cancels it, and [`shutdown`] waits for its orderly end.
@@ -261,8 +277,6 @@ pub(crate) async fn main(reactor: NeoReactor) -> Result<()> {
     check_unsupported(&config)?;
     crate::config::set_native_rtsp_active(true);
     let cancel = CancellationToken::new();
-    let _guard = cancel.clone().drop_guard();
-    let id = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn({
         let cancel = cancel.clone();
@@ -273,9 +287,12 @@ pub(crate) async fn main(reactor: NeoReactor) -> Result<()> {
             r
         }
     });
-    STOPPING.lock().unwrap().push((id, handle));
+    let mut guard = StopOnDrop {
+        cancel,
+        running: Some(handle),
+    };
     let r = done_rx.await;
-    STOPPING.lock().unwrap().retain(|(i, _)| *i != id);
+    guard.running = None;
     match r {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(anyhow::anyhow!(e)),
@@ -283,17 +300,16 @@ pub(crate) async fn main(reactor: NeoReactor) -> Result<()> {
     }
 }
 
-/// R27: wait (≤ 3 s) for the native servers to end in order after their `main` was
-/// dropped: Hubs shut down (sessions get BYE, camera streams stop), connections drain.
-/// Call before the reactor's shutdown.
+/// R27: wait (≤ 2 s) for the native servers to end in order after their `main` was
+/// dropped: Hubs shut down (sessions get BYE, camera streams stop), connections drain
+/// (≤ 1 s). Call before the reactor's shutdown, which logs the cameras out (≤ 5.5 s): a
+/// signal is handled in ≤ 7.5 s, inside docker's 10 s stop timeout.
 pub(crate) async fn shutdown() {
     let handles: Vec<_> = std::mem::take(&mut *STOPPING.lock().unwrap());
-    for (_, h) in handles {
-        if tokio::time::timeout(Duration::from_secs(3), h)
-            .await
-            .is_err()
-        {
-            log::warn!("RTSP server (native) did not stop within 3 s");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    for h in handles {
+        if tokio::time::timeout_at(deadline, h).await.is_err() {
+            log::warn!("RTSP server (native) did not stop within 2 s");
         }
     }
 }

@@ -547,6 +547,26 @@ async fn test_shutdown_during_backoff_is_fast() {
     );
 }
 
+/// A login the camera never answers holds shutdown for the login grace (2 s), no longer
+#[tokio::test]
+async fn test_shutdown_during_a_hung_login_is_bounded() {
+    let cam = FakeCamera::start(FakeCameraConfig {
+        login_delay: Duration::from_secs(30),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut neocam = new_neocam(config_for(&cam, "idle_disconnect = false")).await;
+    wait_stats(&cam, 10, |s| s.logins == 1).await;
+    let t = tokio::time::Instant::now();
+    neocam.shutdown().await;
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "shutdown took {:?}",
+        t.elapsed()
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // Battery-safety review: one failing read must not starve the others
 
