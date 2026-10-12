@@ -302,8 +302,8 @@ pub(crate) async fn main(reactor: NeoReactor) -> Result<()> {
 
 /// R27: wait (≤ 2 s) for the native servers to end in order after their `main` was
 /// dropped: Hubs shut down (sessions get BYE, camera streams stop), connections drain
-/// (≤ 1 s). Call before the reactor's shutdown, which logs the cameras out (≤ 5.5 s): a
-/// signal is handled in ≤ 7.5 s, inside docker's 10 s stop timeout.
+/// (≤ 1 s). Call before the reactor's shutdown, which logs the cameras out (≤ 5.5 s);
+/// `main` holds the two together to 6 s.
 pub(crate) async fn shutdown() {
     let handles: Vec<_> = std::mem::take(&mut *STOPPING.lock().unwrap());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);

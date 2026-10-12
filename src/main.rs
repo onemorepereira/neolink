@@ -206,10 +206,20 @@ async fn neolink_main(args: Vec<OsString>) -> Result<()> {
             Ok(())
         }
     };
-    // R27: the native RTSP server ends first (BYE, streams stopped), then the cameras
-    #[cfg(feature = "native-rtsp")]
-    rtsp_native::shutdown().await;
-    neo_reactor.shutdown().await;
+    // R27: the native RTSP server ends first (BYE, streams stopped), then the cameras log
+    // out. Each step has its own bound; the whole is held to 6 s, well inside docker's
+    // 10 s stop timeout
+    let stop = async {
+        #[cfg(feature = "native-rtsp")]
+        rtsp_native::shutdown().await;
+        neo_reactor.shutdown().await;
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(6), stop)
+        .await
+        .is_err()
+    {
+        warn!("Shutdown did not finish within 6 s; exiting");
+    }
     // Exit now: dropping the runtime would wait for GStreamer's blocking threads
     let code = match result {
         Ok(()) => 0,
