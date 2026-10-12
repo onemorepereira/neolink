@@ -454,6 +454,15 @@ impl Hub {
         clock.set_sample_rate(rate);
         let au_us = if cfg.audio { clock.au_us() } else { 0 };
         let codec = cached.as_ref().map(|d| d.video.codec.into());
+        log::debug!(
+            "{}: cache: desc {}, IRAP {}",
+            cfg.name,
+            if cached.is_some() { "loaded" } else { "none" },
+            match &cached_irap {
+                Some(n) => format!("{} bytes", n.iter().map(|b| b.len()).sum::<usize>()),
+                None => "none".into(),
+            }
+        );
         Self {
             clock,
             learner: DescLearner::new(cfg.audio, cached),
@@ -649,12 +658,21 @@ impl Hub {
                         // §4.6). Not at the last wire time: after an idle spell that is long
                         // past, and the client's first frame and SR would lie behind the
                         // live media by the idle time
-                        let wire = self.wire.virtual_now(now);
+                        self.wire.min_gap_us = self.frame_gap_us();
+                        let wire = self.wire.restamp_now(now);
                         let mut nals = nals.clone();
                         nals.extend(eos_nal(codec, &nals));
                         Some(self.video_frame(codec, &nals, true, wire))
                     }
-                    _ => None,
+                    _ => {
+                        log::debug!(
+                            "{}: PLAY without a cached IRAP (irap {}, codec {:?})",
+                            self.cfg.name,
+                            self.cached_irap.is_some(),
+                            self.codec
+                        );
+                        None
+                    }
                 };
                 let budget = self.budget();
                 if let Some(s) = self.sessions.get_mut(&id) {
