@@ -227,6 +227,12 @@ OR for only mqtt
 ./neolink mqtt --config=neolink.toml
 ```
 
+If the broker is unreachable, at startup or later, neolink keeps running: it logs
+`MQTT: cannot reach the broker at ..., retrying in ...` and retries with backoff (1 s
+doubling to 60 s). What it publishes meanwhile is sent once the broker is back, and on
+every (re)connection it publishes its retained topics again, so a broker restarted
+without persistence gets them back. None of this contacts the cameras.
+
 Neolink will publish these messages:
 
 Messages that are prefixed with `neolink/`

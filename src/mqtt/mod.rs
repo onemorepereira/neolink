@@ -74,6 +74,7 @@ use tokio_util::sync::CancellationToken;
 
 use neolink_core::bc_protocol::{Direction as BcDirection, LightState};
 
+mod backoff;
 mod cmdline;
 mod configwrite;
 mod discovery;
@@ -93,6 +94,7 @@ use log::*;
 use mqttc::{Mqtt, MqttReplyRef};
 
 use self::{
+    backoff::Backoff,
     configwrite::{prepare_config_write, ConfigWrite},
     discovery::enable_discovery,
     mqttc::{MqttInstance, MqttReply},
@@ -150,26 +152,17 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                             let mqtt_instance = thread_instance.subscribe(name).await?;
                             let name = name.clone();
                             set.spawn(async move {
-                                loop {
-                                    let camera = thread_reactor2.get(&name).await?;
-                                    let mqtt_instance = mqtt_instance.resubscribe().await?;
-                                    let r = tokio::select!{
-                                        _ = thread_global_cancel.cancelled() => {
-                                            AnyResult::Ok(())
-                                        },
-                                        _ = local_cancel.cancelled() => {
-                                            AnyResult::Ok(())
-                                        },
-                                        v = listen_on_camera(camera, mqtt_instance) => {
-                                            v
-                                        },
-                                    };
-                                    if let Ok(()) = &r {
-                                        break r
-                                    } else {
-                                        continue;
-                                    }
-                                }
+                                let (reactor, mqtt_instance) = (&thread_reactor2, &mqtt_instance);
+                                tokio::select!{
+                                    _ = thread_global_cancel.cancelled() => {},
+                                    _ = local_cancel.cancelled() => {},
+                                    _ = supervise_listener(&name, || async {
+                                        let camera = reactor.get(&name).await?;
+                                        let mqtt_instance = mqtt_instance.resubscribe().await?;
+                                        listen_on_camera(camera, mqtt_instance).await
+                                    }) => {},
+                                };
+                                AnyResult::Ok(())
                             }) ;
                         }
                     }
@@ -264,6 +257,38 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
 
     drop(cancel_drop);
     Ok(())
+}
+
+/// The first delay before restarting a failed camera listener; it doubles up to
+/// [`LISTENER_RESTART_MAX`]
+const LISTENER_RESTART_MIN: Duration = Duration::from_secs(1);
+const LISTENER_RESTART_MAX: Duration = Duration::from_secs(60);
+/// A listener that ran this long before failing restarts after [`LISTENER_RESTART_MIN`] again
+const LISTENER_STABLE: Duration = Duration::from_secs(60);
+
+/// Runs a camera's MQTT listener, restarting it with backoff while it fails, until it ends
+/// cleanly. A (re)start contacts no camera by itself: the listener publishes its initial
+/// states from the config and the state file, and wakes a sleeping camera only for an MQTT
+/// command that asks for it
+async fn supervise_listener<F, Fut>(name: &str, mut start: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut backoff = Backoff::new(LISTENER_RESTART_MIN, LISTENER_RESTART_MAX);
+    loop {
+        let started = tokio::time::Instant::now();
+        let e = match start().await {
+            Ok(()) => return,
+            Err(e) => e,
+        };
+        if started.elapsed() >= LISTENER_STABLE {
+            backoff.reset();
+        }
+        let delay = backoff.next_delay();
+        log::warn!("{name}: MQTT listener failed, restarting in {delay:?}: {e:#}");
+        sleep(delay).await;
+    }
 }
 
 async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> Result<()> {

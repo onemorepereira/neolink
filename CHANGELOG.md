@@ -161,6 +161,17 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
 ### Fixed
 
 - PIR control on newer firmwares; a malformed XML reply no longer drops the connection.
+- MQTT with an unreachable broker: `mqtt` and `mqtt-rtsp` no longer exit (status 1) when
+  the broker is down at startup or goes away. Neolink logs a warning and retries with
+  backoff (1 s doubling to 60 s); what it publishes meanwhile waits and is sent once the
+  broker is back. SIGTERM/SIGINT still stops it promptly.
+- MQTT retained topics stay retained: after a reconnection (including to a broker that
+  restarted without persistence) neolink publishes its retained topics (camera status,
+  discovery, config, previews, ...) again, retained. Before, a retained publish retried
+  after a disconnect went out without the retain flag.
+- A camera's MQTT listener that fails is restarted with backoff (1 s doubling to 60 s)
+  instead of in a tight loop. A restart contacts no camera, so it never wakes a sleeping
+  one.
 
 ### Security
 
