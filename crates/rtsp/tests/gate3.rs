@@ -357,27 +357,32 @@ async fn test_a20_security() {
         );
     }
 
-    // 100 unauthenticated connections from one IP: 64 held, the rest get 503
+    // 100 unauthenticated connections from one IP: it holds at most its share (32), its
+    // own oldest are closed to make room, and another address still gets in at once
+    let per_ip = ServerConfig::default().max_unauthenticated_per_ip;
     let mut held = vec![];
     for _ in 0..100 {
         held.push(Client::connect(h.addr).await);
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut rejected = 0;
+    let mut closed = vec![];
     for c in held.iter_mut() {
-        let mut probe = [0u8; 16];
-        if let Ok(Ok(n)) = tokio::time::timeout(
-            Duration::from_millis(50),
-            tokio::io::AsyncReadExt::read(&mut c.s, &mut probe),
-        )
-        .await
-        {
-            if n > 0 && probe.starts_with(b"RTSP/1.0 503") {
-                rejected += 1;
-            }
-        }
+        closed.push(closed_within(&mut c.s, Duration::from_millis(5)).await);
     }
-    assert_eq!(rejected, 36, "connections over 64 rejected");
+    assert_eq!(
+        closed.iter().filter(|c| **c).count(),
+        100 - per_ip,
+        "connections past the per-IP share closed"
+    );
+    assert!(
+        closed[100 - per_ip..].iter().all(|c| !c),
+        "the newest {per_ip} are the ones kept"
+    );
+    let mut other = Client::connect_from(h.addr, "127.0.0.2").await;
+    let r = other
+        .request("DESCRIBE", &base, &[("Authorization", &alice)])
+        .await;
+    assert_eq!(r.status, 200, "another address locked out");
     drop(held);
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
@@ -651,8 +656,10 @@ async fn test_unauthenticated_bounds() {
             .status,
         404
     );
-    // 10 wrong passwords over 10 parallel connections: past the 4 allowed per minute,
-    // each waits for its own 1 s slot
+    // 10 wrong passwords for alice over 10 parallel connections: all answered at once
+    // (nothing waits while holding a connection); past the 4 allowed per minute, alice's
+    // credentials from this address get 401, right or wrong, except on a connection that
+    // already authenticated as alice; bob is not affected
     let t = Instant::now();
     let mut tasks = vec![];
     for _ in 0..10 {
@@ -669,8 +676,33 @@ async fn test_unauthenticated_bounds() {
         assert_eq!(t.await.unwrap(), 401);
     }
     assert!(
-        t.elapsed() >= Duration::from_secs(6),
-        "10 failures in {:?}: not paced per IP",
+        t.elapsed() < Duration::from_secs(2),
+        "10 failures took {:?}",
         t.elapsed()
+    );
+    let mut fresh = Client::connect(h.addr).await;
+    assert_eq!(
+        fresh
+            .request("DESCRIBE", &base, &[("Authorization", &alice)])
+            .await
+            .status,
+        401,
+        "a right guess past the limit"
+    );
+    assert_eq!(
+        c.request("DESCRIBE", &base, &[("Authorization", &alice)])
+            .await
+            .status,
+        200,
+        "a connection already authenticated as alice"
+    );
+    let bob = basic("bob", "bobpw");
+    assert_eq!(
+        fresh
+            .request("DESCRIBE", &base, &[("Authorization", &bob)])
+            .await
+            .status,
+        200,
+        "another user"
     );
 }

@@ -98,6 +98,12 @@ pub(crate) struct LimitsConfig {
     #[validate(range(min = 1, max = 4096))]
     #[serde(default = "default_max_connections")]
     pub(crate) max_connections: usize,
+    /// Connections from one address (IPv4, or IPv6 /64) that have neither authenticated
+    /// nor set up a session. Past it, that address's own oldest one is closed. All
+    /// addresses together hold at most max_connections / 2; past that, the oldest one of
+    /// the address holding the most is closed, so a flood from one address (or a few)
+    /// can't lock others out. Clients that authenticated or set up a session never count, so
+    /// this doesn't limit Frigate, go2rtc or Home Assistant on one address
     #[validate(range(min = 1, max = 4096))]
     #[serde(default = "default_max_unauthenticated_per_ip")]
     pub(crate) max_unauthenticated_per_ip: usize,
@@ -110,6 +116,11 @@ pub(crate) struct LimitsConfig {
     #[validate(range(min = 1, max = 1000))]
     #[serde(default = "default_requests_per_second")]
     pub(crate) requests_per_second: u32,
+    /// Wrong credentials per (address, username) per minute; an address may fail 5 × this
+    /// across all usernames. Past either, that username's (or every username's)
+    /// credentials from that address are refused (401, at once, right or wrong) until a
+    /// minute passes without that many failures. RTSP connections already authenticated
+    /// as that user are not affected. The snapshot endpoint applies the same limits
     #[validate(range(min = 1, max = 1000))]
     #[serde(default = "default_failed_auth_per_minute")]
     pub(crate) failed_auth_per_minute: usize,
@@ -132,7 +143,7 @@ const fn default_max_connections() -> usize {
     128
 }
 const fn default_max_unauthenticated_per_ip() -> usize {
-    64
+    32
 }
 const fn default_first_request_timeout_s() -> u64 {
     10

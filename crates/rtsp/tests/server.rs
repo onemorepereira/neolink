@@ -190,19 +190,19 @@ async fn test_rejections_and_limits() {
     assert!(idle.response().await.is_none());
     assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
 
-    // Unauthenticated connections per IP: the 4th gets 503
+    // Unauthenticated connections per IP: the 4th gets in and the oldest is closed
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut held = vec![];
     for _ in 0..3 {
         held.push(TcpStream::connect(h.addr).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut c = Client::connect(h.addr).await;
-    assert_eq!(c.response().await.unwrap().status, 503);
-    drop(held);
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let mut c = Client::connect(h.addr).await;
     assert_eq!(c.request("OPTIONS", &base, &[]).await.status, 200);
+    assert!(closed_within(&mut held[0], Duration::from_millis(100)).await);
+    assert!(!closed_within(&mut held[1], Duration::from_millis(50)).await);
+    assert!(!closed_within(&mut held[2], Duration::from_millis(50)).await);
+    drop(held);
 
     // Request rate: a burst over request_burst gets 503s but the connection survives
     let mut burst = String::new();
