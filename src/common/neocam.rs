@@ -239,12 +239,10 @@ impl NeoCam {
             tokio::select! {
                 _ = wake_cancel.cancelled() => AnyResult::Ok(()),
                 v = async {
-                    let mut reported = false;
+                    let mut done = WakeReads::default();
                     loop {
                         wake_instance.next_connection().await?;
-                        if let Err(e) = wake_reads(&wake_instance, &wake_state, &uid_tx, &wake_name, &mut reported).await {
-                            log::debug!("{wake_name}: wake reads stopped: {e:?}");
-                        }
+                        wake_reads(&wake_instance, &wake_state, &uid_tx, &wake_name, &mut done).await;
                     }
                 } => v,
             }
@@ -503,53 +501,96 @@ impl Drop for NeoCam {
     }
 }
 
-/// The reads done once per wake (see the wake thread in `NeoCam::new`)
+/// What the wake reads have learnt, and which failures were already reported
+#[derive(Default)]
+struct WakeReads {
+    version: bool,
+    streams: bool,
+    warned: std::collections::HashSet<&'static str>,
+}
+
+impl WakeReads {
+    /// A failed read: warn the first time, then only at debug (it is tried every wake)
+    fn failed(&mut self, name: &str, what: &'static str, e: &anyhow::Error) {
+        if self.warned.insert(what) {
+            log::warn!("{name}: could not read the {what} while awake (tried again on later wakes): {e:#}");
+        } else {
+            log::debug!("{name}: could not read the {what}: {e:#}");
+        }
+    }
+}
+
+/// The reads done once per wake (see the wake thread in `NeoCam::new`). Each read stands
+/// alone: one the camera won't answer must not cost the others, or the snapshot endpoint
+/// and MQTT would have nothing to serve for this camera, which tempts users into waking it
+/// (SPEC P5, P7)
 async fn wake_reads(
     instance: &NeoInstance,
     state: &StateFile,
     uid_tx: &WatchSender<Option<String>>,
     name: &str,
-    reported: &mut bool,
-) -> AnyResult<()> {
+    done: &mut WakeReads,
+) {
     // The Argus rejects battery reads (400) for a while after waking (SPEC §9), longer
     // than run_passive_task's own retries: try first, then again after the other reads
     let mut battery_done = read_battery(instance, state, name).await;
 
     if uid_tx.borrow().is_none() {
-        let uid = instance
+        match instance
             .run_passive_task(|cam| Box::pin(async move { Ok(cam.uid().await?) }))
-            .await?;
-        if let Err(e) = state.update(|s| s.uid = Some(uid.clone())) {
-            log::warn!("{name}: could not save the camera state: {e:?}");
+            .await
+        {
+            Ok(uid) => {
+                if let Err(e) = state.update(|s| s.uid = Some(uid.clone())) {
+                    log::warn!("{name}: could not save the camera state: {e:?}");
+                }
+                uid_tx.send_replace(Some(uid));
+            }
+            Err(e) => done.failed(name, "UID", &e),
         }
-        uid_tx.send_replace(Some(uid));
     }
 
-    if !*reported {
-        let version = instance
+    if !done.version {
+        match instance
             .run_passive_task(|cam| Box::pin(async move { Ok(cam.version().await?) }))
-            .await?;
-        log::info!(
-            "{name}: Model {}",
-            version.model.clone().unwrap_or("Undeclared".to_string())
-        );
-        log::info!("{name}: Firmware Version {}", version.firmwareVersion);
-        let stream_info = instance
-            .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_stream_info().await?) }))
-            .await?;
-        let streams: Vec<String> = stream_info
-            .stream_infos
-            .iter()
-            .flat_map(|i| i.encode_tables.iter().map(|e| e.name.clone()))
-            .collect();
-        if let Err(e) = state.update(|s| {
-            s.model = version.model.clone();
-            s.firmware = Some(version.firmwareVersion.clone());
-            s.supported_streams = streams.clone();
-        }) {
-            log::warn!("{name}: could not save the camera state: {e:?}");
+            .await
+        {
+            Ok(version) => {
+                log::info!(
+                    "{name}: Model {}",
+                    version.model.clone().unwrap_or("Undeclared".to_string())
+                );
+                log::info!("{name}: Firmware Version {}", version.firmwareVersion);
+                if let Err(e) = state.update(|s| {
+                    s.model = version.model.clone();
+                    s.firmware = Some(version.firmwareVersion.clone());
+                }) {
+                    log::warn!("{name}: could not save the camera state: {e:?}");
+                }
+                done.version = true;
+            }
+            Err(e) => done.failed(name, "model and firmware", &e),
         }
-        *reported = true;
+    }
+
+    if !done.streams {
+        match instance
+            .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_stream_info().await?) }))
+            .await
+        {
+            Ok(stream_info) => {
+                let streams: Vec<String> = stream_info
+                    .stream_infos
+                    .iter()
+                    .flat_map(|i| i.encode_tables.iter().map(|e| e.name.clone()))
+                    .collect();
+                if let Err(e) = state.update(|s| s.supported_streams = streams.clone()) {
+                    log::warn!("{name}: could not save the camera state: {e:?}");
+                }
+                done.streams = true;
+            }
+            Err(e) => done.failed(name, "stream list", &e),
+        }
     }
 
     // One snapshot per wake, for the snapshot endpoint and the CLI (SPEC P5)
@@ -562,7 +603,7 @@ async fn wake_reads(
                 log::warn!("{name}: could not save the snapshot: {e:?}");
             }
         }
-        Err(e) => log::debug!("{name}: no snapshot this wake: {e:?}"),
+        Err(e) => done.failed(name, "snapshot", &e),
     }
 
     for _ in 0..2 {
@@ -575,7 +616,6 @@ async fn wake_reads(
     if !battery_done {
         log::info!("{name}: no battery reading this wake");
     }
-    Ok(())
 }
 
 /// One battery read into the state file; false if the camera didn't answer
