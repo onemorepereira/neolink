@@ -125,7 +125,7 @@ jobs:
           FFMPEG_DIR: ${{ steps.ffmpeg.outputs.dir }}
         run: |
           podman run --rm --network host -v "$PWD:/src:z" -v "$FFMPEG_DIR:/ffmpeg:ro,z" \
-            -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -e PATH=/usr/local/cargo/bin:/usr/bin:/bin:/ffmpeg/bin \
+            -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -e PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/ffmpeg/bin \
             -w /src localhost/neolink-clients:ci sh -c \
             'set -e; cargo xtask mkfixture --standard --out fixtures/synth && cargo build --locked --release --features native-rtsp -p neolink -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh && E2E_WORK=$(mktemp -d) SERVER=neolink sh tests/e2e/clients.sh'
 
