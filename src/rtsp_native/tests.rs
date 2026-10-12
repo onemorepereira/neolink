@@ -34,10 +34,6 @@ fn free_port() -> u16 {
 /// A config serving `cam` as `name`; `top` goes before the camera, `extra` into it, `tail`
 /// after it (e.g. `[[users]]`)
 fn config(cam: &FakeCamera, port: u16, name: &str, top: &str, extra: &str, tail: &str) -> Config {
-    std::env::set_var(
-        "NEOLINK_STATE_DIR",
-        std::env::temp_dir().join(format!("neolink-native-tests-{}", std::process::id())),
-    );
     let text = format!(
         "bind = \"127.0.0.1\"\nbind_port = {port}\nsnapshot_port = 0\nrtsp_backend = \"native\"\n{top}\n\
          [[cameras]]\nname = \"{name}\"\nusername = \"admin\"\npassword = \"fakepass\"\n\

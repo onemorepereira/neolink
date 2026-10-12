@@ -7,12 +7,8 @@ use std::time::Duration;
 
 /// A camera config that reaches `cam` over TCP, with extra TOML lines
 pub(crate) fn config_for(cam: &FakeCamera, extra: &str) -> CameraConfig {
-    // State files of all tests go to one temporary directory; the fake's port keeps
-    // them apart
-    std::env::set_var(
-        "NEOLINK_STATE_DIR",
-        std::env::temp_dir().join(format!("neolink-tests-{}", std::process::id())),
-    );
+    // State files of all tests go to one temporary directory (`state_dir` under test);
+    // the fake's port keeps them apart
     let text = format!(
         "name = \"fake\"\nusername = \"admin\"\npassword = \"fakepass\"\naddress = \"{}\"\n{}",
         cam.addr(),

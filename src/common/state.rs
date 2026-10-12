@@ -49,6 +49,14 @@ pub(crate) fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Tests run as parallel threads of one process: they share one directory instead of each
+/// test module setting `NEOLINK_STATE_DIR` to its own value, which raced
+#[cfg(test)]
+pub(crate) fn state_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("neolink-tests-{}", std::process::id()))
+}
+
+#[cfg(not(test))]
 pub(crate) fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("NEOLINK_STATE_DIR") {
         return PathBuf::from(dir);
