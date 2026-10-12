@@ -957,12 +957,31 @@ impl Hub {
                 if restarted || t.discontinuity {
                     self.pacer.restart();
                 }
+                let was_held = self.learner.video_held();
                 if let Some(ev) = self.learner.video(codec, &nals, irap, t.media_us, now) {
                     self.desc_event(ev);
                 }
+                if let Some(why) = self.learner.take_hold_end() {
+                    log::info!(
+                        "{}: new parameter sets not confirmed ({why:?}): a glitch, video resumes",
+                        self.cfg.name
+                    );
+                }
                 if self.learner.video_held() {
-                    // New parameter sets not confirmed yet: sessions of the current desc
-                    // must not decode this GOP with the old ones
+                    if !was_held {
+                        log::info!(
+                            "{}: new parameter sets on an IRAP: video held until the next \
+                             IRAP confirms them",
+                            self.cfg.name
+                        );
+                    }
+                    // Sessions of the current desc must not decode this GOP with the old
+                    // parameter sets
+                    return;
+                }
+                if was_held && !irap {
+                    // The hold expired mid-GOP: resume at the next IRAP
+                    self.need_irap = true;
                     return;
                 }
                 let nals = self.apply_parameter_sets(codec, irap, nals);
@@ -2090,6 +2109,7 @@ mod tests {
         closed: bool,
         after: StreamDesc,
         persisted: Option<StreamDesc>,
+        stats: HubStats,
     }
 
     /// Learn, play one session for `secs`, then report what the session and the cache saw
@@ -2120,6 +2140,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let persisted = cache.load_desc();
+        let stats = h.stats().await.unwrap();
         h.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
         GlitchRun {
@@ -2128,6 +2149,7 @@ mod tests {
             closed,
             after,
             persisted,
+            stats,
         }
     }
 
@@ -2331,5 +2353,111 @@ mod tests {
         assert_eq!((r.after.video.width, r.after.video.height), (896, 512));
         assert_eq!(r.after.gen, 1);
         assert_eq!(r.persisted.as_ref(), Some(&r.after));
+    }
+
+    impl GlitchRun {
+        /// The longest wire gap between live video frames (the first frame, the cached
+        /// IRAP, can be up to a GOP before the first live one)
+        fn max_live_video_gap(&self) -> u64 {
+            let video: Vec<u64> = self
+                .frames
+                .iter()
+                .filter(|f| f.track == Track::Video)
+                .map(|f| f.wire_us)
+                .collect();
+            video[1..].windows(2).map(|w| w[1] - w[0]).max().unwrap()
+        }
+    }
+
+    /// The IRAPs after `after_us`: dropped (`None`), or with their NALs rewritten
+    fn map_iraps_after(
+        units: Vec<crate::source::FixtureUnit>,
+        after_us: u64,
+        f: impl Fn(u64, Vec<Bytes>) -> Option<Vec<Bytes>>,
+    ) -> Vec<crate::source::FixtureUnit> {
+        units
+            .into_iter()
+            .filter_map(|mut u| {
+                if let SourceUnit::Video {
+                    codec,
+                    irap: true,
+                    cam_us,
+                    annexb,
+                } = &u.unit
+                {
+                    if u.at_us > after_us {
+                        let nals = f(u.at_us, split_nals(annexb))?;
+                        let mut out = vec![];
+                        for nal in nals {
+                            out.extend_from_slice(&[0, 0, 0, 1]);
+                            out.extend_from_slice(&nal);
+                        }
+                        u.unit = SourceUnit::Video {
+                            codec: *codec,
+                            irap: true,
+                            cam_us: *cam_us,
+                            annexb: Bytes::from(out),
+                        };
+                    }
+                }
+                Some(u)
+            })
+            .collect()
+    }
+
+    /// A glitch IRAP, then IRAPs without in-band parameter sets: nothing can confirm the
+    /// glitch, so the next IRAP ends the hold and video resumes there
+    #[tokio::test(start_paused = true)]
+    async fn test_video_hold_ends_at_an_irap_without_params() {
+        let units = mutate_sps(fixture("plain_h264.bcm"), GLITCH_AT_US, |n| n[3] ^= 0x01);
+        // The glitch IRAP is the first at or after GLITCH_AT_US; strip the ones after it
+        let units = map_iraps_after(units, GLITCH_AT_US + 100_000, |_, nals| {
+            Some(
+                nals.into_iter()
+                    .filter(|n| param_kind(VideoCodec::H264, n).is_none())
+                    .collect(),
+            )
+        });
+        let r = glitch_run(units, 14).await;
+        r.assert_unchanged();
+        // One GOP (2 s) held, then live again
+        let gap = r.max_live_video_gap();
+        assert!(gap <= 2_200_000, "video stalled for {gap} µs");
+    }
+
+    /// The hold outlasts the bridge threshold (two IRAPs lost after the glitch IRAP): the
+    /// bridge covers it with the current stream's cached IRAP, the session stays, and
+    /// live video resumes at the next IRAP
+    #[tokio::test(start_paused = true)]
+    async fn test_video_hold_is_bridged() {
+        let units = mutate_sps(fixture("plain_h264.bcm"), GLITCH_AT_US, |n| n[3] ^= 0x01);
+        let lost = GLITCH_AT_US + 100_000..GLITCH_AT_US + 4_100_000;
+        let units = map_iraps_after(units, GLITCH_AT_US + 100_000, |at, nals| {
+            (!lost.contains(&at)).then_some(nals)
+        });
+        let r = glitch_run(units, 16).await;
+        assert!(!r.closed, "the session was closed");
+        assert_eq!(r.after, r.learned, "the live desc changed");
+        assert_eq!(r.persisted.as_ref(), Some(&r.learned));
+        assert!(r.frames.iter().all(|f| f.gen == 0));
+        assert!(r.stats.bridged_us > 0, "{:?}", r.stats);
+        assert_eq!(r.stats.guard_engaged, 0, "{:?}", r.stats);
+        // Bridged frames keep the gap under the bridge's 5 s interval, and live video (a
+        // GOP of P-frames) follows the bridge
+        let gap = r.max_live_video_gap();
+        assert!(gap < 5_000_000, "video stalled for {gap} µs");
+        let video: Vec<&Arc<Frame>> = r
+            .frames
+            .iter()
+            .filter(|f| f.track == Track::Video)
+            .collect();
+        let longest = (1..video.len())
+            .max_by_key(|&i| video[i].wire_us - video[i - 1].wire_us)
+            .unwrap();
+        let live_after = video[longest..].iter().filter(|f| !f.irap).count();
+        assert!(
+            live_after > 25,
+            "live P-frames after the bridge: {live_after}"
+        );
     }
 }

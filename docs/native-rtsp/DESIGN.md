@@ -254,6 +254,12 @@ The MediaClock is per Hub and lives as long as the Hub, **across Idle** (F-cc 16
   audio frames with an unconfirmed config are dropped and don't touch the audio clock. An
   ADTS frame is validated in full (length, blocks) before its header is learned from. A real
   change costs one GOP (video) or 8 AUs (audio) of delay.
+- **The video hold is bounded.** It ends as a glitch (logged at info) when an IRAP carries
+  the current parameter sets again, when an IRAP carries no usable parameter sets (nothing
+  could confirm the new ones), or after `max(2 × GOP, 5 s)` without a decision. After an
+  expiry mid-GOP, video resumes at the next IRAP. A hold longer than the bridge threshold
+  (3 s + latency, e.g. after a lost IRAP) is bridged like an outage, with the current
+  stream's cached IRAP.
 - NALs with a corrupt header (`forbidden_zero_bit` set, or H.265 `nuh_temporal_id_plus1 =
   0`) fail the R2 whitelist.
 

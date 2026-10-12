@@ -113,6 +113,13 @@ pub struct DescLearner {
     audio: Option<AudioDesc>,
     /// A new video identity and how many IRAPs in a row carried it (debounce)
     video_candidate: Option<(VideoIdentity, u32)>,
+    /// Host µs when video started being held for a candidate
+    held_since: Option<u64>,
+    /// Why the last hold ended without a change, until the Hub takes it (for its log)
+    hold_end: Option<HoldEnd>,
+    /// Media µs of the last IRAP, and the last IRAP interval (the GOP)
+    last_irap_us: Option<u64>,
+    gop_us: Option<u64>,
     /// A new audio config and how many frames in a row carried it (debounce)
     audio_candidate: Option<(AudioDesc, u32)>,
     intervals: Vec<u64>,
@@ -129,6 +136,23 @@ const AUDIO_WAIT_US: u64 = 1_000_000;
 /// on every IRAP from then on; one corrupt or odd IRAP doesn't, and must not close every
 /// session. Two IRAPs cost one GOP of delay on a real change.
 pub const VIDEO_CHANGE_IRAPS: u32 = 2;
+
+/// The least a video hold may last before it is given up as a glitch; the bound is
+/// `max(2 × GOP, this)`. A real change is confirmed by the next IRAP, one GOP after the
+/// hold starts; twice that leaves room for a lost IRAP and bursty arrivals, and the
+/// floor covers a GOP not measured yet (and the Argus's 2 s GOP).
+const HOLD_MIN_US: u64 = 5_000_000;
+
+/// Why a video hold ended without a change
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldEnd {
+    /// An IRAP carried the current parameter sets again
+    BackToCurrent,
+    /// An IRAP came without usable parameter sets, so nothing could confirm the new ones
+    NoParameterSets,
+    /// No IRAP decided within the bound
+    Expired,
+}
 
 /// ADTS frames in a row with a new audio config before it replaces the current one
 ///
@@ -149,6 +173,10 @@ impl DescLearner {
             pending: None,
             audio: None,
             video_candidate: None,
+            held_since: None,
+            hold_end: None,
+            last_irap_us: None,
+            gop_us: None,
             audio_candidate: None,
             intervals: vec![],
             last_media_us: None,
@@ -173,6 +201,18 @@ impl DescLearner {
     /// IRAP either confirms it (a change) or carries the current one again (a glitch)
     pub fn video_held(&self) -> bool {
         self.video_candidate.is_some()
+    }
+
+    /// Why the last hold ended without a change, once
+    pub fn take_hold_end(&mut self) -> Option<HoldEnd> {
+        self.hold_end.take()
+    }
+
+    fn end_hold(&mut self, why: Option<HoldEnd>) {
+        if self.video_candidate.take().is_some() {
+            self.hold_end = why;
+        }
+        self.held_since = None;
     }
 
     /// A video AU (its NALs). Returns an event when the desc becomes ready or changes.
@@ -200,37 +240,57 @@ impl DescLearner {
         self.last_media_us = Some(media_us);
 
         if irap {
-            if let Some(identity) = identity_from(codec, nals) {
-                match &self.current {
-                    Some(cur) if cur.video == identity => self.video_candidate = None,
-                    Some(_) => {
-                        let seen = match &mut self.video_candidate {
-                            Some((c, n)) if *c == identity => {
-                                *n += 1;
-                                *n
-                            }
-                            other => {
-                                *other = Some((identity.clone(), 1));
-                                1
-                            }
-                        };
-                        if seen >= VIDEO_CHANGE_IRAPS {
-                            self.video_candidate = None;
-                            self.gen += 1;
-                            let d = self.make(identity, self.audio_config().cloned());
-                            self.current = Some(d.clone());
-                            return Some(DescEvent::Changed(d));
-                        }
-                    }
-                    None => {
-                        if !self.audio_wanted || self.audio.is_some() {
-                            let d = self.make(identity, self.audio.clone());
-                            self.current = Some(d.clone());
-                            return Some(DescEvent::Ready(d));
-                        }
-                        self.pending.get_or_insert((identity, host_us));
-                    }
+            if let Some(last) = self.last_irap_us {
+                if media_us > last {
+                    self.gop_us = Some(media_us - last);
                 }
+            }
+            self.last_irap_us = Some(media_us);
+        }
+        if let Some(since) = self.held_since {
+            let bound = self.gop_us.map_or(0, |g| 2 * g).max(HOLD_MIN_US);
+            if host_us.saturating_sub(since) > bound {
+                self.end_hold(Some(HoldEnd::Expired));
+            }
+        }
+
+        if !irap {
+            return self.check_timeout(host_us);
+        }
+        let Some(identity) = identity_from(codec, nals) else {
+            // Nothing can confirm a candidate: treat it as a glitch
+            self.end_hold(Some(HoldEnd::NoParameterSets));
+            return self.check_timeout(host_us);
+        };
+        match &self.current {
+            Some(cur) if cur.video == identity => self.end_hold(Some(HoldEnd::BackToCurrent)),
+            Some(_) => {
+                self.held_since.get_or_insert(host_us);
+                let seen = match &mut self.video_candidate {
+                    Some((c, n)) if *c == identity => {
+                        *n += 1;
+                        *n
+                    }
+                    other => {
+                        *other = Some((identity.clone(), 1));
+                        1
+                    }
+                };
+                if seen >= VIDEO_CHANGE_IRAPS {
+                    self.end_hold(None);
+                    self.gen += 1;
+                    let d = self.make(identity, self.audio_config().cloned());
+                    self.current = Some(d.clone());
+                    return Some(DescEvent::Changed(d));
+                }
+            }
+            None => {
+                if !self.audio_wanted || self.audio.is_some() {
+                    let d = self.make(identity, self.audio.clone());
+                    self.current = Some(d.clone());
+                    return Some(DescEvent::Ready(d));
+                }
+                self.pending.get_or_insert((identity, host_us));
             }
         }
         self.check_timeout(host_us)
@@ -578,6 +638,7 @@ mod tests {
             None
         );
         assert!(!l.video_held());
+        assert_eq!(l.take_hold_end(), Some(HoldEnd::BackToCurrent));
         // Two different glitches in a row are not a change either
         let mut third = argus_sub_irap();
         third[1] = Bytes::from(hex("68ee3cb2"));
@@ -590,6 +651,82 @@ mod tests {
             None
         );
         assert_eq!(l.current().unwrap().gen, 0);
+    }
+
+    /// A learner on the Argus params with IRAPs every `gop_us`, at media = host time `t`
+    fn learner_with_gop(gop_us: u64, t: u64) -> DescLearner {
+        let mut l = DescLearner::new(false, None);
+        let mut at = t - 2 * gop_us;
+        while at <= t {
+            l.video(VideoCodec::H264, &argus_sub_irap(), true, at, at);
+            at += gop_us;
+        }
+        l
+    }
+
+    fn glitch_irap() -> Vec<Bytes> {
+        let mut other = argus_sub_irap();
+        other[1] = Bytes::from(hex("68ee3cb1"));
+        other
+    }
+
+    #[test]
+    fn test_hold_ends_at_an_irap_without_params() {
+        let mut l = learner_with_gop(2_000_000, 4_000_000);
+        l.video(VideoCodec::H264, &glitch_irap(), true, 6_000_000, 6_000_000);
+        assert!(l.video_held());
+        assert_eq!(l.take_hold_end(), None);
+        // Nothing can confirm the new params: a glitch, and this IRAP is sent
+        let idr_only = [Bytes::from_static(&[0x65, 0x88, 0x84])];
+        assert_eq!(
+            l.video(VideoCodec::H264, &idr_only, true, 8_000_000, 8_000_000),
+            None
+        );
+        assert!(!l.video_held());
+        assert_eq!(l.take_hold_end(), Some(HoldEnd::NoParameterSets));
+        assert_eq!(l.take_hold_end(), None);
+        assert_eq!(l.current().unwrap().gen, 0);
+    }
+
+    #[test]
+    fn test_hold_is_bounded() {
+        let p = [Bytes::from_static(&[0x41, 0x9a])];
+        // 2 s GOP: max(2 × 2 s, 5 s) = 5 s
+        let mut l = learner_with_gop(2_000_000, 4_000_000);
+        l.video(VideoCodec::H264, &glitch_irap(), true, 6_000_000, 6_000_000);
+        l.video(VideoCodec::H264, &p, false, 10_900_000, 11_000_000);
+        assert!(l.video_held(), "within the bound");
+        l.video(VideoCodec::H264, &p, false, 11_000_000, 11_100_000);
+        assert!(!l.video_held());
+        assert_eq!(l.take_hold_end(), Some(HoldEnd::Expired));
+        assert_eq!(l.current().unwrap().gen, 0);
+        // 4 s GOP: 8 s
+        let mut l = learner_with_gop(4_000_000, 8_000_000);
+        l.video(
+            VideoCodec::H264,
+            &glitch_irap(),
+            true,
+            12_000_000,
+            12_000_000,
+        );
+        l.video(VideoCodec::H264, &p, false, 19_000_000, 19_900_000);
+        assert!(l.video_held(), "within 2 GOPs");
+        l.video(VideoCodec::H264, &p, false, 20_000_000, 20_100_000);
+        assert!(!l.video_held());
+        // A real change is still confirmed by the next IRAP, within the bound
+        let mut l = learner_with_gop(2_000_000, 4_000_000);
+        l.video(VideoCodec::H264, &glitch_irap(), true, 6_000_000, 6_000_000);
+        l.video(VideoCodec::H264, &p, false, 7_000_000, 7_000_000);
+        assert!(matches!(
+            l.video(VideoCodec::H264, &glitch_irap(), true, 8_000_000, 8_000_000),
+            Some(DescEvent::Changed(StreamDesc { gen: 1, .. }))
+        ));
+        assert!(!l.video_held());
+        assert_eq!(
+            l.take_hold_end(),
+            None,
+            "a confirmed change is not a hold end"
+        );
     }
 
     fn adts_48k() -> AdtsHeader {
