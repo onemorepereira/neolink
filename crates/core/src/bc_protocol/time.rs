@@ -178,7 +178,26 @@ fn try_build_timestamp(
             .with_second(second)
             .ok_or(Error::TimeParse)?,
     )?;
-    let offset = UtcOffset::from_whole_seconds(timezone)?;
+    // Reolink uses positive seconds to indicate a negative UTC offset (as in set_time).
+    // The fields are the camera's local time, daylight saving included when the camera
+    // applies it, which this offset does not count
+    let offset = UtcOffset::from_whole_seconds(-timezone)?;
 
     Ok(PrimitiveDateTime::new(date, time).assume_offset(offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_build_timestamp;
+
+    #[test]
+    fn test_time_zone_sign() {
+        // A camera set to UTC-6 reports timeZone 21600
+        let t = try_build_timestamp(21600, 2026, 10, 12, 12, 30, 0).unwrap();
+        assert_eq!(t.offset().whole_hours(), -6);
+        assert_eq!(t.to_offset(time::UtcOffset::UTC).hour(), 18);
+        // and UTC+7 reports -25200
+        let t = try_build_timestamp(-25200, 2026, 10, 12, 12, 30, 0).unwrap();
+        assert_eq!(t.offset().whole_hours(), 7);
+    }
 }
