@@ -639,19 +639,48 @@ The connection task owns the read half. A writer task owns the write half.
 - A user with no password matches only the empty password.
 
 **Failed-auth limiting (F-cc 5)**: only requests that carried credentials and failed count.
-The initial no-credentials 401 does not.
+The initial no-credentials 401 does not. Past the limit (10 in the last minute, per IP or
+IPv6 /64) the address is *limited*: credentials from it get exactly the answer wrong ones
+would (401 with a fresh challenge, or anonymous access on an anonymous mount), also where a
+right password would have earned `stale=true` or a 404, so a guesser can't tell a hit
+from a miss. The exception is a user who authenticated from that address in the last 24 h
+(or owns the connection's session): a client with a stale password must not lock Frigate
+on the same host out. That exception is also an oracle for that user's password to anyone
+sharing the address (NAT), which is the price of not locking out the legitimate client.
+Nothing sleeps: an earlier design delayed each failure past the limit by its own 1 s slot
+inside the request handler, which held the connection's slots, stalled shutdown, and
+still answered a right guess at once.
 
 ### 6.6 Limits (R24, revised, F-cc 5)
 
 | Limit | Value | Over-limit behaviour |
 |---|---|---|
 | Global connections | 128 | 503, then close |
-| Per IP: **unauthenticated** connections (no successful auth yet, or an anonymous mount with no request yet) | 64 | 503, then close |
-| Per IP: authenticated connections | not limited separately (only by the global limit) | — |
+| Per IP (IPv6: /64): **unauthenticated** connections (no credentials accepted and no session yet) | 32 | the IP's own oldest unauthenticated connection is closed |
+| All **unauthenticated** connections | `max_connections / 2` = 64 | the oldest unauthenticated connection of the IP holding the most is closed (the new connection's own IP if it holds as many) |
+| Unauthenticated lifetime (with or without users) | 30 s from connect, or from losing a session | close |
+| Per IP: authenticated connections, and connections with a session (also anonymous) | not limited separately (only by the global limit) | — |
 | First request | within 10 s | close |
-| Request rate | 20/s, burst 40, per connection | 503, then close |
+| Request rate | 20/s, burst 40, per connection | 503 |
 | Bodies | Content-Length ≤ 4 KiB | 413 |
-| Failed auth | 10/min per IP | 1 s response delay |
+| Failed auth | 10/min per IP | credentials not proven from that IP are answered as wrong (§6.5) |
+| accept() errors (EMFILE, ENOMEM) | — | retry after 100 ms |
+
+Why close an old connection instead of refusing the new one: every client starts
+unauthenticated, so a full table that refuses newcomers locks everyone out, and a flood
+that keeps it full needs no more than it already holds. Closing the heaviest address's
+oldest connection means a flood only displaces itself; an attacker would need as many
+addresses (or /64s) as there are slots to displace other clients, and even then only
+clients still authenticating: authenticated and playing clients are never closed this way.
+Legitimate clients are unauthenticated for a round trip or two (Digest 401, then
+credentials), or until SETUP on an anonymous mount, so the caps don't touch Frigate,
+go2rtc or HA on one IP, behind Docker NAT included.
+
+What stays open: with no users configured (or an anonymous mount), any client can take
+up to `max_connections` with real sessions, as many legitimate players could. Anonymous
+access means trusting the network; configure users to limit it. IPv6 addresses are keyed
+per /64, so devices of one home LAN share an address's caps and failed-auth limit; keying
+per /128 would let anyone with a /64 (everyone) bypass both.
 
 ## 7. New config keys (schema, F-int §5.2)
 

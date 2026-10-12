@@ -165,10 +165,9 @@ fn server_config(config: &Config) -> ServerConfig {
     ServerConfig {
         max_connections: l.max_connections,
         max_unauthenticated_per_ip: l.max_unauthenticated_per_ip,
-        max_unauthenticated_total: l
-            .max_unauthenticated_per_ip
-            .min(l.max_connections / 2)
-            .max(1),
+        // Half the connections, whatever the per-address cap: the rest are kept for
+        // clients that authenticated or are playing
+        max_unauthenticated_total: (l.max_connections / 2).max(1),
         first_request_timeout: Duration::from_secs(l.first_request_timeout_s),
         idle_timeout: Duration::from_secs(l.idle_timeout_s),
         requests_per_second: l.requests_per_second as f64,

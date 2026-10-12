@@ -24,8 +24,9 @@ fn cpu_time() -> Duration {
 }
 
 /// Lower the soft fd limit to just above the highest fd in use and fill every hole below
-/// it: the next fd anyone opens fails with EMFILE. Returns the fillers (to close later).
-fn exhaust_fds() -> Vec<i32> {
+/// it: the next fd anyone opens fails with EMFILE. Returns the fillers and the old limit,
+/// for `restore_fds`.
+fn exhaust_fds() -> (Vec<i32>, libc::rlimit) {
     let max = std::fs::read_dir("/proc/self/fd")
         .unwrap()
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
@@ -33,6 +34,7 @@ fn exhaust_fds() -> Vec<i32> {
         .unwrap();
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+    let old = lim;
     lim.rlim_cur = (max + 1) as libc::rlim_t;
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) }, 0);
     let mut fillers = vec![];
@@ -43,11 +45,19 @@ fn exhaust_fds() -> Vec<i32> {
         }
         fillers.push(fd);
     }
-    fillers
+    (fillers, old)
+}
+
+fn restore_fds(fillers: Vec<i32>, old: libc::rlimit) {
+    for fd in fillers {
+        unsafe { libc::close(fd) };
+    }
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &old) }, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_accept_backs_off_when_out_of_fds() {
+    let _ = env_logger::builder().is_test(true).try_init();
     let provider = Arc::new(TestProvider {
         hubs: HashMap::new(),
         allowed: Allowed::Anonymous,
@@ -67,7 +77,7 @@ async fn test_accept_backs_off_when_out_of_fds() {
         .map(|_| tokio::net::TcpSocket::new_v4().unwrap())
         .collect();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let fillers = exhaust_fds();
+    let (fillers, old) = exhaust_fds();
     let mut clients = vec![];
     for s in socks {
         clients.push(s.connect(addr).await.unwrap());
@@ -77,9 +87,7 @@ async fn test_accept_backs_off_when_out_of_fds() {
     let (cpu0, t0) = (cpu_time(), std::time::Instant::now());
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let (cpu, wall) = (cpu_time() - cpu0, t0.elapsed());
-    for fd in fillers {
-        unsafe { libc::close(fd) };
-    }
+    restore_fds(fillers, old);
     assert!(
         cpu < wall / 4,
         "accept loop spun: {cpu:?} CPU in {wall:?} while out of fds"

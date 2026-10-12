@@ -522,8 +522,10 @@ async fn test_churn_leaves_no_slot_behind() {
     }
     assert_eq!(h.server.connection_count(), 0);
     assert_eq!(h.server.unauthenticated_count(), 0);
-    // And a client still plays (from an address the churn used)
-    let r = player(h.addr, "127.0.0.2", Some(&basic("bob", "bobpw"))).await;
+    // And a client still plays. Not from the churning addresses: their wrong passwords
+    // may have put them past the failed-auth limit, where bob (never proven there) gets
+    // 401 like a wrong password
+    let r = player(h.addr, "127.0.0.7", Some(&basic("bob", "bobpw"))).await;
     assert!(r.is_ok(), "{:?}", r.err());
 }
 
@@ -549,4 +551,45 @@ async fn test_unauthenticated_caps() {
         h.server.unauthenticated_count(),
         cfg.max_unauthenticated_total
     );
+}
+
+/// Red team: a connection flood as fast as the attacker can connect (each connection
+/// displaces an older one) doesn't fill max_connections with closing connections, so
+/// another address still plays
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_connect_flood() {
+    let h = start_with(Setup {
+        users: alice_bob(),
+        ..Default::default()
+    })
+    .await;
+    let stop = tokio_util::sync::CancellationToken::new();
+    let mut flooders = vec![];
+    for _ in 0..8 {
+        let (addr, stop) = (h.addr, stop.clone());
+        flooders.push(tokio::spawn(async move {
+            let mut ring = std::collections::VecDeque::new();
+            let mut n = 0usize;
+            while !stop.is_cancelled() {
+                ring.push_back(connect_from(addr, "127.0.0.2").await);
+                if ring.len() > 40 {
+                    ring.pop_front();
+                }
+                n += 1;
+            }
+            n
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let alice = basic("alice", "alicepw");
+    for i in 0..3 {
+        let r = player(h.addr, "127.0.0.1", Some(&alice)).await;
+        assert!(r.is_ok(), "attempt {i}: {:?}", r.err());
+    }
+    stop.cancel();
+    let mut total = 0;
+    for f in flooders {
+        total += f.await.unwrap();
+    }
+    assert!(total > 1000, "only {total} flood connections");
 }
