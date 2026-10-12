@@ -910,10 +910,24 @@ const PAUSE_KEYS: &[&str] = &[
     "mode",
 ];
 
-/// Settings this build can't honour, said once at startup
-pub(crate) fn warn_feature_mismatches(config: &Config) {
-    for c in &config.cameras {
-        if c.push_notifications && !cfg!(feature = "pushnoti") {
+/// Settings this build can't honour, said once at startup. `text` is the config file, to
+/// tell a setting the user wrote from a default.
+pub(crate) fn warn_feature_mismatches(config: &Config, text: &str) {
+    let tables = text.parse::<toml::Value>().ok();
+    let cameras = tables
+        .as_ref()
+        .and_then(|t| t.get("cameras"))
+        .and_then(|c| c.as_array());
+    for (i, c) in config.cameras.iter().enumerate() {
+        let written = cameras
+            .and_then(|a| a.get(i))
+            .and_then(|t| t.as_table())
+            .is_some_and(|t| {
+                ["push_notifications", "push", "push_noti"]
+                    .iter()
+                    .any(|k| t.contains_key(*k))
+            });
+        if c.push_notifications && written && !cfg!(feature = "pushnoti") {
             log::warn!(
                 "{}: push_notifications is set but this build has no push notification support \
                  (feature pushnoti); it is ignored",

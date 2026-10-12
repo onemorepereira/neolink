@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
     config
         .validate()
         .with_context(|| format!("Failed to validate the {:?} config file", conf_path))?;
-    config::warn_feature_mismatches(&config);
+    config::warn_feature_mismatches(&config, &config_text);
     // The config is read (as root, if the image runs so): now become PUID/PGID if asked
     drop_privileges()?;
 
