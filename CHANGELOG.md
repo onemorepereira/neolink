@@ -172,6 +172,16 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
 - A camera's MQTT listener that fails is restarted with backoff (1 s doubling to 60 s)
   instead of in a tight loop. A restart contacts no camera, so it never wakes a sleeping
   one.
+- MQTT no longer warns "Ignoring retained MQTT message on neolink/config" on every
+  connection: that message was neolink's own retained config. Someone else's retained
+  config still gets the warning.
+- The version string comes only from release tags (`v*`); without one it is the crate
+  version and the commit, such as `0.6.3-rc.3 (b15ad3c)`.
+- The camera's time is logged with the right UTC offset sign (a camera on UTC-6 showed
+  `+06:00`). The offset is the camera's time zone without daylight saving.
+- Native RTSP: a client that hangs up, as ffmpeg does right after TEARDOWN, is logged at
+  debug level and no longer as "write failed or stalled". A real stall is logged as
+  "client took no data for ...".
 
 ### Security
 
