@@ -99,6 +99,14 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
   output.
 - **Docker.** See [Docker](#docker) below.
 - **Shutdown.** SIGTERM and SIGINT log the cameras out before exiting.
+- **Push notifications** (builds with the optional `pushnoti` feature) register with
+  the Firebase app of Reolink's Android app (fcm-push-listener 4) instead of its FCM
+  sender ID, a registration Google stopped serving in June 2024. The registration saved
+  in `<config dir>/neolink/neolink_token.toml` keeps its layout and gains
+  `scheme = "firebase"`; a file without it (written by an older neolink) is replaced by
+  a new registration, and each camera gets the new token on its next wake. The `pushnoti`
+  test tool (`crates/pushnoti`) now keeps its registration in `./token.json`. Not yet
+  tested against FCM and a camera.
 
 ### Docker
 
@@ -205,9 +213,12 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
 - Dependency updates for RustSec advisories: openssl, h2, rustls, ring, bytes,
   crossbeam-channel, anyhow, rand and url/idna (lock file); quick-xml 0.41, rumqttc 0.25
   and validator 0.20 (manifest). MQTT over TLS now uses rustls 0.23 with the ring
-  provider. Advisories with no fix usable here (the `pushnoti` feature's
-  fcm-push-listener 2 TLS/HTTP stack; rumqttc's leftover rustls-webpki 0.102) are
-  ignored in `deny.toml`, each with the condition for removing it.
+  provider. rumqttc's leftover rustls-webpki 0.102, which has no fix usable here, is
+  ignored in `deny.toml` with the condition for removing it.
 - time 0.3.55 (RUSTSEC-2026-0009, RFC 2822 parsing, which neolink does not use); this
   raises the MSRV to 1.88. The ICU and zeroize crates, held back for Rust 1.82, move to
   their newest Rust 1.88 compatible releases.
+- `pushnoti` feature: fcm-push-listener 4.1.1 (rustls 0.23, reqwest 0.13 with h2 0.4)
+  replaces 2.0.3, which pinned rustls 0.20 (RUSTSEC-2024-0336), ring 0.16
+  (RUSTSEC-2025-0009) and h2 0.3 (RUSTSEC-2026-0258). Its reqwest also builds rustls'
+  aws-lc-rs provider, so neolink now installs ring as rustls' provider at startup.

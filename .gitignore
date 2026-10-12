@@ -25,6 +25,7 @@
 
 # The token file for the FCM tests
 token.toml
+token.json
 
 # Debug FCM build
 crates/fcm-push-listener

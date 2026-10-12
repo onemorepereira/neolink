@@ -87,6 +87,10 @@ extracting the apk with apktook I found the following:
 
 Where the key we need is `743639030586`
 
+(Google stopped serving that sender-ID registration in June 2024. fcm-push-listener 3
+and later register with the Firebase app instead: the `google_app_id` and
+`google_api_key` above, with the project ID `reolink-login`.)
+
 To emulate the push recievier we use the `fcm-push-listener` crate. Which
 is a rust implementation of the good
 [RE work of Matthieu Lemoine.](https://medium.com/@MatthieuLemoine/my-journey-to-bring-web-push-support-to-node-and-electron-ce70eea1c0b0)

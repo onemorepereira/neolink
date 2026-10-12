@@ -32,14 +32,6 @@ ignore = [
   { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
   { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
   { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102: rumqttc error type only; verification uses 0.103" },
-  # The `pushnoti` feature: fcm-push-listener 2.0.3 pins rustls 0.20 (and ring 0.16) and
-  # reqwest 0.11 (h2 0.3), none of which has a patched release. Only fcm-push-listener 4
-  # moves off them, and it replaces the sender-ID registration with a Firebase
-  # app/project/API-key one: a rewrite of the push listener that needs a live FCM test.
-  # Remove these when pushnoti moves to fcm-push-listener >= 4 (or is dropped).
-  { id = "RUSTSEC-2024-0336", reason = "rustls 0.20 via fcm-push-listener 2 (pushnoti); no 0.20 fix" },
-  { id = "RUSTSEC-2025-0009", reason = "ring 0.16 via fcm-push-listener 2 (pushnoti); no 0.16 fix, panics only with overflow checks" },
-  { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via reqwest 0.11 in fcm-push-listener 2 (pushnoti); fixed only in h2 0.4" },
 ]
 
 [licenses]
@@ -52,28 +44,19 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-3-Clause",
   "BSL-1.0",
+  # webpki-roots 1.x (Mozilla's CA certificates, data), via fcm-push-listener (pushnoti)
+  "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
   "MPL-2.0",
-  "OpenSSL",
   "Unicode-3.0",
   "Unicode-DFS-2016",
+  # foldhash, a build dependency (prost-build, via fcm-push-listener)
+  "Zlib",
 ]
 confidence-threshold = 0.9
 # A license that leaves the tree is reported (warning), so the list stays the set in use
 unused-allowed-license = "warn"
-
-# Crates that name a license file instead of an SPDX expression. The hash pins the file
-# the expression was read from: a changed file fails the check until it is re-read.
-[[licenses.clarify]]
-crate = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
-
-[[licenses.clarify]]
-crate = "webpki"
-expression = "ISC"
-license-files = [{ path = "LICENSE", hash = 0x001c7e6c }]
 
 [licenses.private]
 # Unpublished workspace crates (xtask, the fuzz crate) are checked like the rest
