@@ -45,6 +45,24 @@ neolink battery --fresh --config ~/.config/neolink/argus.toml   # before/after (
 - **Power:** one wake, 350 s awake for a 5.7 min session.
 - **Cache:** the persisted keyframe loaded (228 KB) and went to the first client.
 
+**Session 3, 2026-10-12 00:57 UTC** (third that day, by the owner's choice; battery 48 % →
+46 %):
+- **A11:** ffmpeg (`-c copy`), VLC and a go2rtc client played main through a camera outage.
+  - The nft rule dropped only output to the camera, which kept streaming for about 60 s
+    until its own timeout. neolink saw the loss at 01:00:23 and reconnected 01:01:13, once
+    the rule was removed.
+  - The recording is 330 s for 330 s of wall time, with no backward step. During the
+    outage it has a bridged keyframe every 5 s (`bridge_fps` 0.2); live video resumes on
+    an IDR, with 0 decode errors.
+  - All three clients kept their sessions.
+  - VLC showed 12 "picture is too late" just after the resume (42–47 s late), then
+    recovered. Its clock doesn't follow 0.2 fps bridging.
+- **Phase 1 deferred check:** 10 cycles with 6 s gaps all played. The camera connection was
+  held throughout (no new login), and it slept 10 s after the last cycle.
+- **Power:** one wake, 469 s awake.
+- **Next time:** for a full outage, also drop input from the camera:
+  `sudo nft add chain inet a11 i '{ type filter hook input priority 0; }'; sudo nft add rule inet a11 i ip saddr 192.168.86.34 drop`.
+
 ## Session 1 (day 1): A1, A2, A7, on main and sub
 
 1. A1:
