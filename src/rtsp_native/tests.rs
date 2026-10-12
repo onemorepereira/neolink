@@ -601,3 +601,75 @@ async fn test_native_cold_main_and_sub_describe_together() {
     }
     assert_eq!(cam.stats().logins, 1, "one wake");
 }
+
+/// An always-connected camera serves its mounts from the start, not only once it has
+/// connected and reported its streams (hardware session 4 got 404 there)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_always_on_mounts_at_start() {
+    let cam = fake().await;
+    let port = free_port();
+    let r = run(config(
+        &cam,
+        port,
+        "native-on",
+        "",
+        "idle_disconnect = false",
+        "",
+    ))
+    .await;
+    let mut c = Client::connect(r.port).await;
+    let d = c
+        .request(
+            "DESCRIBE",
+            &format!("rtsp://127.0.0.1:{}/native-on/main", port),
+            &[],
+        )
+        .await;
+    assert_ne!(d.status, 404, "{}", d.head);
+}
+
+/// A12 from a cold start: the desc is cached, the camera stays connected with
+/// pause.on_motion and nothing moves. A client gets the cached IRAP and then bridged
+/// frames and silent audio while it waits (hardware session 4 got nothing until motion,
+/// which Frigate's 5 s -timeout would not survive)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_cold_motion_paused_bridges() {
+    let cam = fake().await;
+    // Learn once, so the next run starts from the cache
+    {
+        let port = free_port();
+        let r = run(config(&cam, port, "native-coldpause", "", "", "")).await;
+        let mut c = Client::connect(r.port).await;
+        c.play(
+            &format!("rtsp://127.0.0.1:{}/native-coldpause/main", port),
+            &[],
+        )
+        .await;
+        assert!(c.collect(Duration::from_secs(3)).await);
+        drop(c);
+        r.task.abort();
+        shutdown().await;
+        r.reactor.shutdown().await;
+    }
+    let port = free_port();
+    let r = run(config(
+        &cam,
+        port,
+        "native-coldpause",
+        "",
+        "stream = \"main\"\nidle_disconnect = false\n[cameras.pause]\non_motion = true",
+        "",
+    ))
+    .await;
+    let mut c = Client::connect(r.port).await;
+    c.play(
+        &format!("rtsp://127.0.0.1:{}/native-coldpause/main", port),
+        &[],
+    )
+    .await;
+    assert!(c.collect(Duration::from_secs(12)).await);
+    let video = c.video();
+    let audio = c.packets.get(&2).copied().unwrap_or(0);
+    assert!(video >= 2, "{} video packets while paused", video);
+    assert!(audio > 100, "{} audio packets while paused", audio);
+}

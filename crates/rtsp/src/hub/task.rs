@@ -675,6 +675,12 @@ impl Hub {
                     }
                 };
                 let budget = self.budget();
+                // A cold start (cached IRAP, no live video yet, e.g. paused by
+                // pause.on_motion): bridging starts from the restamped IRAP, so the
+                // client gets frames and silent audio until the camera streams
+                if restamp.is_some() && self.last_video_wall.is_none() {
+                    self.last_video_wall = Some(now);
+                }
                 if let Some(s) = self.sessions.get_mut(&id) {
                     s.playing = true;
                     if let Some(frame) = restamp {

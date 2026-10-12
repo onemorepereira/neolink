@@ -590,14 +590,16 @@ async fn camera_main(
     result
 }
 
-/// The camera's stream kinds, from its stream info every 15 s without waking it; a camera
-/// that sleeps starts from the configured main and sub (SPEC P16)
+/// The camera's stream kinds, from its stream info every 15 s without waking it. Every
+/// camera starts from the configured main and sub (SPEC P16): a sleeping one can't be
+/// asked, and an always-connected one isn't connected yet at startup (its mounts would
+/// answer 404 until then). The camera's own list replaces the seed once it arrives.
 async fn supported_streams(
     instance: NeoInstance,
     cancel: CancellationToken,
 ) -> Result<watch::Receiver<HashSet<BcStreamKind>>> {
     let config = instance.config().await?.borrow().clone();
-    let seed: HashSet<BcStreamKind> = if config.sleeps() {
+    let seed: HashSet<BcStreamKind> = {
         let kinds = config.stream.as_stream_kinds();
         if kinds.len() > 1 {
             kinds
@@ -607,8 +609,6 @@ async fn supported_streams(
         } else {
             kinds.into_iter().collect()
         }
-    } else {
-        HashSet::new()
     };
     let (tx, rx) = watch::channel(seed);
     tokio::spawn(async move {
