@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 anyhow = "1.0.70"
 clap = { version = "4.2.2", features = ["derive"] }
+env_logger = "0.11.3"
 neolink_core = { path = "../core", features = ["test-util"] }
 neolink_rtsp = { path = "../rtsp" }
 tokio-util = "0.7.7"

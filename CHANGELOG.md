@@ -189,7 +189,9 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
   an unlogged jump of several seconds. Now each catch-up, resume or camera clock reset
   brings the timestamps back in line with real time at a keyframe, and every such step is logged
   (info when over 1 s). The stats line also counts the pacer's pull-backs and skips and
-  the timestamp rebases.
+  the timestamp rebases. Tested with ffmpeg, go2rtc, Frigate's command lines and VLC: all
+  stay connected and recordings stay valid; VLC freezes for several seconds around a
+  congestion episode (up to ~14 s while it re-buffers late video).
 
 ### Security
 

@@ -1,10 +1,10 @@
 name: Nightly
 
 # PLAN 5.5/5.6: long fuzzing, the 15 and 90 min Frigate and A/V runs, the soak, the full
-# client gate, and the advisory check. Each long run is its own job, so they run in
-# parallel and each stays well under its timeout and the 6 h limit of hosted runners. The
-# soak runs 5 h here; the 24 h soak (A15 surrogate) needs a self-hosted runner:
-# SOAK_SECS=86400.
+# client gate (with A11b, the 4 min congestion run), and the advisory check. Each long run
+# is its own job, so they run in parallel and each stays well under its timeout and the
+# 6 h limit of hosted runners. The soak runs 5 h here; the 24 h soak (A15 surrogate) needs
+# a self-hosted runner: SOAK_SECS=86400.
 on:
   schedule:
     - cron: "17 2 * * *"
@@ -58,6 +58,9 @@ jobs:
           - name: Frigate A3, 90 min across the wrap
             run: E2E_WORK=$(mktemp -d) A3_SECS=5400 TESTS=A3 tests/e2e/frigate.sh
             timeout: 130
+          - name: Frigate A11b, congestion episodes at 300 and 1500 ms
+            run: E2E_WORK=$(mktemp -d) TESTS=congestion tests/e2e/frigate.sh
+            timeout: 30
           - name: A/V sync A16 through rtsp-serve, 15 min
             run: E2E_WORK=$(mktemp -d) AV_SECS=900 tests/e2e/avsync.sh
             timeout: 55
@@ -85,7 +88,7 @@ jobs:
         run: ${{ matrix.run }}
 
   clients:
-    name: Client matrix, full gate (A5 for 300 s)
+    name: Client matrix, full gate (A5 for 300 s, A11b congestion)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -103,7 +106,7 @@ jobs:
         run: |
           podman run --rm --network host -v "$PWD:/src:z" -v "$FFMPEG_DIR:/ffmpeg:ro,z" \
             -e NEOLINK_FFMPEG=/ffmpeg/bin/ffmpeg -e PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/ffmpeg/bin \
-            -e A5_SECS=300 -w /src localhost/neolink-clients:ci sh -c \
+            -e A5_SECS=300 -e TESTS="A1 A2 A2b A4 A4b A5 A10 A11b" -w /src localhost/neolink-clients:ci sh -c \
             'set -e; cargo xtask mkfixture --standard --out fixtures/synth && cargo build --locked --release --features native-rtsp -p neolink -p xtask && E2E_WORK=$(mktemp -d) sh tests/e2e/clients.sh && E2E_WORK=$(mktemp -d) SERVER=neolink sh tests/e2e/clients.sh'
 
   advisories:

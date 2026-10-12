@@ -49,6 +49,9 @@ pub struct Opts {
     /// Serve no audio track (`audio = "none"`)
     #[arg(long)]
     no_audio: bool,
+    /// Pacing latency, ms (neolink's `pacing_latency_ms`: 1500 battery or unknown, 300 mains)
+    #[arg(long, default_value_t = 1500)]
+    latency_ms: u64,
     /// Bridge frames per second during an outage
     #[arg(long, default_value_t = 0.2)]
     bridge_fps: f64,
@@ -90,6 +93,8 @@ impl Provider for FixtureProvider {
 }
 
 pub fn run(opts: Opts) -> Result<()> {
+    // The Hub's own log (rebases, pacer skips, bridging) on stderr; RUST_LOG overrides
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     tokio::runtime::Runtime::new()?.block_on(async move {
         let mut hubs = HashMap::new();
         let mut sources: Vec<(StreamKind, HubHandle, Arc<FixtureSource>)> = vec![];
@@ -124,6 +129,7 @@ pub fn run(opts: Opts) -> Result<()> {
             cfg.linger = Duration::from_secs_f64(opts.linger);
             cfg.audio = !opts.no_audio;
             cfg.bridge_fps = opts.bridge_fps;
+            cfg.latency_us = opts.latency_ms * 1000;
             cfg.parameter_sets = match opts.parameter_sets.as_str() {
                 "strip" => ParameterSets::Strip,
                 "passthrough" => ParameterSets::Passthrough,
@@ -221,6 +227,8 @@ pub fn run(opts: Opts) -> Result<()> {
                             "guard_engaged": st.guard_engaged,
                             "dropped_by_budget": st.dropped_by_budget,
                             "bridged_us": st.bridged_us,
+                            "pacer_skips": st.pacer_skips,
+                            "rebases": st.rebases,
                         }),
                     );
                 }
