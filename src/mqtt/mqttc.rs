@@ -376,6 +376,13 @@ mod tests {
         assert!(!is_command_topic("neolink/status"));
         assert!(!is_command_topic("other/argus/control/x"));
     }
+
+    #[test]
+    fn test_rustls_has_a_crypto_provider() {
+        // rumqttc builds the MQTT TLS config with `ClientConfig::builder()`, which panics
+        // when rustls has no crypto provider compiled in (Cargo.toml: rustls with ring)
+        let _ = rustls::ClientConfig::builder();
+    }
 }
 
 impl Drop for MqttBackend<'_> {

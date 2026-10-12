@@ -19,10 +19,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Build images, by digest. rust:1.90.0-alpine3.20 for x86_64; for aarch64 the
+  # Build images, by digest. rust:1.91.0-alpine3.22 for x86_64; for aarch64 the
   # rust-musl-cross image has no versioned tags, so the aarch64-musl tag as of 2026-07-01
-  # by digest, with Rust 1.90.0 installed in it.
-  RUST_ALPINE: docker.io/library/rust:1.90.0-alpine3.20@sha256:ef86f37c2819ebd1ecb1dbd7efda70c693cb013232688aa136a5a2f1e3b65e55
+  # by digest, with Rust 1.91.0 installed in it.
+  RUST_ALPINE: docker.io/library/rust:1.91.0-alpine3.22@sha256:a3e3d30122c08c0ed85dcd8867d956f066be23c32ed67a0453bc04ce478ad69b
   MUSL_CROSS: ghcr.io/rust-cross/rust-musl-cross:aarch64-musl@sha256:ecae5dd62d1c938c14f8071d36c16fa699860aace03bfb5284fb1216474d2643
 
 jobs:
@@ -72,8 +72,8 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src -e GITHUB_SHA -e JEMALLOC_SYS_WITH_LG_PAGE=16 "$MUSL_CROSS" bash -c \
             'set -e
              apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
-             rustup toolchain install 1.90.0 --profile minimal --target aarch64-unknown-linux-musl
-             cargo +1.90.0 build --release --locked --no-default-features --features native-rtsp'
+             rustup toolchain install 1.91.0 --profile minimal --target aarch64-unknown-linux-musl
+             cargo +1.91.0 build --release --locked --no-default-features --features native-rtsp'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: neolink-native-aarch64-linux-musl
