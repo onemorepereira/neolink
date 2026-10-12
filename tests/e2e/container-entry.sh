@@ -30,9 +30,9 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 IMAGE=${IMAGE:?the image to test, e.g. IMAGE=neolink:test}
 XTASK=${XTASK:-$ROOT/target/release/xtask}
 # A pinned helper image to look inside volumes (the native image has no shell)
-HELPER=${HELPER:-docker.io/library/alpine:3.20}
+HELPER=${HELPER:-docker.io/library/alpine:3.20.9@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805}
 # MQTT broker for the mqtt modes (without one, neolink's MQTT mode exits)
-BROKER=${BROKER:-docker.io/library/eclipse-mosquitto:2.0.20}
+BROKER=${BROKER:-docker.io/library/eclipse-mosquitto:2.0.20@sha256:21421af7b32bf9ce508e9090c8eb13bb81f410ca778dc205506180a6f862d0eb}
 # Below the ephemeral range (32768+), where outgoing connections could take a case's port
 PORT_BASE=${PORT_BASE:-18800}
 ONLY=${ONLY:-}
@@ -78,7 +78,11 @@ CAM_ADDR=$(cat "$W/addr")
 MQTT_PORT=$((PORT_BASE - 1))
 podman run -d --rm --label "$TAG" --name "$TAG-broker" --network host "$BROKER" \
   mosquitto -p "$MQTT_PORT" >/dev/null
-for _ in $(seq 100); do podman logs "$TAG-broker" 2>&1 | grep -q running && break; sleep 0.1; done
+# (the logs in a variable first: with pipefail, `podman logs | grep -q` fails when grep
+# stops reading early and podman gets SIGPIPE)
+broker_up() { local l; l=$(podman logs "$TAG-broker" 2>&1 || true); grep -q running <<<"$l"; }
+for _ in $(seq 100); do broker_up && break; sleep 0.1; done
+broker_up || { echo "the MQTT broker did not start"; podman logs "$TAG-broker" 2>&1 | tail -5; exit 2; }
 
 stat_of() { # stat_of logins|logouts
   sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" "$W/stats.json"
@@ -94,6 +98,8 @@ new_case() { # new_case NAME -> sets C (dir), PORT, NAME; returns 1 to skip
   NAME=$1
   CASE_N=$((CASE_N + 1))
   if [ -n "$ONLY" ] && ! [[ $NAME =~ $ONLY ]]; then return 1; fi
+  # Every case needs the fake camera: if it died, stop here instead of failing each case
+  kill -0 "$FAKECAM_PID" 2>/dev/null || { echo "the fake camera exited (before: $NAME)"; tail -5 "$W/fakecam.log"; exit 2; }
   PORT=$((PORT_BASE + 2 * CASE_N))
   C="$W/case$CASE_N"
   mkdir -p "$C"

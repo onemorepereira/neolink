@@ -1,53 +1,69 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # A13 / N9 / PLAN 6.3 for the native image (Dockerfile.native, FROM scratch):
-# - the image starts and serves RTSP from a scripted camera (xtask fakecam);
-# - with a client playing, `podman stop` takes < 5 s, exits 0 and the camera is logged out;
+# - the image starts and serves RTSP from a scripted camera (xtask fakecam): a client
+#   receives frames from it;
+# - with that client playing, `podman stop` takes < 5 s, exits 0 and the camera is logged out;
 # - PUID/PGID drop privileges.
-# Runs on the host with podman. Needs the native image (IMAGE) and the dev image with a
-# built release xtask in the neolink-target volume, plus ffmpeg in the dev image's PATH
-# (mounted at /ffmpeg as in the dev wrappers; FFMPEG_DIR on the host).
-#   IMAGE=neolink:native FFMPEG_DIR=/path/to/ffmpeg sh tests/e2e/container-native.sh
-set -u
+# Runs on the host with podman, a built xtask (the fake camera runs on the host, as in
+# container-entry.sh) and ffmpeg (FFMPEG, default the one on PATH):
+#   cargo build --release -p xtask
+#   podman build -t neolink:native -f Dockerfile.native .
+#   IMAGE=neolink:native bash tests/e2e/container-native.sh
+# Exit status: the number of failed checks; 1 when the run itself broke.
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 IMAGE=${IMAGE:-neolink:native}
-FFMPEG_DIR=${FFMPEG_DIR:?the static ffmpeg directory (with bin/ffmpeg)}
 PORT=${PORT:-38654}
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+XTASK=${XTASK:-${CARGO_TARGET_DIR:-$ROOT/target}/release/xtask}
+FFMPEG=${FFMPEG:-ffmpeg}
 W=$(mktemp -d)
 FAILS=0
-podman run -d --rm --name fakecam-a13 --network host -v "$W":/w:z -v neolink-target:/target \
-  -v "$(cd "$(dirname "$0")/../.." && pwd)/fixtures/synth":/fx:ro,z \
-  neolink-dev /target/release/xtask fakecam --addr-file /w/addr --stats /w/stats.json \
-  --main /fx/plain_h265.bcm --sub /fx/plain_h264.bcm >/dev/null
-i=0; until [ -s "$W/addr" ] || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
+T="neolink-a13-$$"
+track_ctr "$T-neolink"
+[ -x "$XTASK" ] || die "no xtask at $XTASK (cargo build --release -p xtask)"
+command -v "$FFMPEG" >/dev/null || die "no ffmpeg ($FFMPEG)"
+podman image exists "$IMAGE" || die "no image $IMAGE"
+"$XTASK" fakecam --addr-file "$W/addr" --stats "$W/stats.json" \
+  --main "$ROOT/fixtures/synth/plain_h265.bcm" --sub "$ROOT/fixtures/synth/plain_h264.bcm" > "$W/fakecam.log" 2>&1 &
+FAKE=$!; track $FAKE
+running() { [ "$(podman inspect "$1" --format '{{.State.Running}}' 2>/dev/null)" = true ]; }
+wait_until 20 $FAKE "fake camera address" test -s "$W/addr"
 printf 'bind = "127.0.0.1"\nbind_port = %s\nsnapshot_port = 0\n[[cameras]]\nname = "fake"\nusername = "admin"\npassword = "fakepass"\naddress = "%s"\n' \
-  $PORT "$(cat "$W/addr")" > "$W/neolink.toml"
+  "$PORT" "$(cat "$W/addr")" > "$W/neolink.toml"
 chmod 0644 "$W/neolink.toml"
-podman run -d --name neolink-a13 --network host -e PUID=1000 -e PGID=1000 \
+podman run -d --name "$T-neolink" --network host -e PUID=1000 -e PGID=1000 \
   -v "$W/neolink.toml":/etc/neolink.toml:ro,z "$IMAGE" >/dev/null
-i=0; until podman logs neolink-a13 2>&1 | grep -q "Starting RTSP Server (native)" || [ $i -gt 100 ]; do sleep 0.1; i=$((i+1)); done
-if podman logs neolink-a13 2>&1 | grep -q "Running as uid 1000, gid 1000" \
-  && ! podman logs neolink-a13 2>&1 | grep -q "is not writable by PUID"; then
+logs() { podman logs "$T-neolink" 2>&1 || true; }
+# (grep on a variable: with pipefail, `podman logs | grep -q` fails when grep stops early)
+has() { local l; l=$(logs); grep -q -- "$1" <<<"$l"; }
+started() { has "Starting RTSP Server (native)"; }
+wait_until 20 "" "neolink start in the container" started
+running "$T-neolink" || die "the neolink container exited: $(logs | tail -5)"
+if has "Running as uid 1000, gid 1000" && ! has "is not writable by PUID"; then
   echo "PASS PUID/PGID drop, state directory writable"
-else echo "FAIL PUID/PGID drop or state directory"; podman logs neolink-a13 2>&1 | grep -i "uid\|writable" | sed 's/^/    /'; FAILS=$((FAILS+1)); fi
-# A13: a client plays from the FROM-scratch image
-podman run -d --rm --name client-a13 --network host -v "$FFMPEG_DIR":/ffmpeg:ro,z -v "$W":/w:z neolink-dev \
-  /ffmpeg/bin/ffmpeg -nostdin -v error -rtsp_transport tcp -i "rtsp://127.0.0.1:$PORT/fake/main" \
-  -c copy -f null - >/dev/null
+else echo "FAIL PUID/PGID drop or state directory"; { logs | grep -i "uid\|writable" || true; } | sed 's/^/    /'; FAILS=$((FAILS+1)); fi
+# A13: a client plays from the FROM-scratch image. ffmpeg's progress report shows frames
+# arriving; a client that merely has not exited yet is not enough.
+"$FFMPEG" -nostdin -v error -rtsp_transport tcp -i "rtsp://127.0.0.1:$PORT/fake/main" \
+  -c copy -f null -progress "$W/progress.txt" - > "$W/client.log" 2>&1 &
+CLIENT=$!; track $CLIENT
 sleep 8
-if podman ps --format '{{.Names}}' | grep -q client-a13; then echo "PASS A13 the image serves a playing client"
-else echo "FAIL A13 the client ended early"; FAILS=$((FAILS+1)); fi
+frames=$({ sed -n 's/^frame=\([0-9]*\)$/\1/p' "$W/progress.txt" 2>/dev/null || true; } | tail -1)
+if kill -0 $CLIENT 2>/dev/null && [ "${frames:-0}" -ge 25 ]; then echo "PASS A13 the image serves a playing client ($frames frames in 8 s)"
+else echo "FAIL A13 the client is not playing (frames: ${frames:-none})"; sed 's/^/    /' "$W/client.log" | tail -5; FAILS=$((FAILS+1)); fi
 # N9: stop with the client playing
+running "$T-neolink" || die "the neolink container exited before the stop: $(logs | tail -5)"
 START=$(date +%s%N)
-podman stop -t 10 neolink-a13 >/dev/null
+timeout 30 podman stop -t 10 "$T-neolink" >/dev/null || die "podman stop failed"
 MS=$(( ($(date +%s%N) - START) / 1000000 ))
-CODE=$(podman inspect neolink-a13 --format '{{.State.ExitCode}}')
+CODE=$(podman inspect "$T-neolink" --format '{{.State.ExitCode}}')
 sleep 1
+need "$W/stats.json" "fake camera stats"
 LOGOUTS=$(sed -n 's/.*"logouts":\([0-9]*\).*/\1/p' "$W/stats.json")
-podman logs neolink-a13 > "$W/neolink.log" 2>&1
-podman rm -f neolink-a13 >/dev/null
-podman stop -t 2 client-a13 >/dev/null 2>&1
-podman stop -t 2 fakecam-a13 >/dev/null 2>&1
-msg="stop with a client playing: ${MS} ms, exit code ${CODE}, logouts ${LOGOUTS}"
-if [ "$MS" -lt 5000 ] && [ "$CODE" = 0 ] && [ "$LOGOUTS" = 1 ]; then echo "PASS N9 $msg"
+logs > "$W/neolink.log"
+msg="stop with a client playing: ${MS} ms, exit code ${CODE}, logouts ${LOGOUTS:-none}"
+if [ "$MS" -lt 5000 ] && [ "$CODE" = 0 ] && [ "${LOGOUTS:-}" = 1 ]; then echo "PASS N9 $msg"
 else echo "FAIL N9 $msg"; tail -5 "$W/neolink.log" | sed 's/^/    /'; FAILS=$((FAILS+1)); fi
-[ $FAILS = 0 ] && echo "ALL PASSED" || echo "$FAILS FAILED"
+if [ $FAILS = 0 ]; then echo "ALL PASSED"; else echo "$FAILS FAILED"; fi
 exit $FAILS
