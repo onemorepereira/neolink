@@ -86,4 +86,9 @@ default (beta).
   - `clients.sh`, `golden-native.sh`, `avsync.sh`, `frigate.sh`;
   - `soak.sh`, `perf.sh`, `container-native.sh`;
   - with `SERVER=neolink` for the real neolink path.
-- **CI:** `.github/workflows/test.yml`, `nightly.yml`, `native-release.yml` (artifacts only).
+- **CI:** `.github/workflows/test.yml` (every PR and push to master: cargo test, the
+  short e2e runs, the client matrix, the container entry matrix on both images, cargo-deny
+  licenses), `style_checks.yml` (clippy, rustfmt, actionlint, shellcheck), `nightly.yml`
+  (fuzzing, the 15/90 min A/V and Frigate runs, the 5 h soak, the full client gate,
+  advisories), `build.yml` (release builds), `native-release.yml` (artifacts only). Every
+  e2e script fails non-zero on a broken run (`tests/e2e/lib.sh`), not only on a failed check.

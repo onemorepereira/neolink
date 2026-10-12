@@ -3,7 +3,7 @@
 `gst/` holds transcripts of the **GStreamer backend** (neolink 0.6.3-rc.3, default
 features) serving the owner's Argus PT Ultra, recorded 2026-10-11 with
 `cargo xtask golden record` and normalised with `cargo xtask golden normalize`. The client
-is the pinned ffmpeg n8.1.3 (`.github/workflows/test.yml`), `-t 4 -f null`.
+is the pinned ffmpeg n8.1.3 (`.github/actions/setup-ffmpeg`), `-t 4 -f null`.
 
 They contain no media: interleaved data appears only as one line per channel and payload
 type. Credentials are the test users `alice`/`bob` and are normalised away.
