@@ -483,10 +483,23 @@ async fn test_sr_ntp_is_real_time_for_a_late_hub() {
     c.collect(Duration::from_millis(4500)).await;
     let (now_i, now_s) = (std::time::Instant::now(), std::time::SystemTime::now());
     let mut srs = 0;
+    // An SR maps the last frame sent on its track, not the moment it is sent: a late
+    // joiner gets the cached IRAP and then nothing until the next live IRAP (DESIGN §4.6),
+    // so an SR in that gap is up to a GOP after its frame. Compare with that frame's
+    // arrival: the old bug put NTP behind it by the Hub's age (3 s here)
+    let mut last_media: std::collections::HashMap<u8, std::time::Instant> =
+        std::collections::HashMap::new();
     for ((ch, p), at) in c.packets.iter().zip(&c.arrivals) {
-        if ch % 2 == 0 || p.len() < 16 || p[1] != 200 {
+        if ch % 2 == 0 {
+            last_media.insert(*ch, *at);
             continue;
         }
+        if p.len() < 16 || p[1] != 200 {
+            continue;
+        }
+        let Some(at) = last_media.get(&(ch - 1)) else {
+            panic!("SR on channel {ch} before any media on its track");
+        };
         srs += 1;
         let secs = u32::from_be_bytes(p[8..12].try_into().unwrap()) as u64;
         let frac = u32::from_be_bytes(p[12..16].try_into().unwrap()) as u64;
@@ -497,7 +510,6 @@ async fn test_sr_ntp_is_real_time_for_a_late_hub() {
             .as_micros() as u64;
         let real_us = unix_us + 2_208_988_800 * 1_000_000;
         let diff = ntp_us as i64 - real_us as i64;
-        // An SR maps the last frame sent: at most a frame interval or so old
         assert!(
             diff.abs() < 300_000,
             "SR on channel {ch}: NTP {diff} µs from real time"
