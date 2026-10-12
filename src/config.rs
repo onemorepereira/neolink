@@ -120,7 +120,7 @@ pub(crate) struct LimitsConfig {
     /// across all usernames. Past either, that username's (or every username's)
     /// credentials from that address are refused (401, at once, right or wrong) until a
     /// minute passes without that many failures. RTSP connections already authenticated
-    /// as that user are not affected
+    /// as that user are not affected. The snapshot endpoint applies the same limits
     #[validate(range(min = 1, max = 1000))]
     #[serde(default = "default_failed_auth_per_minute")]
     pub(crate) failed_auth_per_minute: usize,

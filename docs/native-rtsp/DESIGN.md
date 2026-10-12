@@ -818,7 +818,8 @@ backends.
   no reason, so this is a signature change on `NeoInstance::permit`/`run_task`.
 
 **Snapshot endpoint (P5)**
-- A minimal HTTP/1.1 GET server on `snapshot_port` (same limits as §6.6).
+- A minimal HTTP/1.1 GET server on `snapshot_port` (same limits as §6.6; failed auth as
+  §6.5, per (address, username) with its own counters, answered at once).
 - Auth is the shared module from §6.5.
 - It serves the cached JPEG and never takes a permit unless `?fresh=1` is allowed by
   config.
