@@ -28,7 +28,11 @@ fn git_cmd_ver() -> Option<String> {
     // neolink versions
     git(&["describe", "--tags", "--match", "v[0-9]*"]).or_else(|| {
         let sha = git(&["rev-parse", "--short", "HEAD"])?;
-        Some(format!("{} ({})", env::var("CARGO_PKG_VERSION").unwrap(), sha))
+        Some(format!(
+            "{} ({})",
+            env::var("CARGO_PKG_VERSION").unwrap(),
+            sha
+        ))
     })
 }
 
