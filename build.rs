@@ -22,18 +22,23 @@ fn git_ver() -> Option<String> {
 }
 
 fn git_cmd_ver() -> Option<String> {
-    let mut git_cmd = Command::new("git");
-    git_cmd.args(["describe", "--tags"]);
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
+    // Release tags only: other tags in the repo (such as the ffmpeg mirror's) are not
+    // neolink versions
+    git(&["describe", "--tags", "--match", "v[0-9]*"]).or_else(|| {
+        let sha = git(&["rev-parse", "--short", "HEAD"])?;
+        Some(format!("{} ({})", env::var("CARGO_PKG_VERSION").unwrap(), sha))
+    })
+}
 
-    if let Some(true) = git_cmd.status().ok().map(|exit| exit.success()) {
-        println!("cargo:rerun-if-changed=.git/HEAD");
-        git_cmd
-            .output()
-            .ok()
-            .map(|o| String::from_utf8(o.stdout).unwrap())
-    } else {
-        None
+fn git(args: &[&str]) -> Option<String> {
+    let out = Command::new("git").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
     }
+    let text = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 fn github_ver() -> Option<String> {
