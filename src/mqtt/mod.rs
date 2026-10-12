@@ -1401,7 +1401,7 @@ async fn query_battery(
         let saved = state.load().last_battery;
         if let Some(b) = saved.filter(|b| !fresh || b.age() <= FRESH_MAX_AGE_S) {
             let reply = publish_xml(mqtt, "status/battery", &b.to_info(config.channel_id)).await?;
-            return Ok(saved_reply(reply, b.age()));
+            return Ok(saved_reply(reply, b.age(), fresh));
         }
     }
     let info = match live_query(camera, power, "query/battery", fresh, |cam| {
@@ -1442,7 +1442,7 @@ async fn query_preview(
             let age = unix_now().saturating_sub(at);
             if !fresh || age <= FRESH_MAX_AGE_S {
                 publish(jpeg).await?;
-                return Ok(saved_reply("OK".to_string(), age));
+                return Ok(saved_reply("OK".to_string(), age, fresh));
             }
         }
     }
@@ -1464,11 +1464,14 @@ async fn query_preview(
 }
 
 /// The reply for an answer from the state file: its age, and how to get a new one
-fn saved_reply(published: String, age: u64) -> String {
+fn saved_reply(published: String, age: u64, fresh: bool) -> String {
     if published != "OK" {
-        return published;
+        published
+    } else if fresh {
+        format!("OK: saved {age} s ago (fresh queries reuse a reading up to {FRESH_MAX_AGE_S} s old)")
+    } else {
+        format!("OK: saved {age} s ago (send `fresh` to wake the camera for a new one)")
     }
-    format!("OK: saved {age} s ago (send `fresh` to wake the camera for a new one)")
 }
 
 /// Wait up to 60 s for the wake reads to update the state file
