@@ -12,7 +12,9 @@ bind = "0.0.0.0"
 # snapshot_port = 8555
 #
 # What neolink learns about each camera (battery level, streams, last snapshot) is kept
-# in $NEOLINK_STATE_DIR (default ~/.local/state/neolink).
+# in the state directory: $NEOLINK_STATE_DIR, else $XDG_STATE_HOME/neolink, else
+# ~/.local/state/neolink, else /tmp/neolink. The Docker images use /var/lib/neolink;
+# mount a volume there so it survives restarts.
 
 # Uncomment the following and supply a path to a valid PEM
 # to activate TLS encryption.
@@ -58,15 +60,24 @@ address = "192.168.1.187:9000"
 # as follows
 # uid = "ABCD01234567890EFG"
 
-# Power. Neolink only connects to a camera while something needs it (an RTSP viewer, a
-# CLI or MQTT command) and disconnects `idle_grace_s` seconds after the last use, so
-# battery cameras can sleep. That is the default unless the camera is known to be on
-# mains power:
-# battery = false        # mains powered: stay connected (as before)
-# idle_disconnect = false # stay connected even on battery (drains it; logs a warning)
-# idle_grace_s = 10      # seconds to stay connected after the last use
+# Power. BY DEFAULT THIS CAMERA SLEEPS: with neither `battery` nor `idle_disconnect`
+# set, neolink does not connect at startup, connects only while something needs the
+# camera (an RTSP viewer, an MQTT control/query message, a CLI command, a ?fresh=1
+# snapshot) and disconnects `idle_grace_s` seconds after the last use. That suits
+# battery and solar cameras. While the camera sleeps, MQTT motion and floodlight
+# status are not reported, and pause.on_motion can't start the stream.
+#
+# Before this version every camera stayed connected. To keep a mains, PoE or NVR
+# camera connected as before, set:
+# battery = false
+#
+# idle_disconnect overrides `battery` when set:
+# idle_disconnect = true  # sleep even if battery = false
+# idle_disconnect = false # always connected, even on battery (drains it; logs a warning)
+#
+# idle_grace_s = 10       # seconds a sleeping camera stays connected after the last use
 # motion_hold_max_s = 120 # longest a motion event keeps the camera connected
-# snapshot_fresh = false # allow /<name>/snapshot.jpg?fresh=1, which wakes the camera
+# snapshot_fresh = false  # allow /<name>/snapshot.jpg?fresh=1, which wakes the camera
 
 # By default any of the users can connect (or anyone at all if no users are specfied)
 # You can uncomment the following to permit only specfic users
@@ -108,6 +119,9 @@ name = "storage shed"
 username = "admin"
 password = "987654321"
 address = "192.168.1.245:9000"
+# This camera is on mains power: keep it connected, as every camera was before
+# (without this line it would sleep, see the Power notes on the first camera)
+battery = false
 # If you use a battery camera: **Instead** of an `address` supply the uid
 # as follows
 # uid = "ABCD01234567890EFG"
@@ -119,3 +133,6 @@ address = "192.168.1.245:9000"
 # **Note**: that unlike in the official client the numbering starts from 0 not 1.
 # An 8 channel NVR would have channels 0 through 7
 # channel_id = 0
+#
+# Each NVR channel is its own [[cameras]] entry with its own power setting. For wired
+# cameras on an NVR, set `battery = false` on every channel, or they sleep.

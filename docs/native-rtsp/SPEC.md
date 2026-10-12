@@ -146,6 +146,9 @@ goal. The camera must be asleep whenever nobody is watching.
 **Out of scope (v1):** waking on motion without staying connected. That needs a local
 push/wake receiver, as bairelay has; it is a v1.x candidate. `pause.on_motion` on a battery
 camera keeps today's behaviour of staying connected, and P1's warning applies to it.
+*As implemented (PLAN Gate 5):* `pause.on_motion` does **not** keep a sleeping camera
+connected. The camera still sleeps, motion can't start its stream, and neolink warns at
+startup; staying connected needs `idle_disconnect = false` (or `battery = false`).
 
 ### 4.2 Deferred to v1.x (in order)
 
