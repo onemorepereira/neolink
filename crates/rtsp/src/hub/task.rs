@@ -12,7 +12,7 @@
 
 use super::clock::{AudioTime, MediaClock};
 use super::desc::{DescCache, DescEvent, DescLearner, IrapWritePolicy, StreamDesc};
-use super::pacer::{Paced, Pacer};
+use super::pacer::{Paced, Pacer, Recovery};
 use super::wire::{eos_nal, Bridge, BridgeOut, SessionGuard, SourceState, Track, WireClock};
 use crate::codec::aac::{adts_access_units, silent_au};
 use crate::codec::annexb::{is_irap, param_kind, split_nals, NalFilter, VideoCodec};
@@ -290,6 +290,11 @@ pub struct HubStats {
     pub drift_corrections: u64,
     pub guard_engaged: u64,
     pub pacer_underruns: u64,
+    /// Excess-latency recoveries (DESIGN §4.4): anchor pull-backs, and skips to an IRAP
+    pub pacer_pullbacks: u64,
+    pub pacer_skips: u64,
+    /// Wire clock re-latches after the first latch (DESIGN §4.5), each one logged
+    pub rebases: u64,
     pub max_queued_bytes: usize,
     /// Frames waiting in the pacer (Hub memory)
     pub pacer_queued: usize,
@@ -338,6 +343,8 @@ struct Item {
     media_us: u64,
     irap: bool,
     discontinuity: bool,
+    /// The IRAP a pacer skip went to: wire time re-latches on it (DESIGN §4.5)
+    skip_target: bool,
     /// The desc gen it was ingested under: an item of a superseded gen is never released
     gen: u32,
     /// Video NALs, or one audio AU
@@ -350,6 +357,9 @@ impl Paced for Item {
     }
     fn is_irap(&self) -> bool {
         self.track == Track::Video && self.irap
+    }
+    fn mark_skip_target(&mut self) {
+        self.skip_target = true;
     }
 }
 
@@ -768,6 +778,9 @@ impl Hub {
                 st.drift_corrections = self.clock.drift_corrections;
                 st.guard_engaged = self.wire.stats.guard_engaged;
                 st.pacer_underruns = self.pacer.stats.underruns;
+                st.pacer_pullbacks = self.pacer.stats.pullbacks;
+                st.pacer_skips = self.pacer.stats.skips;
+                st.rebases = self.wire.stats.relatches;
                 st.pacer_queued = self.pacer.queued();
                 let _ = reply.send(st);
             }
@@ -777,7 +790,7 @@ impl Hub {
     /// The stats line (DESIGN §4.8), logged at debug every 60 s
     fn log_stats(&self) {
         log::debug!(
-            "{}: clients={} playing={} source={} frames_out={} resyncs={} budget_drops={} drift_corrections={} guard_engaged={} pacer_underruns={} bridged={}s learning_starts={}",
+            "{}: clients={} playing={} source={} frames_out={} resyncs={} budget_drops={} drift_corrections={} guard_engaged={} pacer_underruns={} pacer_pullbacks={} pacer_skips={} rebases={} bridged={}s learning_starts={}",
             self.cfg.name,
             self.sessions.len(),
             self.playing(),
@@ -788,6 +801,9 @@ impl Hub {
             self.clock.drift_corrections,
             self.wire.stats.guard_engaged,
             self.pacer.stats.underruns,
+            self.pacer.stats.pullbacks,
+            self.pacer.stats.skips,
+            self.wire.stats.relatches,
             self.bridge.bridged_total(self.now_us()) / 1_000_000,
             self.stats.learning_starts,
         );
@@ -1023,13 +1039,14 @@ impl Hub {
                 if nals.is_empty() {
                     return;
                 }
-                self.pacer.push(
+                self.pace(
                     now,
                     Item {
                         track: Track::Video,
                         media_us: t.media_us,
                         irap,
                         discontinuity: t.discontinuity,
+                        skip_target: false,
                         gen: self.gen(),
                         data: nals,
                     },
@@ -1064,13 +1081,14 @@ impl Hub {
                 for au in aus {
                     if let AudioTime::Send { media_us, .. } = self.clock.audio(now, self.audio_sent)
                     {
-                        self.pacer.push(
+                        self.pace(
                             now,
                             Item {
                                 track: Track::Audio,
                                 media_us,
                                 irap: false,
                                 discontinuity: false,
+                                skip_target: false,
                                 gen: self.gen(),
                                 data: vec![au],
                             },
@@ -1087,6 +1105,45 @@ impl Hub {
         if let Some(ev) = self.learner.check_timeout(now) {
             self.desc_event(ev);
         }
+    }
+
+    /// Queue an item in the pacer, logging its excess-latency recoveries (DESIGN §4.4)
+    fn pace(&mut self, now: u64, item: Item) {
+        match self.pacer.push(now, item) {
+            Some(Recovery::Skip { frames, media_us }) => log::info!(
+                "{}: pacer skipped {frames} queued frames ({:.3} s of media) to the newest \
+                 IRAP: delivery is back to the latency",
+                self.cfg.name,
+                media_us as f64 / 1e6
+            ),
+            Some(Recovery::Pullback { by_us, to_irap }) => log::debug!(
+                "{}: pacer pulled back by {:.3} s{}",
+                self.cfg.name,
+                by_us as f64 / 1e6,
+                if to_irap { " to the newest IRAP" } else { "" }
+            ),
+            None => {}
+        }
+    }
+
+    /// Re-latch the wire clock on the video frame at `media_us`, released now (DESIGN
+    /// §4.5). Logged with how far it moved wire time against wall time: at info from 1 s,
+    /// the on-wire jumps SPEC N5 allows only when logged
+    fn rebase(&mut self, why: &str, media_us: u64, now: u64) {
+        self.wire.min_gap_us = self.frame_gap_us();
+        let r = self.wire.relatch(media_us, now);
+        let level = if r.shift_us.unsigned_abs() > 1_000_000 {
+            log::Level::Info
+        } else {
+            log::Level::Debug
+        };
+        log::log!(
+            level,
+            "{}: wire clock rebased ({why}): {:+.3} s against wall time, at wire {} µs",
+            self.cfg.name,
+            r.shift_us as f64 / 1e6,
+            r.wire_us
+        );
     }
 
     /// Cache writes happen on the blocking pool, never on the Hub task
@@ -1214,11 +1271,11 @@ impl Hub {
                             continue; // live video resumes from an IRAP only
                         }
                         self.bridge.live(now);
-                        self.wire.min_gap_us = self.frame_gap_us();
-                        self.wire.relatch(item.media_us, now);
+                        self.rebase("live after the bridge", item.media_us, now);
                     } else if item.discontinuity {
-                        self.wire.min_gap_us = self.frame_gap_us();
-                        self.wire.relatch(item.media_us, now);
+                        self.rebase("media clock discontinuity", item.media_us, now);
+                    } else if item.skip_target {
+                        self.rebase("pacer skip", item.media_us, now);
                     }
                     self.last_video_wall = Some(now);
                     self.wire.stamp(Track::Video, item.media_us, now)
@@ -2188,6 +2245,9 @@ mod tests {
             assert!(frames.len() > 1000, "{latency}: {}", frames.len());
             let st = h.stats().await.unwrap();
             assert_eq!(st.guard_engaged, 0, "{latency}: {st:?}");
+            // The catch-up skips, each one a rebase (tests/wire_drift.rs checks the wire)
+            assert!(st.pacer_skips > 0, "{latency}: {st:?}");
+            assert!(st.rebases >= st.pacer_skips, "{latency}: {st:?}");
         }
     }
 

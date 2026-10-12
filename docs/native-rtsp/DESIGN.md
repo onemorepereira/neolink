@@ -310,8 +310,10 @@ moves therefore never show up as RTP or NTP steps (F-cc 7).
   - If `min_lead > latency + 1 frame` for 10 s, pull the anchor back by
     `min_lead − latency`. That is one shift, which means a burst of early releases, which
     is harmless.
-  - If `min_lead > latency + GOP`, skip queued frames up to the newest IRAP. This drops
-    media without changing timestamps; the wire shows a gap, handled as in §4.5.
+  - If `min_lead > latency + GOP`, skip queued frames up to the newest IRAP, which is
+    then due now. This drops media; the IRAP is marked, and the WireClock re-latches on
+    it (§4.5), so the wire shows one logged forward rebase at that IRAP instead of a gap
+    the size of the dropped media.
 - **No ppm slew is needed.** Long-term camera-vs-host drift shows up as a slowly growing or
   shrinking `min_lead`, and the rule above corrects it.
 - **`latency = 0`**: release on arrival. Per-track monotonicity is enforced by the
@@ -323,7 +325,8 @@ moves therefore never show up as RTP or NTP steps (F-cc 7).
   The rules above handle it without new mechanism: every late frame is an underrun, so the
   anchor follows arrival and delivery latency grows (timestamps don't move); when the
   catch-up burst arrives, `min_lead` exceeds `latency + GOP` and the pacer skips to the
-  newest IRAP, back to `latency`. Arrival gaps stay below the bridge threshold, so viewers
+  newest IRAP, back to `latency`, and wire time re-latches there, back to wall time
+  (§4.5). Arrival gaps stay below the bridge threshold, so viewers
   see late video, then one skip, and no bridge at the battery default latency (1500 ms,
   threshold 4.5 s). The real capture's longest gap was 3.1 s; the synthetic
   `congestion_h265.bcm` fixture (`cargo xtask mkfixture`; 14 s peak lag, 4.3 s longest
@@ -341,15 +344,33 @@ There is one wire clock per Hub, in µs, monotonic, shared by all tracks and ses
 | Event | New offset |
 |---|---|
 | Hub created | `0` |
-| Bridge engaged, then live resumes | `offset = virtual_now − media_us(first live frame)`, where `virtual_now = last_wire_out + (now − last_wire_out_wall)`. Applied to all tracks. Live video is dropped until the next IRAP (that IRAP *is* the "first live frame"). |
-| MediaClock discontinuity flag | Same formula as resume |
+| First frame (the latch) | `offset = now − media_us(frame)`: the frame is on the wire at the Hub's wall time `now` (µs since Hub creation, whose system time is the SR's `ntp_epoch`, §5.3) |
+| Bridge engaged, then live resumes | Re-latch: `offset = now − media_us(first live frame)`, the same wall-time target as the latch. Applied to all tracks. Live video is dropped until the next IRAP (that IRAP *is* the "first live frame"). |
+| MediaClock discontinuity flag | Re-latch, as on resume |
+| Pacer skip (§4.4) | Re-latch on the IRAP the pacer skipped to, as on resume |
 | Otherwise | unchanged |
+
+Between re-latches, wire time drifts from wall time by what the pacer does to release
+times: an underrun puts it behind (by up to the camera's arrival lag in a congestion
+episode), a pull-back ahead (by less than a GOP; more excess skips instead). Re-latching
+at `virtual_now = last_wire_out + (now − last_wire_out_wall)`, as before, kept that drift,
+and each skip added the media it dropped: at the 300 ms default, bridged congestion
+episodes ratcheted wire time (and SR NTP time) ahead of wall time by about 4 s each, with
+no limit. Aiming every re-latch at wall time ends the drift at each one, so wire time is
+within an episode's arrival lag behind wall time and less than `latency + GOP` ahead
+(`tests/wire_drift.rs`).
 
 A re-latch also keeps the frame at least one frame interval + 1 ms after the last *video*
 frame (and after a late joiner's restamp), so a client counting in frame ticks never sees
-two video frames at the same time. Not after the last audio AU: that one was usually sent
-moments before, and the step would push wire time ahead of wall time at every
-discontinuity. Live audio that would not follow its last AU is dropped.
+two video frames at the same time, and wire time that is ahead of wall time never steps
+back. Not after the last audio AU: that one was usually sent moments before, and the step
+would push wire time ahead of wall time at every discontinuity. Live audio that would not
+follow its last AU is dropped.
+
+Every re-latch is logged with its shift, the new wire time less `virtual_now`: at info
+when it exceeds 1 s, at debug otherwise. The jumps it makes are therefore forward, at an
+IRAP, and logged (SPEC N5). Pacer skips (info) and pull-backs (debug) are logged too, and
+counted with the re-latches in the stats line (§4.8).
 
 **Monotonic guard.** Per track, `wire_ts = max(wire_ts, last_out + 1 tick)`. This is
 enforced after the offset is applied. The guard is a safety net; any time it engages it is
@@ -454,7 +475,8 @@ IRAP, and the session's sender registration.
   - MediaClock discontinuity and re-latch;
   - slow-client resync and drop.
 - **Stats line**: one per Hub. Fields: clients, video bitrate, fps, drops, resyncs,
-  `drift_corrections`, `guard_engaged`, pacer slips, bridge seconds.
+  `drift_corrections`, `guard_engaged`, pacer underruns, pull-backs and skips, wire
+  clock rebases, bridge seconds.
   - Logged at debug every 60 s, and at info on SIGUSR1 (unix).
   - The same counters back the `metrics` feature (§9) and the test-only task/use-counter
     dump used by Gate 1 (PLAN 1.10).
