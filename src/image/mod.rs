@@ -24,7 +24,7 @@ use neolink_core::{
     bcmedia::model::{BcMedia, BcMediaIframe, BcMediaPframe},
 };
 use std::sync::Arc;
-use tokio::{fs::File, io::AsyncWriteExt, sync::RwLock};
+use tokio::sync::RwLock;
 
 mod cmdline;
 mod gst;
@@ -118,12 +118,13 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                     opt.camera,
                     unix_now().saturating_sub(at)
                 );
-                File::create(file_path).await?.write_all(&jpeg).await?;
+                // tokio::fs::write finishes the write before returning: a File's
+                // write_all may still be in flight when the process exits
+                tokio::fs::write(file_path, &jpeg).await?;
                 return Ok(());
             }
             eprintln!("{}: no saved snapshot yet, waking the camera", opt.camera);
         }
-        let mut buffer = File::create(file_path).await?;
         let jpeg_data = camera
             .run_task_for("cli:image", |camera| {
                 Box::pin(async move { Ok(camera.get_snapshot().await?) })
@@ -132,8 +133,8 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         if jpeg_data.is_err() {
             log::debug!("jpeg_data: {:?}", jpeg_data);
         }
-        let jpeg_data = jpeg_data?;
-        buffer.write_all(jpeg_data.as_slice()).await?;
+        // Written only once the camera answered, so a failed wake leaves no empty file
+        tokio::fs::write(file_path, jpeg_data?).await?;
     }
 
     Ok(())
