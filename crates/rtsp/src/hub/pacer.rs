@@ -11,9 +11,11 @@
 //! - **Excess latency**: the minimum lead (`due − now` of each newest frame at arrival)
 //!   over a 10 s window. If it stays above `latency + 1 frame` for 10 s, the anchor is
 //!   pulled back by `min_lead − latency` (a burst of early releases). If it exceeds
-//!   `latency + GOP`, queued frames up to the newest IRAP are skipped (media is dropped,
-//!   timestamps don't change). This recovers from the Argus's congestion episodes, where
-//!   arrivals fall up to 17 s behind and then catch up.
+//!   `latency + GOP`, queued frames up to the newest IRAP are skipped (media is dropped)
+//!   and that IRAP is due now. This recovers from the Argus's congestion episodes, where
+//!   arrivals fall up to 17 s behind and then catch up. The IRAP is marked: the WireClock
+//!   re-latches on it (DESIGN §4.5), so the skip is a logged forward rebase at an IRAP
+//!   rather than an unlogged jump by the dropped media.
 //! - **Latency 0**: release on arrival.
 //!
 //! Pure and clock-free: the caller passes `now` (µs) so tests run in virtual time.
@@ -25,6 +27,19 @@ pub trait Paced {
     fn media_us(&self) -> u64;
     /// A video IRAP (a point the pacer may skip to)
     fn is_irap(&self) -> bool;
+    /// The pacer skipped to this IRAP: it is released at once, and wire time re-latches
+    /// on it
+    fn mark_skip_target(&mut self);
+}
+
+/// A recovery from excess latency (logged by the caller)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// `frames` queued frames (`media_us` of media) dropped up to the newest IRAP
+    Skip { frames: u64, media_us: u64 },
+    /// The anchor moved back by `by_us`: a burst of early releases. `to_irap`: the newest
+    /// queued IRAP was at the front, so the skip dropped nothing and made it due now
+    Pullback { by_us: u64, to_irap: bool },
 }
 
 const WINDOW_US: u64 = 10_000_000;
@@ -83,12 +98,12 @@ impl<T: Paced> Pacer<T> {
         (wall + (media_us as i64 - media0 as i64) + self.latency_us as i64).max(0) as u64
     }
 
-    /// A frame arrived at `now`
-    pub fn push(&mut self, now: u64, frame: T) {
+    /// A frame arrived at `now`. Returns the recovery from excess latency it caused, if any
+    pub fn push(&mut self, now: u64, frame: T) -> Option<Recovery> {
         let media = frame.media_us();
         if self.latency_us == 0 {
             self.queue.push_back(frame);
-            return;
+            return None;
         }
         match self.anchor {
             // The first frame is due now
@@ -112,46 +127,66 @@ impl<T: Paced> Pacer<T> {
             self.leads.pop_front();
         }
         self.queue.push_back(frame);
-        self.recover(now);
+        self.recover(now)
     }
 
-    fn recover(&mut self, now: u64) {
-        let Some(min_lead) = self.leads.iter().map(|(_, l)| *l).min() else {
-            return;
-        };
+    fn recover(&mut self, now: u64) -> Option<Recovery> {
+        let min_lead = self.leads.iter().map(|(_, l)| *l).min()?;
         let latency = self.latency_us as i64;
         if min_lead > latency + self.gop_us as i64 {
             // Far behind live: skip to the newest queued IRAP
             if let Some(pos) = self.queue.iter().rposition(|f| f.is_irap()) {
+                let front_due = self.due(self.queue[0].media_us());
+                let media = self.queue[pos].media_us();
+                let dropped = media.saturating_sub(self.queue[0].media_us());
                 if pos > 0 {
                     self.stats.skips += 1;
                     self.stats.skipped_frames += pos as u64;
                     self.queue.drain(..pos);
+                } else {
+                    self.stats.pullbacks += 1;
                 }
-                // That IRAP is due now
-                let media = self.queue[0].media_us();
+                // That IRAP is due now, and wire time re-latches on it
+                self.queue[0].mark_skip_target();
                 self.anchor = Some((now as i64 - latency, media));
                 self.leads.clear();
                 self.excess_since = None;
-                return;
+                return Some(if pos > 0 {
+                    Recovery::Skip {
+                        frames: pos as u64,
+                        media_us: dropped,
+                    }
+                } else {
+                    Recovery::Pullback {
+                        by_us: front_due.saturating_sub(now),
+                        to_irap: true,
+                    }
+                });
             }
         }
         if min_lead > latency + self.frame_us as i64 {
             let since = *self.excess_since.get_or_insert(now);
             if now.saturating_sub(since) >= WINDOW_US {
                 let pull = (min_lead - latency) as u64;
+                let mut out = None;
                 if let Some((wall, media0)) = self.anchor {
                     self.anchor = Some((wall - pull as i64, media0));
                     self.stats.pullbacks += 1;
+                    out = Some(Recovery::Pullback {
+                        by_us: pull,
+                        to_irap: false,
+                    });
                 }
                 for l in self.leads.iter_mut() {
                     l.1 -= pull as i64;
                 }
                 self.excess_since = None;
+                return out;
             }
         } else {
             self.excess_since = None;
         }
+        None
     }
 
     /// Drop everything queued and forget the anchor (the source stopped)
@@ -196,6 +231,7 @@ mod tests {
     struct F {
         media: u64,
         irap: bool,
+        skip: bool,
     }
     impl Paced for F {
         fn media_us(&self) -> u64 {
@@ -203,6 +239,9 @@ mod tests {
         }
         fn is_irap(&self) -> bool {
             self.irap
+        }
+        fn mark_skip_target(&mut self) {
+            self.skip = true;
         }
     }
 
@@ -238,7 +277,20 @@ mod tests {
     /// Replay arrivals into a pacer, returning (release wall, media) per frame
     /// Like the Hub: wake at each due time (or on arrival), release at max(due, now)
     fn replay(p: &mut Pacer<F>, arrivals: &[(u64, u64, bool)]) -> Vec<(u64, u64)> {
+        replay_full(p, arrivals)
+            .0
+            .into_iter()
+            .map(|(wall, f)| (wall, f.media))
+            .collect()
+    }
+
+    /// Like [`replay`], with the released frames and the recoveries
+    fn replay_full(
+        p: &mut Pacer<F>,
+        arrivals: &[(u64, u64, bool)],
+    ) -> (Vec<(u64, F)>, Vec<Recovery>) {
         let mut out = vec![];
+        let mut recoveries = vec![];
         let mut now = 0u64;
         for &(at, media, irap) in arrivals {
             while let Some(due) = p.next_due() {
@@ -247,22 +299,27 @@ mod tests {
                 }
                 now = now.max(due);
                 for f in p.pop_due(now) {
-                    out.push((now, f.media));
+                    out.push((now, f));
                 }
             }
             now = now.max(at);
-            p.push(now, F { media, irap });
+            let f = F {
+                media,
+                irap,
+                skip: false,
+            };
+            recoveries.extend(p.push(now, f));
             for f in p.pop_due(now) {
-                out.push((now, f.media));
+                out.push((now, f));
             }
         }
         while let Some(due) = p.next_due() {
             now = now.max(due);
             for f in p.pop_due(now) {
-                out.push((now, f.media));
+                out.push((now, f));
             }
         }
-        out
+        (out, recoveries)
     }
 
     fn jitter_p99(releases: &[(u64, u64)]) -> u64 {
@@ -286,6 +343,7 @@ mod tests {
             F {
                 media: 0,
                 irap: true,
+                skip: false,
             },
         );
         assert_eq!(p.next_due(), Some(5_000_000));
@@ -294,6 +352,7 @@ mod tests {
             F {
                 media: 66_667,
                 irap: false,
+                skip: false,
             },
         );
         assert_eq!(p.pop_due(5_000_000).len(), 1);
@@ -362,6 +421,51 @@ mod tests {
         );
     }
 
+    /// Every skip lands on an IRAP, which is released marked (the WireClock re-latches on
+    /// it, DESIGN §4.5), and is reported with what it dropped
+    #[test]
+    fn test_skip_marks_its_irap() {
+        let Some(arrivals) = fixture("congestion_h265.bcm") else {
+            panic!("run `cargo xtask mkfixture --standard --out fixtures/synth` first");
+        };
+        for latency in [300_000u64, 1_500_000] {
+            let mut p = Pacer::new(latency);
+            let (released, recoveries) = replay_full(&mut p, &arrivals);
+            let skips: Vec<_> = recoveries
+                .iter()
+                .filter_map(|r| match r {
+                    Recovery::Skip { frames, media_us } => Some((*frames, *media_us)),
+                    _ => None,
+                })
+                .collect();
+            assert!(!skips.is_empty(), "{latency}: {:?}", p.stats);
+            assert_eq!(skips.len() as u64, p.stats.skips, "{latency}");
+            assert_eq!(
+                skips.iter().map(|s| s.0).sum::<u64>(),
+                p.stats.skipped_frames,
+                "{latency}"
+            );
+            assert!(skips.iter().all(|s| s.1 > 0), "{latency}: {skips:?}");
+            let marked: Vec<&F> = released.iter().map(|r| &r.1).filter(|f| f.skip).collect();
+            let to_irap = recoveries
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r,
+                        Recovery::Skip { .. } | Recovery::Pullback { to_irap: true, .. }
+                    )
+                })
+                .count();
+            assert_eq!(marked.len(), to_irap, "{latency}");
+            assert!(marked.iter().all(|f| f.irap), "{latency}");
+            assert_eq!(
+                recoveries.len() as u64,
+                p.stats.skips + p.stats.pullbacks,
+                "{latency}"
+            );
+        }
+    }
+
     #[test]
     fn test_latency_zero_releases_on_arrival() {
         let mut p = Pacer::new(0);
@@ -370,6 +474,7 @@ mod tests {
             F {
                 media: 0,
                 irap: true,
+                skip: false,
             },
         );
         p.push(
@@ -377,6 +482,7 @@ mod tests {
             F {
                 media: 1_000_000,
                 irap: false,
+                skip: false,
             },
         );
         assert_eq!(p.pop_due(20).len(), 2);

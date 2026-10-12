@@ -2,10 +2,12 @@
 //! (DESIGN §4.5)
 //!
 //! One wire clock per Hub, in µs, shared by every track and session:
-//! `wire_us = media_us + offset`. The offset changes only when live media resumes after a
-//! bridge, or at a MediaClock discontinuity: `offset = virtual_now − media_us`, where
-//! `virtual_now = last_wire_out + (now − last_wire_out_wall)`, so wire time keeps tracking
-//! wall time across gaps and never steps backwards.
+//! `wire_us = media_us + offset`. The offset changes only at a re-latch (a rebase): when
+//! live media resumes after a bridge, at a MediaClock discontinuity, or at the IRAP a
+//! pacer skip goes to. A re-latch puts that frame at the Hub's wall time, like the first
+//! latch, so the drift pacer underruns and pullbacks leave on the wire ends there instead
+//! of being carried on; it never steps back from what was sent. Between re-latches, the
+//! bridge's frames follow `virtual_now = last_wire_out + (now − last_wire_out_wall)`.
 
 use crate::codec::annexb::VideoCodec;
 use bytes::Bytes;
@@ -46,9 +48,20 @@ impl Track {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WireStats {
+    /// Re-latches after the first latch (rebases)
     pub relatches: u64,
     /// The monotonic guard had to engage: always a bug, so counted and logged
     pub guard_engaged: u64,
+}
+
+/// A re-latch: where it put the frame, and how far that moved wire time against wall time
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rebase {
+    /// The wire time of the frame re-latched on
+    pub wire_us: u64,
+    /// That wire time less `virtual_now` (where wire time would be had it followed wall
+    /// time since the last release): positive is a forward on-wire jump
+    pub shift_us: i64,
 }
 
 #[derive(Debug)]
@@ -95,17 +108,21 @@ impl WireClock {
         }
     }
 
-    /// Re-latch so that the video frame at `media_us` is on the wire at `virtual_now`
-    /// (resume after a bridge, or a MediaClock discontinuity)
-    pub fn relatch(&mut self, media_us: u64, now_wall: u64) {
+    /// Re-latch so that the video frame at `media_us` is on the wire at the wall time
+    /// `now_wall` (resume after a bridge, a MediaClock discontinuity, a pacer skip). Not
+    /// at `virtual_now`: that keeps whatever wire time has drifted from wall time (pacer
+    /// underruns and pullbacks, the media a skip drops), and re-latching there carried
+    /// the drift on, more at every congestion episode (DESIGN §4.5)
+    pub fn relatch(&mut self, media_us: u64, now_wall: u64) -> Rebase {
         // After the last video frame by a real step, even when no wall time has passed
         // (frames released together after a camera reconnect): a 1 µs step is below the
         // 90 kHz RTP tick and the millisecond of recordings (duplicate DTS in ffmpeg).
+        // The same step keeps a wire clock that is ahead of wall time from going back.
         // Not after the last audio AU: that one is usually released moments earlier, and
         // a frame interval after it puts video ahead of the wall clock for good, a little
         // more at every discontinuity. Live audio that would not follow its last AU is
-        // dropped by `stamp_if_after`; `virtual_now` is never behind any track
-        let mut v = self.virtual_now(now_wall);
+        // dropped by `stamp_if_after`
+        let mut v = now_wall;
         if let Some(last) = self.last_track[Track::Video.index()] {
             v = v.max(last + self.min_gap_us);
         }
@@ -114,6 +131,10 @@ impl WireClock {
         }
         self.offset = Some(v as i64 - media_us as i64);
         self.stats.relatches += 1;
+        Rebase {
+            wire_us: v,
+            shift_us: v as i64 - self.virtual_now(now_wall) as i64,
+        }
     }
 
     /// The wire time of a live frame released at `now_wall`
@@ -516,6 +537,37 @@ mod tests {
         );
         // Audio from the old timeline that would not follow its last AU is dropped
         assert_eq!(clock.stamp_if_after(Track::Audio, 0, 5_070_000), None);
+        assert_eq!(clock.stats.guard_engaged, 0);
+    }
+
+    /// A re-latch puts its frame at wall time: wire time that fell behind (pacer underruns)
+    /// jumps forward there, by the reported shift; wire time ahead of wall time comes back
+    /// towards it without stepping back from the last video frame
+    #[test]
+    fn test_relatch_aims_at_wall_time() {
+        let mut clock = WireClock::new();
+        assert_eq!(clock.stamp(Track::Video, 0, 1_000_000), 1_000_000);
+        // Frames released 5 s late (underruns): wire time 5 s behind wall time
+        let late = clock.stamp(Track::Video, 66_667, 6_066_667);
+        assert_eq!(late, 1_066_667);
+        let r = clock.relatch(133_333, 6_133_333);
+        assert_eq!(r.wire_us, 6_133_333);
+        assert_eq!(r.shift_us, 5_000_000);
+        assert_eq!(clock.stamp(Track::Video, 133_333, 6_133_333), 6_133_333);
+        assert_eq!(clock.stamp(Track::Video, 200_000, 6_200_000), 6_200_000);
+
+        // Wire time 2 s ahead (frames released early, a pullback): back to the wall clock
+        // after a gap, never before the last video frame
+        let mut clock = WireClock::new();
+        clock.stamp(Track::Video, 2_000_000, 0);
+        let ahead = clock.stamp(Track::Video, 4_000_000, 0);
+        assert_eq!(ahead, 2_000_000);
+        let r = clock.relatch(0, 1_000_000);
+        assert_eq!(r.wire_us, ahead + RELATCH_MIN_GAP_US);
+        assert!(r.shift_us < 0, "{r:?}");
+        let r = clock.relatch(0, 10_000_000);
+        assert_eq!(r.wire_us, 10_000_000);
+        assert_eq!(clock.stats.relatches, 2);
         assert_eq!(clock.stats.guard_engaged, 0);
     }
 

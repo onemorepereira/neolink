@@ -182,6 +182,14 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
 - Native RTSP: a client that hangs up, as ffmpeg does right after TEARDOWN, is logged at
   debug level and no longer as "write failed or stalled". A real stall is logged as
   "client took no data for ...".
+- Native RTSP: stream timestamps no longer drift away from real time after network
+  congestion. Before, each congestion episode that the stream bridged (likely at the
+  mains default `pacing_latency_ms` of 300) moved the RTP and RTCP sender-report times
+  about 8 s further into the future, without limit, and catching up after an episode made
+  an unlogged jump of several seconds. Now each catch-up, resume or camera clock reset
+  brings the timestamps back in line with real time at a keyframe, and every such step is logged
+  (info when over 1 s). The stats line also counts the pacer's pull-backs and skips and
+  the timestamp rebases.
 
 ### Security
 
