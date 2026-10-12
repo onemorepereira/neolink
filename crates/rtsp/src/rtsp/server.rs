@@ -123,6 +123,11 @@ impl Server {
         self.connections.load(Ordering::SeqCst)
     }
 
+    /// Connections holding an unauthenticated slot now
+    pub fn unauthenticated_count(&self) -> usize {
+        self.unauth_total.load(Ordering::SeqCst)
+    }
+
     /// The current users and schemes
     pub fn auth(&self) -> Arc<Auth> {
         self.auth.read().unwrap().clone()

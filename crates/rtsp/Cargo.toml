@@ -24,6 +24,7 @@ sha2 = "0.10.8"
 socket2 = { version = "0.5.7", features = ["all"] }
 
 [dev-dependencies]
+libc = "0.2.153"
 env_logger = "0.11.3"
 tokio = { version = "1.39", features = ["rt", "macros", "sync", "time", "net", "io-util", "test-util", "rt-multi-thread"] }
 symphonia = { version = "0.5.4", default-features = false, features = ["aac"] }
