@@ -86,10 +86,34 @@ pub(crate) fn unix_now() -> u64 {
 }
 
 /// Tests run as parallel threads of one process: they share one directory instead of each
-/// test module setting `NEOLINK_STATE_DIR` to its own value, which raced
+/// test module setting `NEOLINK_STATE_DIR` to its own value, which raced. It starts empty
+/// (a reused pid must not see an earlier run's state), and the first call removes the
+/// directories of test processes that have exited, which nothing else cleans up
 #[cfg(test)]
 pub(crate) fn state_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("neolink-tests-{}", std::process::id()))
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let tmp = std::env::temp_dir();
+        // Liveness is read from /proc, so only on Linux; elsewhere they are left alone
+        if cfg!(target_os = "linux") {
+            for entry in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
+                let name = entry.file_name();
+                let pid = name
+                    .to_str()
+                    .and_then(|n| n.strip_prefix("neolink-tests-"))
+                    .and_then(|p| p.parse::<u32>().ok());
+                if let Some(pid) = pid {
+                    if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+        let dir = tmp.join(format!("neolink-tests-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    })
+    .clone()
 }
 
 #[cfg(not(test))]

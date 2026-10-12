@@ -1,3 +1,4 @@
+use super::backoff::Backoff;
 use crate::{
     config::{Config, MqttServerConfig},
     AnyResult,
@@ -6,9 +7,10 @@ use anyhow::{anyhow, Context, Result};
 use futures::future::FutureExt;
 use log::*;
 use rumqttc::{
-    AsyncClient, ConnectReturnCode, Event, Incoming, LastWill, MqttOptions, QoS, TlsConfiguration,
-    Transport,
+    AsyncClient, ConnectReturnCode, Event, EventLoop, Incoming, LastWill, MqttOptions, QoS,
+    TlsConfiguration, Transport,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio::{
@@ -17,12 +19,22 @@ use tokio::{
         mpsc::{channel as mpsc, Receiver as MpscReceiver, Sender as MpscSender},
         oneshot::{channel as oneshot, Sender as OneshotSender},
         watch::Receiver as WatchReceiver,
+        Mutex,
     },
     time::{sleep, Duration},
 };
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Delays between attempts to reach the broker
+const BROKER_RETRY_MIN: Duration = Duration::from_secs(1);
+const BROKER_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// The last retained payload of each topic neolink publishes. Every (re)connection to the
+/// broker publishes them again, so a broker that restarted without persistence, or a
+/// retained publish lost with a dropped connection, is restored, still retained
+type RetainedCache = Arc<Mutex<HashMap<String, Arc<String>>>>;
 
 pub(crate) struct Mqtt {
     cancel: CancellationToken,
@@ -36,6 +48,7 @@ impl Mqtt {
         let (outgoing_tx, mut outgoing_rx) = mpsc::<MqttRequest>(100);
         let cancel = CancellationToken::new();
         let mut set = JoinSet::<AnyResult<()>>::new();
+        let retained = RetainedCache::default();
 
         // Thread that handles the mqttc side
         // including restarting it if the config changes
@@ -45,12 +58,16 @@ impl Mqtt {
         let thread_outgoing_tx = outgoing_tx.clone();
         set.spawn(async move {
             let mut mqtt_config = thread_config.borrow().mqtt.clone();
+            // Only for a client that cannot start (an unreadable CA or client key): an
+            // unreachable broker is retried by the backend itself
+            let mut backoff = Backoff::new(BROKER_RETRY_MIN, BROKER_RETRY_MAX);
             let r = loop {
                 break tokio::select! {
                     _ = thread_cancel.cancelled() => AnyResult::Ok(()),
                     v = thread_config.wait_for(|config| config.mqtt != mqtt_config).map(|res| res.map(|r| r.clone())) =>
                     {
                         mqtt_config = v?.mqtt.clone();
+                        backoff.reset();
                         continue;
                     }
                     v = async {
@@ -60,12 +77,14 @@ impl Mqtt {
                             outgoing_tx: thread_outgoing_tx.clone(),
                             config: mqtt_config.as_ref().unwrap(),
                             cancel: CancellationToken::new(),
+                            retained: retained.clone(),
                         };
                         backend.run().await
                     }, if mqtt_config.is_some() => {
                         if let Err(e) = &v {
-                            log::error!("MQTT Client Connection Failed: {:?}", e);
-                            sleep(Duration::from_secs(2)).await;
+                            let delay = backoff.next_delay();
+                            log::error!("MQTT client failed, retrying in {delay:?}: {e:?}");
+                            sleep(delay).await;
                             continue;
                         }
                         v
@@ -120,9 +139,14 @@ struct MqttBackend<'a> {
     outgoing_tx: MpscSender<MqttRequest>,
     config: &'a MqttServerConfig,
     cancel: CancellationToken,
+    retained: RetainedCache,
 }
 
 impl<'a> MqttBackend<'a> {
+    /// Runs one client until the requests channel closes. An unreachable broker is no
+    /// error: the client keeps what it was asked to publish and retries the broker with
+    /// backoff (rumqttc reconnects on the next poll); only a client that cannot be set up
+    /// is an error
     async fn run(&mut self) -> AnyResult<()> {
         log::trace!("Run MQTT Server");
         let mut mqttoptions = MqttOptions::new(
@@ -173,11 +197,8 @@ impl<'a> MqttBackend<'a> {
             true,
         ));
 
-        let (client, mut connection) = AsyncClient::new(mqttoptions, 100);
-
-        let client = Arc::new(client);
-        let send_client = client.clone();
-        send_client
+        let (client, connection) = AsyncClient::new(mqttoptions, 100);
+        client
             .publish(
                 "neolink/status".to_string(),
                 QoS::AtLeastOnce,
@@ -186,169 +207,258 @@ impl<'a> MqttBackend<'a> {
             )
             .await?;
         log::debug!("MQTT Published Startup");
-        let loop_cancel = CancellationToken::new();
-        let _drop_guard = loop_cancel.clone().drop_guard();
-        loop {
-            let r = tokio::select! {
-                v = self.outgoing_rx.recv() => {
-                    let msg = v.ok_or(anyhow!("All outgoing MQTT channels closed"))?;
 
-                    // Put it on a thread so that we don't block polling
-                    let outgoing_tx = self.outgoing_tx.clone();
-                    let incomming_tx = self.incomming_tx.clone();
-                    let send_client = send_client.clone();
-                    let cancel = self.cancel.clone();
-                    let thread_cancel = loop_cancel.clone();
-                    let server_config = self.config.clone();
-                    tokio::task::spawn(async move {
-                        tokio::select!{
-                            _ = cancel.cancelled() => AnyResult::Ok(()),
-                            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-                            v = async {
-                                match msg {
-                                    MqttRequest::Send(msg, tx) =>  {
-                                        let v = send_client.publish(
-                                            msg.topic.clone(),
-                                            QoS::AtLeastOnce,
-                                            false,
-                                            (*msg.message).clone(),
-                                        ).await;
-                                        match &v {
-                                            Ok(()) => {
-                                                let _ = tx.send(Ok(()));
-                                            },
-                                            Err(rumqttc::ClientError::Request(_)) | Err(rumqttc::ClientError::TryRequest(_)) => {
-                                                // Requeue it
-                                                outgoing_tx.send(MqttRequest::Send(msg, tx)).await?;
-                                            }
-                                        };
-                                        v?;
-                                    }
-                                    MqttRequest::SendRetained(msg, tx) =>  {
-                                        let v = send_client.publish(
-                                            msg.topic.clone(),
-                                            QoS::AtLeastOnce,
-                                            true,
-                                            (*msg.message).clone(),
-                                        ).await;
-                                        match &v {
-                                            Ok(()) => {
-                                                let _ = tx.send(Ok(()));
-                                            },
-                                            Err(rumqttc::ClientError::Request(_)) | Err(rumqttc::ClientError::TryRequest(_)) => {
-                                                // Requeue it
-                                                outgoing_tx.send(MqttRequest::Send(msg, tx)).await?;
-                                            }
-                                        };
-                                        v?;
-                                    }
-                                    MqttRequest::HangUp(reply) => {
-                                        // The same payload as the last will, which HA's
-                                        // availability expects
-                                        send_client.publish(
-                                            "neolink/status".to_string(),
-                                            QoS::AtLeastOnce,
-                                            true,
-                                            "offline".to_string(),
-                                        ).await?;
-                                        let _ = reply.send(());
-                                        return Err(anyhow!("Disconneting"));
-                                    }
-                                    MqttRequest::Subscribe(name, reply) => {
-                                        let instance = MqttInstance {
-                                            name,
-                                            incomming_rx: BroadcastStream::new(incomming_tx.subscribe()),
-                                            outgoing_tx: outgoing_tx.clone(),
-                                        };
-                                        let _ = reply.send(Ok(instance));
-                                    },
-                                    MqttRequest::LastWill{topic, message, reply} => {
-                                        let last_will = LastWillMqtt::new(
-                                            &server_config,
-                                            topic,
-                                            message,
-                                        ).await;
-                                        let _ = reply.send(last_will);
-                                    }
-                                }
-                                AnyResult::Ok(())
-                            } => v,
-                        }
-                    });
+        let broker = format!("{}:{}", self.config.broker_addr, self.config.port);
+        // Requests are handled while the broker is unreachable too: publishes wait in the
+        // client, subscriptions to the incoming messages need no broker
+        let requests = handle_requests(
+            self.outgoing_rx,
+            &client,
+            &self.outgoing_tx,
+            &self.incomming_tx,
+            self.config,
+            &self.retained,
+        );
+        let connection = poll_connection(
+            connection,
+            &client,
+            &broker,
+            &self.incomming_tx,
+            &self.cancel,
+            &self.retained,
+        );
+        tokio::select! {
+            v = requests => v,
+            v = connection => v,
+        }
+    }
+}
 
-                    AnyResult::Ok(())
-                },
-                v = connection.poll() =>  {
-                    let  notification = v.with_context(|| "MQTT connection dropped")?;
-                    // Handle message on another thread so that we can keep polling
-                    let client = client.clone();
-                    let incomming_tx = self.incomming_tx.clone();
-                    let cancel = self.cancel.clone();
-                    let thread_cancel = loop_cancel.clone();
-                    tokio::task::spawn(async move {
-                        tokio::select!{
-                            _ = cancel.cancelled() => AnyResult::Ok(()),
-                            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-                            v = async {
-                                match notification {
-                                    Event::Incoming(Incoming::ConnAck(connected)) => {
-                                        if ConnectReturnCode::Success == connected.code {
-                                            // Publish connected now that we are online
-                                            client
-                                            .publish(
-                                                "neolink/status".to_string(),
-                                                QoS::AtLeastOnce,
-                                                true,
-                                                "connected",
-                                            )
-                                            .await?;
-                                            // We succesfully logged in. Now ask for the cameras subscription.
-                                            client
-                                            .subscribe("neolink/#".to_string(), QoS::AtMostOnce)
-                                            .await?;
-                                        }
-                                    }
-                                    Event::Incoming(Incoming::Publish(published_message)) => {
-                                        // Retained commands are replays from before we started:
-                                        // acting on them on every broker reconnect would wake
-                                        // battery cameras or undo settings (SPEC P14)
-                                        let stale = published_message.retain
-                                            && is_command_topic(&published_message.topic);
-                                        if stale {
-                                            log::warn!(
-                                                "Ignoring retained MQTT message on {}; publish commands without retain",
-                                                published_message.topic
-                                            );
-                                        }
-                                        if let Some(sub_topic) = published_message
-                                            .topic
-                                            .strip_prefix("neolink/")
-                                            .filter(|_| !stale)
-                                        {
-                                            let _ = incomming_tx
-                                                .send(MqttReply {
-                                                    topic: sub_topic.to_string(),
-                                                    message: Arc::new(String::from_utf8_lossy(published_message.payload.as_ref())
-                                                        .into_owned()),
-                                                });
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                AnyResult::Ok(())
-                            } => v
-                        }
-                    });
-                    AnyResult::Ok(())
-                },
-            };
-            if r.is_ok() {
+async fn handle_requests(
+    outgoing_rx: &mut MpscReceiver<MqttRequest>,
+    client: &AsyncClient,
+    outgoing_tx: &MpscSender<MqttRequest>,
+    incomming_tx: &BroadcastSender<MqttReply>,
+    server_config: &MqttServerConfig,
+    retained: &RetainedCache,
+) -> AnyResult<()> {
+    loop {
+        let msg = outgoing_rx
+            .recv()
+            .await
+            .ok_or(anyhow!("All outgoing MQTT channels closed"))?;
+
+        // Put it on a thread so that we don't block polling. It is not cancelled when
+        // this client ends: a publish then fails and is requeued for the next client, so
+        // the sender still gets its reply
+        let outgoing_tx = outgoing_tx.clone();
+        let incomming_tx = incomming_tx.clone();
+        let client = client.clone();
+        let server_config = server_config.clone();
+        let retained = retained.clone();
+        tokio::task::spawn(async move {
+            match msg {
+                MqttRequest::Publish(publish) => {
+                    send_publish(publish, &client, &outgoing_tx, &retained).await?;
+                }
+                MqttRequest::HangUp(reply) => {
+                    // The same payload as the last will, which HA's
+                    // availability expects
+                    client
+                        .publish(
+                            "neolink/status".to_string(),
+                            QoS::AtLeastOnce,
+                            true,
+                            "offline".to_string(),
+                        )
+                        .await?;
+                    let _ = reply.send(());
+                    return Err(anyhow!("Disconneting"));
+                }
+                MqttRequest::Subscribe(name, reply) => {
+                    let instance = MqttInstance {
+                        name,
+                        incomming_rx: BroadcastStream::new(incomming_tx.subscribe()),
+                        outgoing_tx: outgoing_tx.clone(),
+                    };
+                    let _ = reply.send(Ok(instance));
+                }
+                MqttRequest::LastWill {
+                    topic,
+                    message,
+                    reply,
+                } => {
+                    let last_will = LastWillMqtt::new(&server_config, topic, message).await;
+                    let _ = reply.send(last_will);
+                }
+            }
+            AnyResult::Ok(())
+        });
+    }
+}
+
+/// Polls the broker connection for as long as the client runs. A lost or refused
+/// connection is retried with backoff: rumqttc reconnects on the next poll and sends what
+/// was published meanwhile
+async fn poll_connection(
+    mut connection: EventLoop,
+    client: &AsyncClient,
+    broker: &str,
+    incomming_tx: &BroadcastSender<MqttReply>,
+    cancel: &CancellationToken,
+    retained: &RetainedCache,
+) -> AnyResult<()> {
+    let mut backoff = Backoff::new(BROKER_RETRY_MIN, BROKER_RETRY_MAX);
+    let mut failing = false;
+    loop {
+        let notification = match connection.poll().await {
+            Ok(notification) => notification,
+            Err(e) => {
+                let delay = backoff.next_delay();
+                log::warn!("MQTT: cannot reach the broker at {broker}, retrying in {delay:?}: {e}");
+                failing = true;
+                sleep(delay).await;
                 continue;
             }
-            break r;
-        }?;
-        Ok(())
+        };
+        if let Event::Incoming(Incoming::ConnAck(connected)) = &notification {
+            if connected.code == ConnectReturnCode::Success {
+                backoff.reset();
+                if std::mem::take(&mut failing) {
+                    log::info!("MQTT: connected to the broker at {broker}");
+                }
+            }
+        }
+        // Handle message on another thread so that we can keep polling
+        let client = client.clone();
+        let incomming_tx = incomming_tx.clone();
+        let cancel = cancel.clone();
+        let retained = retained.clone();
+        tokio::task::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => AnyResult::Ok(()),
+                v = handle_notification(notification, &client, &incomming_tx, &retained) => v,
+            }
+        });
     }
+}
+
+async fn handle_notification(
+    notification: Event,
+    client: &AsyncClient,
+    incomming_tx: &BroadcastSender<MqttReply>,
+    retained: &RetainedCache,
+) -> AnyResult<()> {
+    match notification {
+        Event::Incoming(Incoming::ConnAck(connected)) => {
+            if ConnectReturnCode::Success == connected.code {
+                // Publish connected now that we are online
+                client
+                    .publish(
+                        "neolink/status".to_string(),
+                        QoS::AtLeastOnce,
+                        true,
+                        "connected",
+                    )
+                    .await?;
+                // A restarted broker may have lost the retained topics (camera status,
+                // discovery, config): publish them again
+                republish_retained(client, retained).await?;
+                // We succesfully logged in. Now ask for the cameras subscription.
+                client
+                    .subscribe("neolink/#".to_string(), QoS::AtMostOnce)
+                    .await?;
+            }
+        }
+        Event::Incoming(Incoming::Publish(published_message)) => {
+            // Retained commands are replays from before we started:
+            // acting on them on every broker reconnect would wake
+            // battery cameras or undo settings (SPEC P14)
+            let stale = published_message.retain && is_command_topic(&published_message.topic);
+            if stale {
+                log::warn!(
+                    "Ignoring retained MQTT message on {}; publish commands without retain",
+                    published_message.topic
+                );
+            }
+            if let Some(sub_topic) = published_message
+                .topic
+                .strip_prefix("neolink/")
+                .filter(|_| !stale)
+            {
+                let _ = incomming_tx.send(MqttReply {
+                    topic: sub_topic.to_string(),
+                    message: Arc::new(
+                        String::from_utf8_lossy(published_message.payload.as_ref()).into_owned(),
+                    ),
+                });
+            }
+        }
+        _ => {}
+    }
+    AnyResult::Ok(())
+}
+
+/// Publishes `publish` (QoS 1). A retained one is remembered first: if this client is gone
+/// it is published, still retained, on the next connection. Any other is requeued for the
+/// next client. The sender's reply is sent once it is queued in a client
+async fn send_publish(
+    publish: Publish,
+    client: &AsyncClient,
+    outgoing_tx: &MpscSender<MqttRequest>,
+    retained: &RetainedCache,
+) -> AnyResult<()> {
+    let Publish { msg, retain, reply } = publish;
+    let sent = if retain {
+        // Held while publishing, so that a reconnection's republish cannot overtake it
+        // with the previous payload
+        let mut cache = retained.lock().await;
+        cache.insert(msg.topic.clone(), msg.message.clone());
+        client
+            .publish(
+                msg.topic.clone(),
+                QoS::AtLeastOnce,
+                true,
+                (*msg.message).clone(),
+            )
+            .await
+    } else {
+        client
+            .publish(
+                msg.topic.clone(),
+                QoS::AtLeastOnce,
+                false,
+                (*msg.message).clone(),
+            )
+            .await
+    };
+    match sent {
+        Ok(()) => {
+            let _ = reply.send(Ok(()));
+        }
+        // This client is gone (the config changed): the cache publishes it on the next
+        // connection
+        Err(_) if retain => {
+            let _ = reply.send(Ok(()));
+        }
+        Err(_) => {
+            outgoing_tx
+                .send(MqttRequest::Publish(Publish { msg, retain, reply }))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Publishes every remembered retained topic again, retained
+async fn republish_retained(client: &AsyncClient, retained: &RetainedCache) -> AnyResult<()> {
+    let cache = retained.lock().await;
+    for (topic, message) in cache.iter() {
+        client
+            .publish(topic.clone(), QoS::AtLeastOnce, true, (**message).clone())
+            .await?;
+    }
+    Ok(())
 }
 
 /// Topics that make neolink act: `neolink/config`, `neolink/<cam>/control/..`,
@@ -375,6 +485,107 @@ mod tests {
         assert!(!is_command_topic("neolink/argus/status/battery_level"));
         assert!(!is_command_topic("neolink/status"));
         assert!(!is_command_topic("other/argus/control/x"));
+    }
+
+    #[test]
+    fn test_rustls_has_a_crypto_provider() {
+        // rumqttc builds the MQTT TLS config with `ClientConfig::builder()`, which panics
+        // when rustls has no crypto provider compiled in (Cargo.toml: rustls with ring)
+        let _ = rustls::ClientConfig::builder();
+    }
+
+    /// A config whose broker is a local port nothing listens on
+    fn unreachable_broker() -> crate::config::Config {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        toml::from_str(&format!(
+            "cameras = []\n[mqtt]\nbroker_addr = \"127.0.0.1\"\nport = {port}\n"
+        ))
+        .unwrap()
+    }
+
+    /// While the broker is down, sends wait for it instead of failing: a failed send ends
+    /// `neolink mqtt` (exit 1) or restarts a camera's listener
+    #[tokio::test]
+    async fn test_sends_wait_for_an_unreachable_broker() {
+        use super::Mqtt;
+        let (_config_tx, config) = tokio::sync::watch::channel(unreachable_broker());
+        let mqtt = Mqtt::new(config).await;
+        let instance = std::sync::Arc::new(mqtt.subscribe("cam").await.unwrap());
+        // More than the client's request channel holds (100), retained and not
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..300 {
+            let instance = instance.clone();
+            set.spawn(async move {
+                instance
+                    .send_message(&format!("t{i}"), "x", i % 2 == 0)
+                    .await
+            });
+        }
+        // They may wait, but none fails
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            while let Some(r) = set.join_next().await {
+                r.unwrap()?;
+            }
+            crate::AnyResult::Ok(())
+        })
+        .await;
+        if let Ok(r) = waited {
+            r.expect("a send failed while the broker was down");
+        }
+    }
+
+    /// A retained publish whose client went away is published again by the next
+    /// connection, still retained and QoS 1, and never requeued as a plain publish
+    #[tokio::test]
+    async fn test_retained_publish_survives_a_lost_client() {
+        use super::*;
+        let (outgoing_tx, mut outgoing_rx) = mpsc::<MqttRequest>(10);
+        let retained = RetainedCache::default();
+        // A client whose event loop is gone, as when the backend restarts
+        let (client, eventloop) = AsyncClient::new(MqttOptions::new("old", "127.0.0.1", 1), 10);
+        drop(eventloop);
+        let (reply, rx) = oneshot();
+        let publish = Publish {
+            msg: MqttReply {
+                topic: "neolink/cam/status".to_string(),
+                message: Arc::new("connected".to_string()),
+            },
+            retain: true,
+            reply,
+        };
+        send_publish(publish, &client, &outgoing_tx, &retained)
+            .await
+            .unwrap();
+        if let Ok(MqttRequest::Publish(p)) = outgoing_rx.try_recv() {
+            assert!(p.retain, "a retained publish was requeued without retain");
+        }
+        tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("no reply")
+            .unwrap()
+            .unwrap();
+
+        let (client, mut eventloop) = AsyncClient::new(MqttOptions::new("new", "127.0.0.1", 1), 10);
+        republish_retained(&client, &retained).await.unwrap();
+        // Moves what the client queued to `pending` (there is no broker)
+        eventloop.clean();
+        let published: Vec<_> = eventloop
+            .pending
+            .iter()
+            .filter_map(|r| match r {
+                rumqttc::Request::Publish(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].topic, "neolink/cam/status");
+        assert_eq!(&published[0].payload[..], b"connected");
+        assert!(published[0].retain, "republished without retain");
+        assert_eq!(published[0].qos, QoS::AtLeastOnce);
     }
 }
 
@@ -410,8 +621,7 @@ impl MqttInstance {
         tokio::spawn(async move {
             while let Some(req) = outgoing_rx.recv().await {
                 let (msg, tx, retained) = match req {
-                    MqttRequest::Send(msg, tx) => (msg, tx, false),
-                    MqttRequest::SendRetained(msg, tx) => (msg, tx, true),
+                    MqttRequest::Publish(Publish { msg, retain, reply }) => (msg, reply, retain),
                     MqttRequest::Subscribe(name, reply) => {
                         let _ = reply.send(Ok(MqttInstance {
                             name,
@@ -484,31 +694,18 @@ impl MqttInstance {
         .filter(|s| !s.is_empty())
         .cloned()
         .collect::<Vec<_>>();
-        if retain {
-            let (tx, rx) = oneshot();
-            self.outgoing_tx
-                .send(MqttRequest::SendRetained(
-                    MqttReply {
-                        topic: topics.join("/"),
-                        message: Arc::new(message.to_string()),
-                    },
-                    tx,
-                ))
-                .await?;
-            rx.await??;
-        } else {
-            let (tx, rx) = oneshot();
-            self.outgoing_tx
-                .send(MqttRequest::Send(
-                    MqttReply {
-                        topic: topics.join("/"),
-                        message: Arc::new(message.to_string()),
-                    },
-                    tx,
-                ))
-                .await?;
-            rx.await??;
-        }
+        let (tx, rx) = oneshot();
+        self.outgoing_tx
+            .send(MqttRequest::Publish(Publish {
+                msg: MqttReply {
+                    topic: topics.join("/"),
+                    message: Arc::new(message.to_string()),
+                },
+                retain,
+                reply: tx,
+            }))
+            .await?;
+        rx.await??;
         Ok(())
     }
 
@@ -593,8 +790,7 @@ pub(crate) struct MqttReplyRef<'a> {
 }
 
 enum MqttRequest {
-    Send(MqttReply, OneshotSender<Result<()>>),
-    SendRetained(MqttReply, OneshotSender<Result<()>>),
+    Publish(Publish),
     HangUp(OneshotSender<()>),
     Subscribe(String, OneshotSender<Result<MqttInstance>>),
     LastWill {
@@ -602,6 +798,13 @@ enum MqttRequest {
         message: String,
         reply: OneshotSender<Result<LastWillMqtt>>,
     },
+}
+
+/// A message to publish; the reply comes once a client has queued it
+struct Publish {
+    msg: MqttReply,
+    retain: bool,
+    reply: OneshotSender<Result<()>>,
 }
 
 pub(crate) struct LastWillMqtt {

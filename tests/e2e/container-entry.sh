@@ -30,7 +30,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 IMAGE=${IMAGE:?the image to test, e.g. IMAGE=neolink:test}
 XTASK=${XTASK:-$ROOT/target/release/xtask}
 # A pinned helper image to look inside volumes (the native image has no shell)
-HELPER=${HELPER:-docker.io/library/alpine:3.20.9@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805}
+HELPER=${HELPER:-docker.io/library/alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6}
 # MQTT broker for the mqtt modes (without one, neolink's MQTT mode exits)
 BROKER=${BROKER:-docker.io/library/eclipse-mosquitto:2.0.20@sha256:21421af7b32bf9ce508e9090c8eb13bb81f410ca778dc205506180a6f862d0eb}
 # Below the ephemeral range (32768+), where outgoing connections could take a case's port

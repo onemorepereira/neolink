@@ -245,7 +245,10 @@ The MediaClock is per Hub and lives as long as the Hub, **across Idle** (F-cc 16
 - **Late audio**: if audio first appears on a desc published without audio, the change is
   recorded for the *next* DESCRIBE and existing sessions are not touched.
 - **Codec / resolution / params change**: `gen += 1`. Sessions on the old gen are closed via
-  their cancel token (BYE, then close).
+  their cancel token (BYE, then close). Paced items carry the gen they were ingested
+  under; one still queued from a superseded gen (a burst can hold the old stream's last
+  GOP) is dropped at release, so it never becomes the cached or persisted IRAP or a new
+  session's first frame.
 - **Changes are debounced; learning is not.** The first desc is learned at once (readiness
   above). After that, a new video identity is adopted only when **2 IRAPs in a row** carry
   it, and a new audio ASC only after **8 ADTS frames in a row**. One corrupt or odd frame
@@ -458,7 +461,7 @@ IRAP, and the session's sender registration.
 
 ## 5. Media to RTP
 
-### 5.1 Packetizers (ported from bairelay `codec/*`, checked against gortsplib vectors)
+### 5.1 Packetizers (written from the RFCs, behaviour modelled on bairelay `codec/*`, checked against gortsplib vectors)
 
 - **H.264** (RFC 6184): single NAL if `len ≤ mtu − 12`, else FU-A. The marker goes on the
   last packet of the AU.
@@ -560,7 +563,7 @@ Deltas from GStreamer (listed in spec §5):
 
 - **Own parser** for `METHOD SP URI SP RTSP/1.0` plus headers. Header names are
   case-insensitive, values are trimmed, and the head is limited to 8 KiB.
-- **Tolerant headers**, ported from bairelay `rtsp/transport.rs`:
+- **Tolerant headers**, with the tolerance modelled on bairelay `rtsp/transport.rs`:
   - **Transport**: a list of specs, case-insensitive. **The first acceptable TCP spec is
     chosen and exactly one is echoed**, with `RTP/AVP/TCP;unicast;interleaved=a-b;ssrc=X;mode="PLAY"`
     as GStreamer does. If the list has no TCP spec, the reply is 461 (R4).
@@ -631,6 +634,9 @@ The connection task owns the read half. A writer task owns the write half.
 - **Track resolution**: by suffix, or by an absolute URI equal to `Content-Base` + control.
 - **Unknown path**: 404.
 - **Configured but unsupported stream**: 404 (F-int 8).
+- **Startup**: the listener is bound first, but no connection is accepted until every
+  camera configured at start has set its mounts (bounded at 10 s); until then clients wait
+  in the backlog, so a configured camera never answers 404 just after startup.
 
 ### 6.5 Auth (R6), matching golden behaviour
 

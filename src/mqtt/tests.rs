@@ -390,6 +390,84 @@ async fn test_ledger_published() {
     .await;
 }
 
+// --- restarting a camera's listener
+
+/// A listener that keeps failing is restarted with growing delays, not in a tight loop
+#[tokio::test(start_paused = true)]
+async fn test_listener_restarts_back_off() {
+    let counter = std::sync::atomic::AtomicU32::new(0);
+    let attempts = &counter;
+    let supervised = supervise_listener("fake", || async move {
+        let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        // A tight loop never yields: stop it here rather than spin forever
+        assert!(n < 100, "restarted {} times without a delay", n);
+        Err(anyhow!("listener failed"))
+    });
+    // Delays 1, 2, 4, 8, 16, 32 then 60 s: attempts start at 0, 1, 3, 7, 15, 31, 63, 123,
+    // 183, 243 and 303 s
+    let _ = tokio::time::timeout(Duration::from_secs(300), supervised).await;
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 10);
+}
+
+/// A listener that ends cleanly is not restarted
+#[tokio::test(start_paused = true)]
+async fn test_listener_ending_cleanly_is_not_restarted() {
+    let counter = std::sync::atomic::AtomicU32::new(0);
+    let attempts = &counter;
+    supervise_listener("fake", || async move {
+        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+    .await;
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Restarting the listener of a sleeping camera never wakes it: each start publishes its
+/// initial states and discovery from the config and the state file only
+#[tokio::test]
+async fn test_listener_restarts_do_not_wake() {
+    let cam = FakeCamera::start(FakeCameraConfig::default())
+        .await
+        .unwrap();
+    let neocam = new_neocam(config_for(
+        &cam,
+        "[mqtt]\ndiscovery.topic = \"homeassistant\"\n\
+         discovery.features = [\"camera\", \"battery\", \"floodlight\", \"motion\"]",
+    ))
+    .await;
+    let (mqtt, _incoming, mut published) = MqttInstance::for_test("fake");
+    let counter = std::sync::atomic::AtomicU32::new(0);
+    let (attempts, neocam, mqtt) = (&counter, &neocam, &mqtt);
+    let supervised = supervise_listener("fake", || async move {
+        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let camera = neocam.subscribe().await?;
+        let mqtt = mqtt.resubscribe().await?;
+        // Fails soon after starting, as one would on a lost broker
+        tokio::time::timeout(Duration::from_millis(300), listen_on_camera(camera, mqtt))
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("listener failed")))
+    });
+    // Starts at 0, 1.3 and 3.6 s
+    let _ = tokio::time::timeout(Duration::from_secs(5), supervised).await;
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let mut starts = 0;
+    while let Ok((topic, message, _)) = published.try_recv() {
+        if topic == "neolink/fake/status" && message == "disconnected" {
+            starts += 1;
+        }
+    }
+    assert!(
+        starts >= 3,
+        "the listener did not start 3 times: {}",
+        starts
+    );
+    assert_eq!(
+        cam.stats().connections,
+        0,
+        "a listener restart woke the camera"
+    );
+}
+
 // --- neolink/config writes: power settings come from the config file (SPEC P14)
 
 const FILE_CONFIG: &str = r#"

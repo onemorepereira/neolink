@@ -456,8 +456,10 @@ Defects this found, all fixed:
   volume, CA certs).
 - **6.3:** `tests/e2e/container-native.sh`: A13 plays; `PUID` drops; N9: `podman stop` with a
   client playing takes 297 ms, exit 0, one logout. In CI.
-- **6.4:** `cargo-about` notice (76 entries). No bairelay code was ported (line overlap is
-  only generic idioms), so no provenance headers are needed.
+- **6.4:** `cargo-about` notice (76 entries). No bairelay code was ported, so no provenance headers are needed.
+  Re-checked 2026-10-12 against bairelay 6787e47: 95 of 3,572 significant lines in
+  `crates/rtsp/src` match a bairelay line (derive lists, `use` lines, test attributes, the
+  ISO 14496-3 AAC sample-rate table) and no run of 4 consecutive lines matches.
 - **6.5:** `docs/native-rtsp/NATIVE.md` covers install, config keys, battery behaviour, the
   §5 deltas, Docker changes, the `irap.bin` privacy note, the MQTT trust boundary and
   bridged media. The README links to it.
