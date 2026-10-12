@@ -245,7 +245,10 @@ The MediaClock is per Hub and lives as long as the Hub, **across Idle** (F-cc 16
 - **Late audio**: if audio first appears on a desc published without audio, the change is
   recorded for the *next* DESCRIBE and existing sessions are not touched.
 - **Codec / resolution / params change**: `gen += 1`. Sessions on the old gen are closed via
-  their cancel token (BYE, then close).
+  their cancel token (BYE, then close). Paced items carry the gen they were ingested
+  under; one still queued from a superseded gen (a burst can hold the old stream's last
+  GOP) is dropped at release, so it never becomes the cached or persisted IRAP or a new
+  session's first frame.
 - **Changes are debounced; learning is not.** The first desc is learned at once (readiness
   above). After that, a new video identity is adopted only when **2 IRAPs in a row** carry
   it, and a new audio ASC only after **8 ADTS frames in a row**. One corrupt or odd frame

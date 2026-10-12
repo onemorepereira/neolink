@@ -338,6 +338,8 @@ struct Item {
     media_us: u64,
     irap: bool,
     discontinuity: bool,
+    /// The desc gen it was ingested under: an item of a superseded gen is never released
+    gen: u32,
     /// Video NALs, or one audio AU
     data: Vec<Bytes>,
 }
@@ -1028,6 +1030,7 @@ impl Hub {
                         media_us: t.media_us,
                         irap,
                         discontinuity: t.discontinuity,
+                        gen: self.gen(),
                         data: nals,
                     },
                 );
@@ -1068,6 +1071,7 @@ impl Hub {
                                 media_us,
                                 irap: false,
                                 discontinuity: false,
+                                gen: self.gen(),
                                 data: vec![au],
                             },
                         );
@@ -1167,7 +1171,7 @@ impl Hub {
             wire_us,
             rtp,
             bytes,
-            gen: self.learner.current().map(|d| d.gen).unwrap_or(0),
+            gen: self.gen(),
         })
     }
 
@@ -1180,8 +1184,13 @@ impl Hub {
             wire_us,
             rtp,
             bytes,
-            gen: self.learner.current().map(|d| d.gen).unwrap_or(0),
+            gen: self.gen(),
         })
+    }
+
+    /// The current desc's gen (0 before the first)
+    fn gen(&self) -> u32 {
+        self.learner.current().map(|d| d.gen).unwrap_or(0)
     }
 
     fn release(&mut self) {
@@ -1191,6 +1200,12 @@ impl Hub {
         let mut released = 0u64;
         for item in self.pacer.pop_due(now) {
             released += 1;
+            if item.gen < self.gen() {
+                // Queued before a desc change (e.g. the old resolution's last GOP in a
+                // burst): its sessions are closed, and as the cached or persisted IRAP it
+                // would show the old stream under the new desc
+                continue;
+            }
             let Some(codec) = self.codec else { continue };
             let wire = match item.track {
                 Track::Video => {
@@ -2433,6 +2448,104 @@ mod tests {
         assert_eq!((r.after.video.width, r.after.video.height), (896, 512));
         assert_eq!(r.after.gen, 1);
         assert_eq!(r.persisted.as_ref(), Some(&r.after));
+    }
+
+    /// The SPS NAL of a video unit, if it carries one
+    fn unit_sps(unit: &SourceUnit) -> Option<Vec<u8>> {
+        let SourceUnit::Video { codec, annexb, .. } = unit else {
+            return None;
+        };
+        split_nals(annexb)
+            .into_iter()
+            .find(|n| param_kind(*codec, n) == Some(crate::codec::annexb::ParamKind::Sps))
+            .map(|n| n.to_vec())
+    }
+
+    /// A resolution change that arrives in a burst (as after a congestion episode): the
+    /// old resolution's last GOP is still queued in the pacer when the change is
+    /// confirmed. Its IRAP must not start a session on the new desc, nor be persisted
+    /// under it (where the hourly write policy would keep it)
+    #[tokio::test(start_paused = true)]
+    async fn test_resolution_change_in_a_burst_drops_the_old_gop() {
+        let mut units = fixture("reschange_h264.bcm");
+        // IRAP arrival times; the first with another SPS starts the new resolution
+        let iraps: Vec<(u64, Vec<u8>)> = units
+            .iter()
+            .filter(|u| matches!(u.unit, SourceUnit::Video { irap: true, .. }))
+            .map(|u| (u.at_us, unit_sps(&u.unit).unwrap()))
+            .collect();
+        let k = iraps.iter().position(|(_, s)| *s != iraps[0].1).unwrap();
+        // From before the old resolution's last IRAP to the IRAP confirming the change.
+        // The burst's first frame is late and goes out on arrival; the rest are paced
+        let (from, to) = (iraps[k - 1].0 - 1_500_000, iraps[k + 1].0);
+        for u in units.iter_mut() {
+            if (from..=to).contains(&u.at_us) {
+                u.at_us = to;
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "neolink-burst-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = DescCache::new(&dir, "argus", "main");
+        let source = Arc::new(FixtureSource::new(units, 1.0, Some(false)));
+        let mut cfg = HubConfig::new("burst");
+        cfg.battery = false;
+        cfg.cache = Some(cache.clone());
+        // In-band parameter sets show which resolution an IRAP belongs to
+        cfg.parameter_sets = ParameterSets::Passthrough;
+        let h = spawn(cfg, source);
+        let learned = h.describe().await.unwrap();
+        let mut sub = h.subscribe(1).await.unwrap();
+        h.play(1).await;
+        drain(&mut sub, (to / 1_000_000) + 2).await;
+        assert!(sub.closed.is_cancelled(), "the old session is closed");
+        // The client comes back at once, on the new desc, past the queued old GOP and
+        // the new IRAP
+        let after = h.describe().await.unwrap();
+        assert_eq!(after.gen, 1);
+        let mut joiner = h.subscribe(2).await.unwrap();
+        h.play(2).await;
+        let frames = drain(&mut joiner, 6).await;
+        let first = frames
+            .iter()
+            .find(|f| f.track == Track::Video)
+            .expect("video for the new session");
+        let has = |sps: &[u8]| {
+            first
+                .rtp
+                .iter()
+                .any(|c| c.body.windows(sps.len()).any(|w| w == sps))
+        };
+        assert!(
+            !has(&learned.video.params.sps),
+            "the new session started on the old resolution's IRAP"
+        );
+        assert!(has(&after.video.params.sps));
+        // Cache writes run on the blocking pool, outside virtual time
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            tokio::task::yield_now().await;
+        }
+        let irap = cache
+            .load_irap(&after)
+            .expect("an IRAP persisted for the new desc");
+        h.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let sps = irap
+            .iter()
+            .find(|n| param_kind(VideoCodec::H264, n) == Some(crate::codec::annexb::ParamKind::Sps))
+            .expect("in-band SPS")
+            .to_vec();
+        assert_ne!(
+            sps, learned.video.params.sps,
+            "the old resolution's IRAP was persisted"
+        );
+        assert_eq!(sps, after.video.params.sps);
     }
 
     impl GlitchRun {
