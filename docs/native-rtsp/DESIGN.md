@@ -319,8 +319,9 @@ moves therefore never show up as RTP or NTP steps (F-cc 7).
   shrinking `min_lead`, and the rule above corrects it.
 - **`latency = 0`**: release on arrival. Per-track monotonicity is enforced by the
   WireClock (F-cc 32).
-- **Default `pacing_latency_ms`**: 1500 when battery or unknown, otherwise 300.
-  Spec §9 Q4 decides whether mains-powered cameras burst.
+- **Default `pacing_latency_ms`**: 1500 for every camera. A lower value suits a camera
+  whose delivery does not burst; nobody has measured that on mains-powered cameras yet
+  (Spec §9 Q4), so it is left to the user.
 - **Congestion episodes (SPEC §9, 2026-10-11).** The Argus link sometimes slows for tens of
   seconds; the camera buffers and arrivals fall up to 17 s behind, with no frames lost.
   The rules above handle it without new mechanism: every late frame is an underrun, so the
@@ -328,10 +329,10 @@ moves therefore never show up as RTP or NTP steps (F-cc 7).
   catch-up burst arrives, `min_lead` exceeds `latency + GOP` and the pacer skips to the
   newest IRAP, back to `latency`, and wire time re-latches there, back to wall time
   (§4.5). Arrival gaps stay below the bridge threshold, so viewers
-  see late video, then one skip, and no bridge at the battery default latency (1500 ms,
+  see late video, then one skip, and no bridge at the default latency (1500 ms,
   threshold 4.5 s). The real capture's longest gap was 3.1 s; the synthetic
   `congestion_h265.bcm` fixture (`cargo xtask mkfixture`; 14 s peak lag, 4.3 s longest
-  gap) is harsher. At the 300 ms mains default (threshold 3.3 s) such a gap would bridge
+  gap) is harsher. At `pacing_latency_ms = 300` (threshold 3.3 s) such a gap would bridge
   briefly, which is acceptable: Phase 2.6 tests both latencies on that fixture.
   **Clients (SPEC A11b, measured 2026-10-12, two episodes per latency).** ffmpeg (`-c copy`
   and live decode), go2rtc and Frigate's command lines keep their sessions through the
@@ -771,7 +772,7 @@ per /128 would let anyone with a /64 (everyone) bypass both.
 | `mqtt_config_writes` | top | bool, `true` | Startup warning if true and users are configured |
 | `rtp_mtu` | top | 576–9000, `1400` | |
 | `audio` | camera | `"aac"\|"none"`, `"aac"` | |
-| `pacing_latency_ms` | camera | 0–3000, auto (§4.4) | |
+| `pacing_latency_ms` | camera | 0–3000, default 1500 (§4.4) | |
 | `parameter_sets` | camera | `"strip"\|"passthrough"\|"inject"`, `"strip"` (A4b, Gate 3) | |
 | `bridge_fps` | camera | 0.1–2, `0.2` | |
 | `battery` | camera | bool, unset (`None` → battery) | Not auto-detected: the state file records a successful battery read, but only the config decides whether a camera sleeps. `false` makes the camera always-on unless `idle_disconnect = true` |
