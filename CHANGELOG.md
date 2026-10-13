@@ -201,8 +201,8 @@ itself. See [README: Power](README.md#power-sleeping-and-always-on-cameras).
   debug level and no longer as "write failed or stalled". A real stall is logged as
   "client took no data for ...".
 - Native RTSP: stream timestamps no longer drift away from real time after network
-  congestion. Before, each congestion episode that the stream bridged (likely at the
-  mains default `pacing_latency_ms` of 300) moved the RTP and RTCP sender-report times
+  congestion. Before, each congestion episode that the stream bridged (likely with a
+  low `pacing_latency_ms` such as 300) moved the RTP and RTCP sender-report times
   about 8 s further into the future, without limit, and catching up after an episode made
   an unlogged jump of several seconds. Now each catch-up, resume or camera clock reset
   brings the timestamps back in line with real time at a keyframe, and every such step is logged
