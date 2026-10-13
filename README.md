@@ -1,7 +1,7 @@
 # Neolink
 
-![CI](https://github.com/QuantumEntangledAndy/neolink/workflows/CI/badge.svg)
-[![dependency status](https://deps.rs/repo/github/QuantumEntangledAndy/neolink/status.svg)](https://deps.rs/repo/github/QuantumEntangledAndy/neolink)
+![CI](https://github.com/onemorepereira/neolink/workflows/CI/badge.svg)
+[![dependency status](https://deps.rs/repo/github/onemorepereira/neolink/status.svg)](https://deps.rs/repo/github/onemorepereira/neolink)
 
 Neolink is a small program that acts as a proxy between Reolink IP cameras and
 normal RTSP clients.
@@ -19,9 +19,26 @@ does has been reverse engineered.
 
 ## This Fork
 
-This fork is an extension of
-[thirtythreeforty's](https://github.com/thirtythreeforty/neolink) with additional
-features not yet in upstream master.
+This repository is a fork of
+[QuantumEntangledAndy/neolink](https://github.com/QuantumEntangledAndy/neolink), which is
+itself a fork of the original
+[thirtythreeforty/neolink](https://github.com/thirtythreeforty/neolink). Neolink is their
+work: the reverse engineering of the Baichuan protocol, the camera support and most of
+the features below come from them and from the contributors to those projects. Thank you.
+
+This fork starts from upstream commit `6e05e78` and adds:
+
+- power management: cameras connect only while in use, so battery cameras can sleep
+  (see [Power](#power-sleeping-and-always-on-cameras)). This changes the default for
+  mains cameras too, so read the upgrade steps;
+- a native RTSP backend that needs no GStreamer (beta, see below);
+- a snapshot endpoint that never wakes the camera;
+- MQTT and Docker hardening, and dependency and security updates.
+
+[CHANGELOG.md](CHANGELOG.md) lists every change since `6e05e78`. Issues with this fork's
+changes belong here, not upstream. The upstream projects are not responsible for them.
+
+The features of QuantumEntangledAndy's fork, on which this one is built:
 
 **Major Features**:
 
@@ -29,8 +46,6 @@ features not yet in upstream master.
 - Motion Detection
 - Paused Streams (when no rtsp client or no motion detected)
 - Save a still image to disk
-- Power management: cameras are connected only while in use, so battery cameras
-  can sleep (see [Power](#power-sleeping-and-always-on-cameras))
 
 **Minor Features**:
 
@@ -51,10 +66,12 @@ a ~15 MB `FROM scratch` image). See
 the GStreamer build.
 
 
-Download from the
-[release page](https://github.com/QuantumEntangledAndy/neolink/releases)
+This fork has not published releases yet: build it from source (`cargo build --release`)
+or build the Docker image (see [Docker](#docker)). The
+[upstream release page](https://github.com/QuantumEntangledAndy/neolink/releases) has
+prebuilt binaries of QuantumEntangledAndy's neolink, without this fork's changes.
 
-Extract the zip
+If you use an upstream release, extract the zip.
 
 Install the latest [gstreamer](https://gstreamer.freedesktop.org/download/)
 (1.20.5 as of writing this).
@@ -102,7 +119,7 @@ Make a config file see below.
 To use `neolink` you need a config file.
 
 There's a more complete example
-[here](https://github.com/QuantumEntangledAndy/neolink/blob/master/sample_config.toml),
+[here](sample_config.toml),
 but the following should work as a minimal example.
 
 ```toml
@@ -749,13 +766,18 @@ key is set: check that list after upgrading.
 
 ### Docker
 
-[Docker](https://hub.docker.com/r/quantumentangledandy/neolink) builds are also
-provided in multiple architectures. The latest tag tracks master while each
-branch gets it's own tag.
+This fork does not publish Docker images. Build one from this repository:
 
 ```bash
-docker pull quantumentangledandy/neolink
+docker build -t neolink .                              # GStreamer image
+docker build -t neolink:native -f Dockerfile.native .  # native backend, FROM scratch
+```
 
+The images on Docker Hub,
+[quantumentangledandy/neolink](https://hub.docker.com/r/quantumentangledandy/neolink),
+are the upstream project's and don't include this fork's changes.
+
+```bash
 # Add `-e "RUST_LOG=debug"` to run with debug logs
 #
 # --network host is only needed if you require to connect
@@ -763,12 +785,11 @@ docker pull quantumentangledandy/neolink
 # method then normal bridge mode should work fine
 # and you can ommit this option. Not all OSes support
 # network=host, notably macos lacks this option.
-docker run --network host --volume=$PWD/config.toml:/etc/neolink.toml quantumentangledandy/neolink
+docker run --network host --volume=$PWD/config.toml:/etc/neolink.toml neolink
 ```
 
-An image built from this repository's `Dockerfile` also keeps what neolink learns about
-each camera (last snapshot, battery reading, streams) in `/var/lib/neolink`. Mount a
-volume there so it survives restarts:
+The image also keeps what neolink learns about each camera (last snapshot, battery
+reading, streams) in `/var/lib/neolink`. Mount a volume there so it survives restarts:
 
 ```bash
 docker run --network host \
@@ -939,6 +960,7 @@ the network, you must offer that software's source code to your users.
 
 ## Donations
 
-If you find this code helpful please consider supporting development.
+If you find this code helpful, please consider supporting QuantumEntangledAndy, whose
+neolink this fork is built on:
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2G5HOYIZ)
