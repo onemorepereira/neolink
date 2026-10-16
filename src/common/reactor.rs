@@ -199,6 +199,11 @@ impl NeoReactor {
         Ok(sender_rx.await?)
     }
 
+    /// Sender for reactor commands, so the API server can request config updates
+    pub(crate) fn commander(&self) -> MpscSender<NeoReactorCommand> {
+        self.commander.clone()
+    }
+
     /// One line per camera: active permits, wakes and awake time (PLAN 1.10)
     #[allow(dead_code)]
     pub(crate) async fn stats(&self) -> Vec<String> {
