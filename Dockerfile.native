@@ -15,7 +15,7 @@ FROM docker.io/library/rust:1.91.0-alpine3.22@sha256:a3e3d30122c08c0ed85dcd8867d
 RUN apk add --no-cache musl-dev protobuf-dev perl make
 WORKDIR /usr/local/src/neolink
 COPY . .
-RUN cargo build --release --locked --no-default-features --features native-rtsp \
+RUN cargo build --release --locked --no-default-features --features native-rtsp,api \
  && mkdir -p /out/var/lib/neolink /out/etc/ssl/certs \
  && cp target/release/neolink /out/neolink \
  && /out/neolink --version

@@ -54,7 +54,7 @@ deploy: push
 
 check:
 	cargo check --locked --workspace
-	cargo check --locked --workspace --no-default-features --features native-rtsp
+	cargo check --locked --workspace --no-default-features --features native-rtsp,api
 
 test:
 	cargo test --locked --workspace
