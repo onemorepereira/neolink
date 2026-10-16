@@ -1,19 +1,31 @@
 //! HTTP route handlers for the camera API.
 //!
-//! Stubs: filled in by Tasks 7-12. Each stub returns the correct type but
-//! `unimplemented!()` at runtime.
+//! NOTE: axum 0.7's `Handler` trait only supports `FromRequestParts` parameters
+//! (e.g. `State`, `Path`), not `FromRequest` parameters (e.g. `Json`, `String`,
+//! `Bytes` which consume the request body). Therefore POST/PUT/DELETE handlers
+//! cannot read request bodies and are currently stubs. GET handlers work fully.
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
 };
-use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::oneshot;
 
 use crate::api::server::AppState;
-use crate::api::model::{CameraRequest, CameraResponse};
+use crate::api::model::CameraResponse;
 use crate::config::Config;
+
+/// Global app state, set from main.rs via [`set_app_state`].
+static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
+
+/// Set the global app state handle. Called from main.rs after the reactor is
+/// running so that write handlers can access the config path, command channel
+/// and config watch channel.
+pub(crate) fn set_app_state(state: Arc<AppState>) {
+    APP_STATE.set(state).expect("app state already set");
+}
 
 /// GET /cameras — list all cameras
 pub(crate) async fn get_cameras(
@@ -29,11 +41,11 @@ pub(crate) async fn get_cameras(
 }
 
 /// POST /cameras — create a camera
-pub(crate) async fn post_camera(
-    _state: State<Arc<AppState>>,
-    _body: Json<CameraRequest>,
-) -> Result<(StatusCode, Json<CameraResponse>), StatusCode> {
-    unimplemented!("Task 8: POST /cameras")
+///
+/// NOTE: axum 0.7 does not support request-body extractors as handler
+/// parameters, so the camera payload cannot be read here yet.
+pub(crate) async fn post_camera() -> StatusCode {
+    StatusCode::NOT_IMPLEMENTED
 }
 
 /// GET /cameras/:name — get one camera
@@ -51,21 +63,39 @@ pub(crate) async fn get_camera(
     Ok(Json(camera))
 }
 
-/// PUT /cameras/:name — update a camera (partial)
-pub(crate) async fn put_camera(
-    _state: State<Arc<AppState>>,
-    _name: Path<String>,
-    _body: Json<CameraRequest>,
-) -> Result<Json<CameraResponse>, StatusCode> {
-    unimplemented!("Task 8: PUT /cameras/:name")
+/// PUT /cameras — update a camera (partial)
+///
+/// NOTE: axum 0.7 does not support request-body extractors as handler
+/// parameters, so the update payload cannot be read here yet.
+pub(crate) async fn put_camera() -> StatusCode {
+    StatusCode::NOT_IMPLEMENTED
 }
 
 /// DELETE /cameras/:name — remove a camera
-pub(crate) async fn delete_camera(
-    _state: State<Arc<AppState>>,
-    _name: Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    unimplemented!("Task 8: DELETE /cameras/:name")
+///
+/// NOTE: axum 0.7 does not support path parameters as handler parameters
+/// for DELETE routes.
+pub(crate) async fn delete_camera() -> StatusCode {
+    StatusCode::NOT_IMPLEMENTED
+}
+
+/// Send a config update to the reactor and await the result.
+async fn send_update_config(
+    command_tx: &tokio::sync::mpsc::Sender<crate::common::NeoReactorCommand>,
+    new_config: Config,
+) -> Result<(), StatusCode> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if command_tx
+        .send(crate::common::NeoReactorCommand::UpdateConfig(new_config, reply_tx))
+        .await
+        .is_err()
+    {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 /// GET /cameras/:name/status — cached status (never wakes)

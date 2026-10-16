@@ -1243,3 +1243,69 @@ mod key_tests {
         assert_eq!(config.api_port, 8080);
     }
 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            cameras: vec![],
+            bind_addr: default_bind_addr(),
+            bind_port: default_bind_port(),
+            tokio_console: default_tokio_console(),
+            certificate: default_certificate(),
+            mqtt: None,
+            tls_client_auth: default_tls_client_auth(),
+            users: vec![],
+            snapshot_port: None,
+            rtsp_backend: None,
+            rtsp_auth: default_rtsp_auth(),
+            mqtt_config_writes: default_true(),
+            rtp_mtu: default_rtp_mtu(),
+            limits: LimitsConfig::default(),
+            api_bind: default_api_bind(),
+            api_port: default_api_port(),
+        }
+    }
+}
+
+impl Default for CameraConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            camera_addr: None,
+            camera_uid: None,
+            username: String::new(),
+            password: None,
+            stream: default_stream(),
+            permitted_users: None,
+            channel_id: default_channel_id(),
+            mqtt: default_mqtt(),
+            pause: default_pause(),
+            discovery: default_discovery(),
+            max_encryption: default_maxenc(),
+            strict: default_strict(),
+            print_format: default_print(),
+            update_time: default_update_time(),
+            buffer_duration: default_buffer_duration(),
+            enabled: default_true(),
+            debug: default_false(),
+            use_splash: default_true(),
+            splash_pattern: default_splash(),
+            max_discovery_retries: default_max_discovery_retries(),
+            push_notifications: default_true(),
+            idle_disconnect: None,
+            battery: None,
+            idle_grace_s: default_idle_grace_s(),
+            snapshot_fresh: default_false(),
+            motion_hold_max_s: default_motion_hold_max_s(),
+            audio: default_audio(),
+            pacing_latency_ms: None,
+            parameter_sets: default_parameter_sets(),
+            bridge_fps: default_bridge_fps(),
+            bridge_max_s: default_bridge_max_s(),
+            rtcp_sr: default_true(),
+            persist_irap: default_true(),
+            display_name: None,
+            updated_at: None,
+        }
+    }
+}

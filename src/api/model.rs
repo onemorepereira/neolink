@@ -32,7 +32,9 @@ fn default_idle_grace_s() -> u64 {
 
 /// A camera as accepted on POST/PUT.
 ///
-/// `username` and `password` are accepted for internal storage but never disclosed.
+/// All fields except `name` are optional: on POST, omitted fields get defaults;
+/// on PUT, omitted fields are left unchanged (partial update). `username` and
+/// `password` are accepted for internal storage but never disclosed.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub(crate) struct CameraRequest {
     pub name: String,
@@ -46,18 +48,18 @@ pub(crate) struct CameraRequest {
     pub address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
-    #[serde(default = "default_true")]
-    pub battery: bool,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_stream")]
-    pub stream: String,
-    #[serde(default = "default_discovery")]
-    pub discovery: String,
-    #[serde(default = "default_false")]
-    pub snapshot_fresh: bool,
-    #[serde(default = "default_idle_grace_s")]
-    pub idle_grace_s: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_fresh: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_grace_s: Option<u64>,
 }
 
 /// A camera as returned on GET.
@@ -91,23 +93,34 @@ pub(crate) struct CameraResponse {
 }
 
 impl CameraRequest {
-    /// The stream kind this request asks for.
-    pub(crate) fn stream_kind(&self) -> StreamConfig {
-        match self.stream.to_lowercase().as_str() {
+    /// The stream kind this request asks for (`None` means "not specified").
+    pub(crate) fn stream_kind(&self) -> Option<StreamConfig> {
+        self.stream.as_ref().map(|s| match s.to_lowercase().as_str() {
             "none" => StreamConfig::None,
             "all" => StreamConfig::All,
             "both" => StreamConfig::Both,
             "sub" => StreamConfig::Sub,
             "extern" => StreamConfig::Extern,
             _ => StreamConfig::Main,
-        }
+        })
     }
 
-    /// Convert into an internal `CameraConfig`.
-    ///
-    /// `username` is required: if the request doesn't carry one, `supplied_username`
-    /// must be `Some` (the caller resolves it, e.g. from the existing config on PUT).
-    pub(crate) fn into_camera_config(
+    /// The discovery method this request asks for (`None` means "not specified").
+    fn discovery_kind(&self) -> Option<neolink_core::bc_protocol::DiscoveryMethods> {
+        self.discovery.as_ref().map(|s| match s.to_lowercase().as_str() {
+            "none" => neolink_core::bc_protocol::DiscoveryMethods::None,
+            "local" => neolink_core::bc_protocol::DiscoveryMethods::Local,
+            "remote" => neolink_core::bc_protocol::DiscoveryMethods::Remote,
+            "map" => neolink_core::bc_protocol::DiscoveryMethods::Map,
+            "cellular" => neolink_core::bc_protocol::DiscoveryMethods::Cellular,
+            _ => neolink_core::bc_protocol::DiscoveryMethods::Relay,
+        })
+    }
+
+    /// Resolve into a full `CameraConfig` for POST (create).
+    /// Applies defaults for any field that is `None`.
+    /// `username` must be provided either in the request or as `supplied_username`.
+    pub(crate) fn resolve_for_create(
         &self,
         supplied_username: Option<&str>,
     ) -> Result<CameraConfig> {
@@ -117,7 +130,6 @@ impl CameraRequest {
             .or(supplied_username)
             .ok_or_else(|| anyhow::anyhow!("username is required"))?;
 
-        // A camera needs an address or a uid (existing validation rule).
         if self.address.is_none() && self.uid.is_none() {
             anyhow::bail!("either address or uid is required");
         }
@@ -128,34 +140,28 @@ impl CameraRequest {
             camera_uid: self.uid.clone(),
             username: username.to_string(),
             password: self.password.clone(),
-            stream: self.stream_kind(),
+            stream: self.stream_kind().unwrap_or(StreamConfig::Main),
             permitted_users: None,
             channel_id: 0,
             mqtt: crate::config::default_mqtt(),
             pause: crate::config::default_pause(),
-            discovery: match self.discovery.to_lowercase().as_str() {
-                "none" => neolink_core::bc_protocol::DiscoveryMethods::None,
-                "local" => neolink_core::bc_protocol::DiscoveryMethods::Local,
-                "remote" => neolink_core::bc_protocol::DiscoveryMethods::Remote,
-                "map" => neolink_core::bc_protocol::DiscoveryMethods::Map,
-                "cellular" => neolink_core::bc_protocol::DiscoveryMethods::Cellular,
-                _ => neolink_core::bc_protocol::DiscoveryMethods::Relay,
-            },
+            discovery: self.discovery_kind()
+                .unwrap_or(neolink_core::bc_protocol::DiscoveryMethods::Relay),
             max_encryption: "Aes".to_string(),
             strict: false,
             print_format: neolink_core::bc_protocol::PrintFormat::None,
             update_time: false,
             buffer_duration: 3000,
-            enabled: self.enabled,
+            enabled: self.enabled.unwrap_or(true),
             debug: false,
             use_splash: true,
             splash_pattern: crate::config::SplashPattern::Snow,
             max_discovery_retries: 10,
             push_notifications: true,
             idle_disconnect: None,
-            battery: Some(self.battery),
-            idle_grace_s: self.idle_grace_s,
-            snapshot_fresh: self.snapshot_fresh,
+            battery: Some(self.battery.unwrap_or(true)),
+            idle_grace_s: self.idle_grace_s.unwrap_or(10),
+            snapshot_fresh: self.snapshot_fresh.unwrap_or(false),
             motion_hold_max_s: 120,
             audio: "aac".to_string(),
             pacing_latency_ms: None,
@@ -167,6 +173,45 @@ impl CameraRequest {
             display_name: self.display_name.clone(),
             updated_at: Some(Utc::now()),
         })
+    }
+
+    /// Apply this request as a partial update to an existing `CameraConfig` (PUT).
+    /// Only fields that are `Some` are changed; everything else is left as-is.
+    pub(crate) fn apply_to(&self, existing: &mut CameraConfig) {
+        if let Some(display_name) = &self.display_name {
+            existing.display_name = Some(display_name.clone());
+        }
+        if let Some(address) = &self.address {
+            existing.camera_addr = Some(address.clone());
+        }
+        if let Some(uid) = &self.uid {
+            existing.camera_uid = Some(uid.clone());
+        }
+        if let Some(username) = &self.username {
+            existing.username = username.clone();
+        }
+        if let Some(password) = &self.password {
+            existing.password = Some(password.clone());
+        }
+        if let Some(battery) = self.battery {
+            existing.battery = Some(battery);
+        }
+        if let Some(enabled) = self.enabled {
+            existing.enabled = enabled;
+        }
+        if let Some(stream) = self.stream_kind() {
+            existing.stream = stream;
+        }
+        if let Some(discovery) = self.discovery_kind() {
+            existing.discovery = discovery;
+        }
+        if let Some(snapshot_fresh) = self.snapshot_fresh {
+            existing.snapshot_fresh = snapshot_fresh;
+        }
+        if let Some(idle_grace_s) = self.idle_grace_s {
+            existing.idle_grace_s = idle_grace_s;
+        }
+        existing.updated_at = Some(Utc::now());
     }
 }
 
@@ -272,15 +317,15 @@ mod tests {
             display_name: None,
             address: Some("1.2.3.4".to_string()),
             uid: None,
-            battery: true,
-            enabled: true,
-            stream: "main".to_string(),
-            discovery: "relay".to_string(),
-            snapshot_fresh: false,
-            idle_grace_s: 10,
+            battery: None,
+            enabled: None,
+            stream: None,
+            discovery: None,
+            snapshot_fresh: None,
+            idle_grace_s: None,
         };
-        assert!(req.into_camera_config(None).is_err());
-        assert!(req.into_camera_config(Some("admin")).is_ok());
+        assert!(req.resolve_for_create(None).is_err());
+        assert!(req.resolve_for_create(Some("admin")).is_ok());
     }
 
     #[test]
@@ -292,13 +337,13 @@ mod tests {
             display_name: None,
             address: None,
             uid: None,
-            battery: true,
-            enabled: true,
-            stream: "main".to_string(),
-            discovery: "relay".to_string(),
-            snapshot_fresh: false,
-            idle_grace_s: 10,
+            battery: None,
+            enabled: None,
+            stream: None,
+            discovery: None,
+            snapshot_fresh: None,
+            idle_grace_s: None,
         };
-        assert!(req.into_camera_config(Some("admin")).is_err());
+        assert!(req.resolve_for_create(Some("admin")).is_err());
     }
 }

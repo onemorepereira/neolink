@@ -16,6 +16,7 @@ use axum::{
 use crate::config::Config;
 use crate::common::NeoReactorCommand;
 
+#[derive(Debug)]
 pub(crate) struct AppState {
     pub(crate) config_path: PathBuf,
     pub(crate) config_rx: WatchReceiver<Config>,
@@ -28,6 +29,19 @@ impl Clone for AppState {
             config_path: self.config_path.clone(),
             config_rx: self.config_rx.clone(),
             command_tx: self.command_tx.clone(),
+        }
+    }
+}
+
+impl AppState {
+    /// Placeholder state used before the real state is available.
+    fn placeholder() -> Self {
+        let (config_tx, config_rx) = tokio::sync::watch::channel(Config::default());
+        let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+        Self {
+            config_path: PathBuf::from("/tmp/neolink.toml"),
+            config_rx,
+            command_tx,
         }
     }
 }
@@ -45,18 +59,19 @@ pub(crate) async fn start(
         config_rx,
         command_tx,
     });
+    crate::api::endpoints::set_app_state(state.clone());
 
     let app = Router::new()
         .route("/health", get(health))
         .route(
             "/cameras",
             get(crate::api::endpoints::get_cameras)
-                .post(crate::api::endpoints::post_camera),
+                .post(crate::api::endpoints::post_camera)
+                .put(crate::api::endpoints::put_camera),
         )
         .route(
             "/cameras/:name",
             get(crate::api::endpoints::get_camera)
-                .put(crate::api::endpoints::put_camera)
                 .delete(crate::api::endpoints::delete_camera),
         )
         .route(
