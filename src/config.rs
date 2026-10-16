@@ -24,6 +24,7 @@ static RE_MAXENC_SRC: Lazy<Regex> = Lazy::new(|| {
 #[derive(Deserialize, Serialize, Validate, Clone, PartialEq)]
 pub(crate) struct Config {
     #[validate(nested)]
+    #[serde(default)]
     pub(crate) cameras: Vec<CameraConfig>,
 
     #[serde(rename = "bind", default = "default_bind_addr")]
