@@ -49,7 +49,7 @@ tokio-stream = "0.1.12"
 tokio-util = { version = "0.7.7", features = ["full", "tracing"] }
 toml = "0.8.2"
 axum = "0.7"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.8.0", features = ["v4"] }
 validator = {version="0.20.0", features = ["derive"] }
 

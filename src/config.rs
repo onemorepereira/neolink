@@ -9,7 +9,7 @@ use std::clone::Clone;
 use std::collections::HashSet;
 use validator::Validate;
 use validator::ValidationError;
-
+use chrono::{DateTime, Utc};
 static RE_TLS_CLIENT_AUTH: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(none|request|require)$").unwrap());
 static RE_RTSP_BACKEND: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(gstreamer|native)$").unwrap());
@@ -90,6 +90,15 @@ pub(crate) struct Config {
     #[validate(nested)]
     #[serde(default)]
     pub(crate) limits: LimitsConfig,
+
+    /// HTTP API listen address (only with feature `api`)
+    #[serde(default = "default_api_bind")]
+    pub(crate) api_bind: String,
+
+    /// HTTP API listen port (only with feature `api`)
+    #[validate(range(min = 0, max = 65535, message = "Invalid port", code = "api_port"))]
+    #[serde(default = "default_api_port")]
+    pub(crate) api_port: u16,
 }
 
 /// Native RTSP server limits (SPEC R24)
@@ -413,6 +422,14 @@ pub(crate) struct CameraConfig {
     /// Native backend: keep the last IRAP on disk to show while the camera wakes
     #[serde(default = "default_true")]
     pub(crate) persist_irap: bool,
+
+    /// Human label for the camera (API-only, not in TOML config file)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) display_name: Option<String>,
+
+    /// When the camera config was last written via the API
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) updated_at: Option<DateTime<Utc>>,
 }
 
 fn default_audio() -> String {
@@ -709,6 +726,14 @@ fn default_bind_port() -> u16 {
     8554
 }
 
+fn default_api_bind() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_api_port() -> u16 {
+    8080
+}
+
 fn default_stream() -> StreamConfig {
     StreamConfig::All
 }
@@ -867,6 +892,8 @@ const CONFIG_KEYS: &[&str] = &[
     "mqtt_config_writes",
     "rtp_mtu",
     "limits",
+    "api_bind",
+    "api_port",
 ];
 const LIMITS_KEYS: &[&str] = &[
     "max_connections",
@@ -935,6 +962,8 @@ const CAMERA_KEYS: &[&str] = &[
     "bridge_max_s",
     "rtcp_sr",
     "persist_irap",
+    "display_name",
+    "updated_at",
 ];
 const USER_KEYS: &[&str] = &["name", "username", "pass", "password"];
 const CAMERA_MQTT_KEYS: &[&str] = &[
@@ -1197,5 +1226,20 @@ mod key_tests {
                 .collect();
             assert_eq!(unknown, Vec::<String>::new(), "{name}");
         }
+    }
+
+    #[test]
+    fn test_api_config_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+            [[cameras]]
+            name = "test"
+            username = "admin"
+            address = "1.2.3.4"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.api_bind, "0.0.0.0");
+        assert_eq!(config.api_port, 8080);
     }
 }
