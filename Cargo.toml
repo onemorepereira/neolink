@@ -48,6 +48,8 @@ tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "io-util", 
 tokio-stream = "0.1.12"
 tokio-util = { version = "0.7.7", features = ["full", "tracing"] }
 toml = "0.8.2"
+axum = "0.7"
+chrono = "0.4"
 uuid = { version = "1.8.0", features = ["v4"] }
 validator = {version="0.20.0", features = ["derive"] }
 
@@ -81,6 +83,8 @@ pushnoti = [
   "dep:dirs",
   "dep:md5"
 ]
+# HTTP configuration API (open, no auth; exposure controlled at the k3s layer)
+api = []
 
 [profile.release]
 # Smaller binaries (PLAN 1.8)
