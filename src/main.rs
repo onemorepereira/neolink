@@ -41,6 +41,8 @@ mod battery;
 mod cmdline;
 mod common;
 mod config;
+#[cfg(feature = "api")]
+mod api;
 #[cfg(feature = "gstreamer")]
 mod image;
 mod mqtt;

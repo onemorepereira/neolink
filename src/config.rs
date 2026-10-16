@@ -581,7 +581,7 @@ const fn default_false() -> bool {
     false
 }
 
-fn default_mqtt() -> MqttConfig {
+pub(crate) fn default_mqtt() -> MqttConfig {
     MqttConfig {
         enable_motion: true,
         enable_light: true,
@@ -592,6 +592,15 @@ fn default_mqtt() -> MqttConfig {
         enable_floodlight: true,
         floodlight_update: 2000,
         discovery: Default::default(),
+    }
+}
+
+pub(crate) fn default_pause() -> PauseConfig {
+    PauseConfig {
+        on_motion: default_on_motion(),
+        on_disconnect: default_on_disconnect(),
+        motion_timeout: default_motion_timeout(),
+        mode: default_pause_mode(),
     }
 }
 
@@ -776,15 +785,6 @@ fn default_pause_mode() -> String {
 
 fn default_strict() -> bool {
     false
-}
-
-fn default_pause() -> PauseConfig {
-    PauseConfig {
-        on_motion: default_on_motion(),
-        on_disconnect: default_on_disconnect(),
-        motion_timeout: default_motion_timeout(),
-        mode: default_pause_mode(),
-    }
 }
 
 fn default_buffer_duration() -> u64 {

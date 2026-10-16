@@ -23,7 +23,7 @@ use crate::common::PushNotiThread;
 use crate::{config::Config, AnyResult, Result};
 
 #[allow(clippy::large_enum_variant)]
-enum NeoReactorCommand {
+pub(crate) enum NeoReactorCommand {
     HangUp,
     Shutdown(OneshotSender<()>),
     Stats(OneshotSender<Vec<String>>),
