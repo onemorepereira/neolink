@@ -40,7 +40,7 @@ pub(crate) async fn post_camera(
     new_config.cameras.push(new_cam);
     new_config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    persist::persist_config(&st.config_path, &new_config)
+    persist::persist_config(&st.config_path, &new_config).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     update_config(&st.command_tx, new_config).await?;
 
@@ -78,7 +78,7 @@ pub(crate) async fn put_camera(
     req.apply_to(&mut new_config.cameras[idx]);
     new_config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    persist::persist_config(&st.config_path, &new_config)
+    persist::persist_config(&st.config_path, &new_config).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     update_config(&st.command_tx, new_config).await?;
 
@@ -103,7 +103,7 @@ pub(crate) async fn delete_camera(
     new_config.cameras.retain(|c| c.name != name);
     new_config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    persist::persist_config(&st.config_path, &new_config)
+    persist::persist_config(&st.config_path, &new_config).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     update_config(&st.command_tx, new_config).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -226,7 +226,7 @@ pub(crate) async fn put_config(
     let mut config: Config = toml::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    persist::persist_config(&st.config_path, &config)
+    persist::persist_config(&st.config_path, &config).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     update_config(&st.command_tx, config).await?;
     Ok(StatusCode::OK)

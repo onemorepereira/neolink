@@ -9,3 +9,4 @@ pub(crate) mod model;
 pub(crate) mod persist;
 pub(crate) mod server;
 pub(crate) mod endpoints;
+pub(crate) mod k8s;
