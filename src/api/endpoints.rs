@@ -1,146 +1,248 @@
 //! HTTP route handlers for the camera API.
-//!
-//! NOTE: axum 0.7's `Handler` trait only supports `FromRequestParts` parameters
-//! (e.g. `State`, `Path`), not `FromRequest` parameters (e.g. `Json`, `String`,
-//! `Bytes` which consume the request body). Therefore POST/PUT/DELETE handlers
-//! cannot read request bodies and are currently stubs. GET handlers work fully.
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::Json,
+    extract::{Path, State, Json},
+    http::{StatusCode, header},
+    response::Response,
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::sync::oneshot;
+use validator::Validate;
 
+use crate::api::persist;
 use crate::api::server::AppState;
-use crate::api::model::CameraResponse;
+use crate::api::model::{CameraRequest, CameraResponse};
+use crate::common::{state_dir, StateFile};
 use crate::config::Config;
 
-/// Global app state, set from main.rs via [`set_app_state`].
-static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
+// ── GET /cameras ──────────────────────────────────────────────────────────────
 
-/// Set the global app state handle. Called from main.rs after the reactor is
-/// running so that write handlers can access the config path, command channel
-/// and config watch channel.
-pub(crate) fn set_app_state(state: Arc<AppState>) {
-    APP_STATE.set(state).expect("app state already set");
-}
-
-/// GET /cameras — list all cameras
 pub(crate) async fn get_cameras(
-    state: State<Arc<AppState>>,
+    State(st): State<Arc<AppState>>,
 ) -> Result<Json<Vec<CameraResponse>>, StatusCode> {
-    let config = state.config_rx.borrow();
-    let cameras: Vec<CameraResponse> = config
-        .cameras
-        .iter()
-        .map(CameraResponse::from)
-        .collect();
+    let cameras = st.config_rx.borrow().cameras.iter().map(CameraResponse::from).collect();
     Ok(Json(cameras))
 }
 
-/// POST /cameras — create a camera
-///
-/// NOTE: axum 0.7 does not support request-body extractors as handler
-/// parameters, so the camera payload cannot be read here yet.
-pub(crate) async fn post_camera() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
-}
+// ── POST /cameras ─────────────────────────────────────────────────────────────
 
-/// GET /cameras/:name — get one camera
-pub(crate) async fn get_camera(
-    state: State<Arc<AppState>>,
-    name: Path<String>,
-) -> Result<Json<CameraResponse>, StatusCode> {
-    let config = state.config_rx.borrow();
-    let camera = config
-        .cameras
-        .iter()
-        .find(|c| c.name == *name)
+pub(crate) async fn post_camera(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<CameraRequest>,
+) -> Result<(StatusCode, Json<CameraResponse>), StatusCode> {
+    let config = st.config_rx.borrow().clone();
+    if config.cameras.iter().any(|c| c.name == req.name) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let new_cam = req.resolve_for_create(None).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let mut new_config = config;
+    new_config.cameras.push(new_cam);
+    new_config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    persist::persist_config(&st.config_path, &new_config)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    update_config(&st.command_tx, new_config).await?;
+
+    let camera = st.config_rx.borrow().cameras.iter()
+        .find(|c| c.name == req.name)
         .map(CameraResponse::from)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(camera)))
+}
+
+// ── GET /cameras/:name ────────────────────────────────────────────────────────
+
+pub(crate) async fn get_camera(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<CameraResponse>, StatusCode> {
+    st.config_rx.borrow().cameras.iter()
+        .find(|c| c.name == name)
+        .map(|c| Json(CameraResponse::from(c)))
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+// ── PUT /cameras/:name ────────────────────────────────────────────────────────
+
+pub(crate) async fn put_camera(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CameraRequest>,
+) -> Result<Json<CameraResponse>, StatusCode> {
+    let config = st.config_rx.borrow().clone();
+    let idx = config.cameras.iter().position(|c| c.name == name)
         .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(camera))
+
+    let mut new_config = config;
+    req.apply_to(&mut new_config.cameras[idx]);
+    new_config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    persist::persist_config(&st.config_path, &new_config)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    update_config(&st.command_tx, new_config).await?;
+
+    let camera = st.config_rx.borrow().cameras.iter()
+        .find(|c| c.name == name)
+        .map(|c| Json(CameraResponse::from(c)))
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(camera)
 }
 
-/// PUT /cameras — update a camera (partial)
-///
-/// NOTE: axum 0.7 does not support request-body extractors as handler
-/// parameters, so the update payload cannot be read here yet.
-pub(crate) async fn put_camera() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+// ── DELETE /cameras/:name ─────────────────────────────────────────────────────
+
+pub(crate) async fn delete_camera(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let config = st.config_rx.borrow().clone();
+    if !config.cameras.iter().any(|c| c.name == name) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let mut new_config = config;
+    new_config.cameras.retain(|c| c.name != name);
+    new_config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    persist::persist_config(&st.config_path, &new_config)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    update_config(&st.command_tx, new_config).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-/// DELETE /cameras/:name — remove a camera
-///
-/// NOTE: axum 0.7 does not support path parameters as handler parameters
-/// for DELETE routes.
-pub(crate) async fn delete_camera() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+// ── GET /cameras/:name/status ─────────────────────────────────────────────────
+
+pub(crate) async fn get_camera_status(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let cam_config = st.config_rx.borrow().cameras.iter()
+        .find(|c| c.name == name)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Read cached state from disk — never wakes the camera
+    let sf = StateFile::for_camera(&cam_config);
+    let state = sf.load();
+
+    let battery_level = state.last_battery.as_ref().map(|b| b.percent);
+    let battery_age_s = state.last_battery.as_ref().map(|b| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|now| now.as_secs().saturating_sub(b.at))
+            .unwrap_or(0)
+    });
+
+    Ok(Json(serde_json::json!({
+        "name":          name,
+        "connected":     false,      // cached; live value only while awake
+        "battery_level": battery_level,
+        "battery_age_s": battery_age_s,
+        "motion":        "unknown",  // only known over an open connection
+        "today_wakes":   0,          // ledger not yet wired through API
+    })))
 }
 
-/// Send a config update to the reactor and await the result.
-async fn send_update_config(
-    command_tx: &tokio::sync::mpsc::Sender<crate::common::NeoReactorCommand>,
-    new_config: Config,
+// ── GET /cameras/:name/snapshot.jpg ──────────────────────────────────────────
+// 1×1 grey JPEG placeholder (when no snapshot has been saved yet)
+static GREY_JPEG: &[u8] = include_bytes!("snapshot_placeholder.jpg");
+
+pub(crate) async fn get_camera_snapshot(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Response<axum::body::Body>, StatusCode> {
+    let cam_config = st.config_rx.borrow().cameras.iter()
+        .find(|c| c.name == name)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let sf = StateFile::for_camera(&cam_config);
+    let jpeg = match sf.snapshot() {
+        Some((bytes, _at)) => bytes,
+        None => GREY_JPEG.to_vec(),
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .body(axum::body::Body::from(jpeg))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+// ── POST /cameras/:name/wake ──────────────────────────────────────────────────
+
+pub(crate) async fn post_camera_wake(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let cam_config = st.config_rx.borrow().cameras.iter()
+        .find(|c| c.name == name)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let instance = st.reactor.get(&name).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    instance.connect().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    // Release after idle_grace_s so the caller can connect via RTSP
+    let grace = cam_config.idle_grace_s;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
+        let _ = instance.disconnect().await;
+    });
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── GET /cameras/:name/rtsp-url ───────────────────────────────────────────────
+
+pub(crate) async fn get_camera_rtsp_url(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let config = st.config_rx.borrow();
+    if !config.cameras.iter().any(|c| c.name == name) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let url = format!("rtsp://{}:{}/{}", config.bind_addr, config.bind_port, name);
+    Ok(Json(serde_json::json!({ "rtsp_url": url })))
+}
+
+// ── GET /config ───────────────────────────────────────────────────────────────
+
+pub(crate) async fn get_config(
+    State(st): State<Arc<AppState>>,
+) -> Result<String, StatusCode> {
+    toml::to_string(&*st.config_rx.borrow())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+// ── PUT /config ───────────────────────────────────────────────────────────────
+
+pub(crate) async fn put_config(
+    State(st): State<Arc<AppState>>,
+    body: String,
+) -> Result<StatusCode, StatusCode> {
+    crate::config::warn_unknown_keys(&body, "PUT /config");
+    let mut config: Config = toml::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    persist::persist_config(&st.config_path, &config)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    update_config(&st.command_tx, config).await?;
+    Ok(StatusCode::OK)
+}
+
+// ── internal ──────────────────────────────────────────────────────────────────
+
+async fn update_config(
+    tx: &tokio::sync::mpsc::Sender<crate::common::NeoReactorCommand>,
+    config: Config,
 ) -> Result<(), StatusCode> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    if command_tx
-        .send(crate::common::NeoReactorCommand::UpdateConfig(new_config, reply_tx))
+    tx.send(crate::common::NeoReactorCommand::UpdateConfig(config, reply_tx))
         .await
-        .is_err()
-    {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-    match reply_rx.await {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
-
-/// GET /cameras/:name/status — cached status (never wakes)
-pub(crate) async fn get_camera_status(
-    _state: State<Arc<AppState>>,
-    _name: Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    unimplemented!("Task 9: GET /cameras/:name/status")
-}
-
-/// GET /cameras/:name/snapshot.jpg — passive still (never wakes)
-pub(crate) async fn get_camera_snapshot(
-    _state: State<Arc<AppState>>,
-    _name: Path<String>,
-) -> Result<Vec<u8>, StatusCode> {
-    unimplemented!("Task 10: GET /cameras/:name/snapshot.jpg")
-}
-
-/// POST /cameras/:name/wake — explicit wake (wakes camera)
-pub(crate) async fn post_camera_wake(
-    _state: State<Arc<AppState>>,
-    _name: Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    unimplemented!("Task 11: POST /cameras/:name/wake")
-}
-
-/// GET /cameras/:name/rtsp-url — RTSP URL for this camera
-pub(crate) async fn get_camera_rtsp_url(
-    _state: State<Arc<AppState>>,
-    _name: Path<String>,
-) -> Json<serde_json::Value> {
-    unimplemented!("Task 10: GET /cameras/:name/rtsp-url")
-}
-
-/// GET /config — whole config as TOML
-pub(crate) async fn get_config(
-    _state: State<Arc<AppState>>,
-) -> Result<String, StatusCode> {
-    unimplemented!("Task 12: GET /config")
-}
-
-/// PUT /config — replace whole config
-pub(crate) async fn put_config(
-    _state: State<Arc<AppState>>,
-    _body: String,
-) -> Result<StatusCode, StatusCode> {
-    unimplemented!("Task 12: PUT /config")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    reply_rx.await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }

@@ -127,6 +127,34 @@ async fn neolink_main(args: Vec<OsString>) -> Result<()> {
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
 
+    #[cfg(feature = "api")]
+    {
+        let config_rx = neo_reactor.config().await?;
+        let command_tx = neo_reactor.commander();
+        let api_cancel = tokio_util::sync::CancellationToken::new();
+        let api_cancel_child = api_cancel.child_token();
+        let api_conf_path = conf_path.clone();
+        let api_bind = config.api_bind.clone();
+        let api_port = config.api_port;
+        let api_reactor = neo_reactor.clone();
+        tokio::spawn(async move {
+            if let Err(e) = api::server::start(
+                api_conf_path.into(),
+                config_rx,
+                command_tx,
+                api_reactor,
+                api_bind,
+                api_port,
+                api_cancel_child,
+            )
+            .await
+            {
+                log::error!("HTTP API error: {e:?}");
+            }
+        });
+        log::info!("HTTP API started on {}:{}", config.api_bind, config.api_port);
+    }
+
     // Run the command until it ends or a signal arrives, then stop every camera cleanly so
     // that it is logged out instead of dropped (PLAN 1.5)
     let cmd = opt.cmd;
