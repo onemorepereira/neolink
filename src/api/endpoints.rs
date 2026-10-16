@@ -12,7 +12,7 @@ use validator::Validate;
 use crate::api::persist;
 use crate::api::server::AppState;
 use crate::api::model::{CameraRequest, CameraResponse};
-use crate::common::{state_dir, StateFile};
+use crate::common::StateFile;
 use crate::config::Config;
 
 // ── GET /cameras ──────────────────────────────────────────────────────────────

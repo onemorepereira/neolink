@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 use axum::{
     Router,
-    routing::{get, post, put, delete},
+    routing::{get, post},
     http::StatusCode,
     extract::State,
 };
