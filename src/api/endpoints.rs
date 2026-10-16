@@ -15,6 +15,14 @@ use crate::api::model::{CameraRequest, CameraResponse};
 use crate::common::StateFile;
 use crate::config::Config;
 
+/// Return a 4xx with a plain-text body so the request log captures the reason.
+fn err(status: StatusCode, msg: impl std::fmt::Display) -> StatusCode {
+    // We log the message here; the middleware logs the response body on 4xx.
+    // Since handlers return StatusCode (no body), log directly.
+    log::warn!("api error {}: {}", status.as_u16(), msg);
+    status
+}
+
 // ── GET /cameras ──────────────────────────────────────────────────────────────
 
 pub(crate) async fn get_cameras(
@@ -34,11 +42,11 @@ pub(crate) async fn post_camera(
     if config.cameras.iter().any(|c| c.name == req.name) {
         return Err(StatusCode::CONFLICT);
     }
-    let new_cam = req.resolve_for_create(None).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let new_cam = req.resolve_for_create(None).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     let mut new_config = config;
     new_config.cameras.push(new_cam);
-    new_config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+    new_config.validate().map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     persist::persist_config(&st.config_path, &new_config).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -76,7 +84,7 @@ pub(crate) async fn put_camera(
 
     let mut new_config = config;
     req.apply_to(&mut new_config.cameras[idx]);
-    new_config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+    new_config.validate().map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     persist::persist_config(&st.config_path, &new_config).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -101,7 +109,7 @@ pub(crate) async fn delete_camera(
     }
     let mut new_config = config;
     new_config.cameras.retain(|c| c.name != name);
-    new_config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+    new_config.validate().map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     persist::persist_config(&st.config_path, &new_config).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -223,8 +231,8 @@ pub(crate) async fn put_config(
     body: String,
 ) -> Result<StatusCode, StatusCode> {
     crate::config::warn_unknown_keys(&body, "PUT /config");
-    let mut config: Config = toml::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
-    config.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut config: Config = toml::from_str(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    config.validate().map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     persist::persist_config(&st.config_path, &config).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

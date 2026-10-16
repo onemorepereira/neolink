@@ -10,7 +10,9 @@ use anyhow::Result;
 use axum::{
     Router,
     routing::{get, post},
-    http::StatusCode,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     extract::State,
 };
 use crate::config::Config;
@@ -57,6 +59,7 @@ pub(crate) async fn start(
             get(crate::api::endpoints::get_config)
                 .put(crate::api::endpoints::put_config),
         )
+        .layer(middleware::from_fn(log_request))
         .with_state(state);
 
     let addr: SocketAddr = format!("{bind}:{port}").parse()?;
@@ -68,6 +71,27 @@ pub(crate) async fn start(
         .await?;
 
     Ok(())
+}
+
+/// Log every API request: method, path, status, and — for 4xx — the response body.
+async fn log_request(req: Request<axum::body::Body>, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri    = req.uri().clone();
+
+    let resp = next.run(req).await;
+    let status = resp.status();
+
+    if status.is_client_error() {
+        // Collect the body so we can log it, then reconstruct the response.
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, 4096).await.unwrap_or_default();
+        let detail = String::from_utf8_lossy(&bytes);
+        log::warn!("api: {} {} → {} — {}", method, uri, status.as_u16(), detail);
+        Response::from_parts(parts, axum::body::Body::from(bytes))
+    } else {
+        log::info!("api: {} {} → {}", method, uri, status.as_u16());
+        resp
+    }
 }
 
 async fn health(_st: State<Arc<AppState>>) -> StatusCode {
