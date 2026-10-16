@@ -17,9 +17,15 @@ use crate::config::Config;
 
 /// GET /cameras — list all cameras
 pub(crate) async fn get_cameras(
-    _state: State<Arc<AppState>>,
+    state: State<Arc<AppState>>,
 ) -> Result<Json<Vec<CameraResponse>>, StatusCode> {
-    unimplemented!("Task 7: GET /cameras")
+    let config = state.config_rx.borrow();
+    let cameras: Vec<CameraResponse> = config
+        .cameras
+        .iter()
+        .map(CameraResponse::from)
+        .collect();
+    Ok(Json(cameras))
 }
 
 /// POST /cameras — create a camera
@@ -32,10 +38,17 @@ pub(crate) async fn post_camera(
 
 /// GET /cameras/:name — get one camera
 pub(crate) async fn get_camera(
-    _state: State<Arc<AppState>>,
-    _name: Path<String>,
+    state: State<Arc<AppState>>,
+    name: Path<String>,
 ) -> Result<Json<CameraResponse>, StatusCode> {
-    unimplemented!("Task 7: GET /cameras/:name")
+    let config = state.config_rx.borrow();
+    let camera = config
+        .cameras
+        .iter()
+        .find(|c| c.name == *name)
+        .map(CameraResponse::from)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(camera))
 }
 
 /// PUT /cameras/:name — update a camera (partial)
