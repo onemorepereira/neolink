@@ -1310,3 +1310,60 @@ impl Default for CameraConfig {
         }
     }
 }
+
+/// Serialize `config` to TOML including passwords.
+///
+/// `toml::to_string` skips password fields (they use `skip_serializing` to
+/// keep them out of debug logs). This function patches them back in so the
+/// on-disk config file is self-contained and survives a pod restart.
+pub(crate) fn config_to_toml(config: &Config) -> Result<String, toml::ser::Error> {
+    let mut doc: toml::Value = toml::Value::try_from(config)?;
+
+    let cameras = doc
+        .get_mut("cameras")
+        .and_then(|v| v.as_array_mut())
+        .map(|a| a.as_mut_slice());
+
+    if let Some(entries) = cameras {
+        for (entry, cam) in entries.iter_mut().zip(config.cameras.iter()) {
+            let tbl = match entry.as_table_mut() {
+                Some(t) => t,
+                None => continue,
+            };
+            if let Some(pw) = &cam.password {
+                tbl.insert("password".to_string(), toml::Value::String(pw.clone()));
+            }
+        }
+    }
+
+    // Inject MQTT credentials
+    if let (Some(mqtt_val), Some(mqtt_cfg)) = (
+        doc.get_mut("mqtt").and_then(|v| v.as_table_mut()),
+        config.mqtt.as_ref(),
+    ) {
+        if let Some((user, pass)) = &mqtt_cfg.credentials {
+            mqtt_val.insert(
+                "credentials".to_string(),
+                toml::Value::Array(vec![
+                    toml::Value::String(user.clone()),
+                    toml::Value::String(pass.clone()),
+                ]),
+            );
+        }
+    }
+
+    // Inject [[users]] passwords
+    if let Some(users_val) = doc.get_mut("users").and_then(|v| v.as_array_mut()) {
+        for (entry, user) in users_val.iter_mut().zip(config.users.iter()) {
+            let tbl = match entry.as_table_mut() {
+                Some(t) => t,
+                None => continue,
+            };
+            if let Some(pw) = &user.pass {
+                tbl.insert("pass".to_string(), toml::Value::String(pw.clone()));
+            }
+        }
+    }
+
+    toml::to_string(&doc)
+}

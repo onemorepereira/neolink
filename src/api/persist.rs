@@ -11,7 +11,8 @@ use crate::config::Config;
 /// The ConfigMap patch is best-effort: a failure logs a warning but does not
 /// abort the write (the file on disk is always the authoritative copy).
 pub(crate) async fn persist_config(path: &Path, config: &Config) -> Result<()> {
-    let toml = toml::to_string(config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let toml = crate::config::config_to_toml(config)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // 1. Atomic write to disk (temp + rename).
     let tmp = path.with_extension("tmp");
@@ -30,6 +31,38 @@ pub(crate) async fn persist_config(path: &Path, config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_persist_includes_password() {
+        let dir = std::env::temp_dir().join(format!("neolink-pw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let config: Config = toml::from_str(
+            r#"
+            [[cameras]]
+            name = "cam"
+            username = "admin"
+            password = "supersecret"
+            address = "1.2.3.4"
+            "#,
+        )
+        .unwrap();
+
+        persist_config(&path, &config).await.unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        // Password must survive to disk so neolink can authenticate after restart
+        assert!(content.contains("supersecret"), "password missing from disk: {content}");
+        assert!(content.contains("admin"), "username missing from disk");
+
+        // Must NOT appear in Debug output (PLAN 1.6)
+        let debug = format!("{:?}", config.cameras[0]);
+        assert!(!debug.contains("supersecret"), "password leaked in debug: {debug}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn test_persist_config_atomic() {
@@ -53,7 +86,6 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("name = \"test\""));
-        assert!(!content.contains("secret"));
 
         // Second write doesn't corrupt
         persist_config(&path, &config).await.unwrap();
