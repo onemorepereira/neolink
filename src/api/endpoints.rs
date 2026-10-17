@@ -128,26 +128,71 @@ pub(crate) async fn get_camera_status(
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Read cached state from disk — never wakes the camera
+    // ── cached state from disk (never wakes) ──────────────────────────────────
     let sf = StateFile::for_camera(&cam_config);
-    let state = sf.load();
+    let disk = sf.load();
 
-    let battery_level = state.last_battery.as_ref().map(|b| b.percent);
-    let battery_age_s = state.last_battery.as_ref().map(|b| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|now| now.as_secs().saturating_sub(b.at))
-            .unwrap_or(0)
-    });
+    // ── live data from reactor (never wakes) ──────────────────────────────────
+    let (ledger_status, motion_str, connected, active_users) = match st.reactor.get(&name).await {
+        Err(_) => (None, "unknown".to_string(), false, 0u32),
+        Ok(instance) => {
+            // Ledger: wake history and awake state
+            let ledger_status = instance.wakes().await.ok()
+                .map(|rx| rx.borrow().clone());
+
+            // Motion: current state from the motion watcher
+            let motion_str = match instance.motion().await.ok()
+                .map(|rx| rx.borrow().clone())
+            {
+                Some(crate::common::MdState::Start(_)) => "on",
+                Some(crate::common::MdState::Stop(_))  => "off",
+                _                                       => "unknown",
+            }.to_string();
+
+            // Connected = awake flag from ledger
+            let connected = ledger_status.as_ref().map(|l| l.awake).unwrap_or(false);
+
+            // Active users = permit count (streams, MQTT commands, etc.)
+            let active_users = st.reactor.get(&name).await
+                .map(|_| 0u32)  // use_count is on NeoCam not NeoInstance
+                .unwrap_or(0);
+
+            (ledger_status, motion_str, connected, active_users)
+        }
+    };
+
+    // ── assemble response ──────────────────────────────────────────────────────
+    let battery = disk.last_battery.as_ref().map(|b| serde_json::json!({
+        "percent":        b.percent,
+        "voltage_mv":     b.voltage,
+        "current_ma":     b.current,
+        "temperature_c":  b.temperature,
+        "charge_status":  b.charge_status,
+        "adapter_status": b.adapter_status,
+        "age_s":          b.age(),
+    }));
+
+    let wakes = ledger_status.as_ref().map(|l| serde_json::json!({
+        "awake":           l.awake,
+        "reason":          l.reason,
+        "since":           l.since,
+        "last_awake_s":    l.last_awake_s,
+        "today_wakes":     l.today_wakes,
+        "today_awake_s":   l.today_awake_s,
+        "last_hour_wakes": l.last_hour_wakes,
+    }));
 
     Ok(Json(serde_json::json!({
-        "name":          name,
-        "connected":     false,      // cached; live value only while awake
-        "battery_level": battery_level,
-        "battery_age_s": battery_age_s,
-        "motion":        "unknown",  // only known over an open connection
-        "today_wakes":   0,          // ledger not yet wired through API
+        "name":               name,
+        "connected":          connected,
+        "motion":             motion_str,
+        "battery":            battery,
+        "wakes":              wakes,
+        "snapshot_at":        disk.snapshot_at,
+        "supported_streams":  disk.supported_streams,
+        "model":              disk.model,
+        "firmware":           disk.firmware,
+        "uid":                disk.uid,
     })))
 }
 
