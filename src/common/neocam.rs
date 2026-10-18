@@ -636,25 +636,33 @@ async fn wake_reads(
                 .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_snapshot().await?) })),
         )
         .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}")))
         {
-            Ok(jpeg) => {
+            Ok(Ok(jpeg)) => {
                 if let Err(e) = state.save_snapshot(&jpeg) {
                     log::warn!("{name}: could not save the snapshot: {e:?}");
                 }
                 done.snapshot = true;
             }
-            Err(ref e)
+            // Camera does not respond to or support SNAP — stop trying every wake
+            Err(_timeout) => {
+                done.snapshot = true;
+                done.failed(
+                    name,
+                    "snapshot",
+                    &anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}"),
+                );
+            }
+            Ok(Err(ref e))
                 if matches!(
                     e.downcast_ref::<neolink_core::Error>(),
                     Some(neolink_core::Error::CameraServiceUnavailable { .. })
                 ) =>
             {
-                // Camera does not support SNAP; stop trying
+                // Camera explicitly refused SNAP; stop trying
                 done.snapshot = true;
                 done.failed(name, "snapshot", e);
             }
-            Err(e) => done.failed(name, "snapshot", &e),
+            Ok(Err(e)) => done.failed(name, "snapshot", &e),
         }
     }
 
@@ -670,22 +678,49 @@ async fn wake_reads(
     }
 }
 
-/// One battery read into the state file; false if the camera didn't answer
+/// One battery read into the state file; false if the camera didn't answer.
+/// Tries the polled `battery_info` command first; if it is rejected or times out,
+/// falls back to `battery_info_list` — the unsolicited push some cameras (e.g. Argus
+/// PT Ultra) send right after login instead of responding to the polled request.
 async fn read_battery(instance: &NeoInstance, state: &StateFile, name: &str) -> bool {
     use super::state::BatteryReading;
     // Bounded, so a wake that ends meanwhile doesn't leave this waiting for the next one
-    let result = tokio::time::timeout(
+    let polled = tokio::time::timeout(
         Duration::from_secs(15),
         instance.run_passive_task(|cam| Box::pin(async move { Ok(cam.battery_info().await?) })),
     )
     .await;
-    let b = match result {
-        Ok(Ok(b)) => b,
+    let result = match polled {
+        Ok(Ok(b)) => Ok(b),
         Ok(Err(e)) => {
+            log::debug!("{name}: polled battery read failed ({e:#}); trying login-push fallback");
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                instance.run_passive_task(|cam| {
+                    Box::pin(async move { Ok(cam.battery_info_list().await?) })
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")))
+        }
+        Err(_) => {
+            log::debug!("{name}: polled battery timed out; trying login-push fallback");
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                instance.run_passive_task(|cam| {
+                    Box::pin(async move { Ok(cam.battery_info_list().await?) })
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")))
+        }
+    };
+    let b = match result {
+        Ok(b) => b,
+        Err(e) => {
             log::debug!("{name}: battery read failed: {e:?}");
             return false;
         }
-        Err(_) => return false,
     };
     log::info!(
         "{name}: battery {}% ({} mV, {} mA, {})",

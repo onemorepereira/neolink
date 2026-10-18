@@ -77,6 +77,49 @@ impl BcCamera {
         Ok(())
     }
 
+    /// Reads battery info from the unsolicited push the camera sends right after login
+    /// (`MSG_ID_BATTERY_INFO_LIST`). Some cameras (e.g. Argus PT Ultra) send battery this
+    /// way instead of responding to the polled `MSG_ID_BATTERY_INFO` request.
+    pub async fn battery_info_list(&self) -> Result<BatteryInfo> {
+        let connection = self.get_connection();
+        let mut sub = connection.subscribe_to_id(MSG_ID_BATTERY_INFO_LIST).await?;
+        let msg = sub.recv().await?;
+        if let BcBody::ModernMsg(ModernMsg {
+            payload:
+                Some(BcPayloads::BcXml(BcXml {
+                    battery_list: Some(battery_list),
+                    ..
+                })),
+            ..
+        }) = msg.body
+        {
+            battery_list.battery_info.into_iter().next().ok_or(
+                Error::UnintelligibleReply {
+                    reply: std::sync::Arc::new(Box::new(Bc {
+                        meta: BcMeta {
+                            msg_id: MSG_ID_BATTERY_INFO_LIST,
+                            channel_id: 0,
+                            msg_num: 0,
+                            response_code: 0,
+                            stream_type: 0,
+                            class: 0,
+                        },
+                        body: BcBody::ModernMsg(ModernMsg {
+                            extension: None,
+                            payload: None,
+                        }),
+                    })),
+                    why: "BatteryList was empty",
+                },
+            )
+        } else {
+            Err(Error::UnintelligibleReply {
+                reply: std::sync::Arc::new(Box::new(msg)),
+                why: "Expected BatteryList xml but it was not received",
+            })
+        }
+    }
+
     /// Requests the current battery status of the camera
     pub async fn battery_info(&self) -> Result<BatteryInfo> {
         let connection = self.get_connection();
