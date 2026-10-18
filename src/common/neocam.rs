@@ -14,7 +14,7 @@ use tokio::{
         watch::{channel as watch, Receiver as WatchReceiver, Sender as WatchSender},
     },
     task::JoinSet,
-    time::{sleep, Duration},
+    time::{sleep, timeout, Duration},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -514,11 +514,19 @@ impl Drop for NeoCam {
     }
 }
 
+/// Per-call deadline for each step in `wake_reads`. Long enough for a slow camera on a
+/// relay connection; short enough that one hung command can't block the rest of the reads
+/// for the entire wake.
+const WAKE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What the wake reads have learnt, and which failures were already reported
 #[derive(Default)]
 struct WakeReads {
     version: bool,
     streams: bool,
+    /// Once a snapshot has been saved, or the camera has permanently refused SNAP
+    /// (`CameraServiceUnavailable`), stop trying every wake.
+    snapshot: bool,
     warned: std::collections::HashSet<&'static str>,
 }
 
@@ -551,9 +559,12 @@ async fn wake_reads(
     let mut battery_done = read_battery(instance, state, name).await;
 
     if uid_tx.borrow().is_none() {
-        match instance
-            .run_passive_task(|cam| Box::pin(async move { Ok(cam.uid().await?) }))
-            .await
+        match timeout(
+            WAKE_READ_TIMEOUT,
+            instance.run_passive_task(|cam| Box::pin(async move { Ok(cam.uid().await?) })),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}")))
         {
             Ok(uid) => {
                 if let Err(e) = state.update(|s| s.uid = Some(uid.clone())) {
@@ -566,9 +577,12 @@ async fn wake_reads(
     }
 
     if !done.version {
-        match instance
-            .run_passive_task(|cam| Box::pin(async move { Ok(cam.version().await?) }))
-            .await
+        match timeout(
+            WAKE_READ_TIMEOUT,
+            instance.run_passive_task(|cam| Box::pin(async move { Ok(cam.version().await?) })),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}")))
         {
             Ok(version) => {
                 log::info!(
@@ -589,9 +603,13 @@ async fn wake_reads(
     }
 
     if !done.streams {
-        match instance
-            .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_stream_info().await?) }))
-            .await
+        match timeout(
+            WAKE_READ_TIMEOUT,
+            instance
+                .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_stream_info().await?) })),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}")))
         {
             Ok(stream_info) => {
                 let streams: Vec<String> = stream_info
@@ -608,17 +626,36 @@ async fn wake_reads(
         }
     }
 
-    // One snapshot per wake, for the snapshot endpoint and the CLI (SPEC P5)
-    match instance
-        .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_snapshot().await?) }))
+    // One snapshot per wake, for the snapshot endpoint and the CLI (SPEC P5).
+    // Skipped once saved successfully or once the camera has permanently refused SNAP
+    // (CameraServiceUnavailable), to avoid retrying a command the camera doesn't support.
+    if !done.snapshot {
+        match timeout(
+            WAKE_READ_TIMEOUT,
+            instance
+                .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_snapshot().await?) })),
+        )
         .await
-    {
-        Ok(jpeg) => {
-            if let Err(e) = state.save_snapshot(&jpeg) {
-                log::warn!("{name}: could not save the snapshot: {e:?}");
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}")))
+        {
+            Ok(jpeg) => {
+                if let Err(e) = state.save_snapshot(&jpeg) {
+                    log::warn!("{name}: could not save the snapshot: {e:?}");
+                }
+                done.snapshot = true;
             }
+            Err(ref e)
+                if matches!(
+                    e.downcast_ref::<neolink_core::Error>(),
+                    Some(neolink_core::Error::CameraServiceUnavailable { .. })
+                ) =>
+            {
+                // Camera does not support SNAP; stop trying
+                done.snapshot = true;
+                done.failed(name, "snapshot", e);
+            }
+            Err(e) => done.failed(name, "snapshot", &e),
         }
-        Err(e) => done.failed(name, "snapshot", &e),
     }
 
     for _ in 0..2 {
