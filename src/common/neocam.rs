@@ -627,36 +627,35 @@ async fn wake_reads(
     }
 
     // One snapshot per wake, for the snapshot endpoint and the CLI (SPEC P5).
-    // Skipped once saved successfully or once the camera has permanently refused SNAP.
-    // Uses run_task_for (with a permit) rather than run_passive_task: some cameras
-    // (e.g. Argus PT Ultra) ignore SNAP when sent passively but answer it when a permit
-    // holds the connection open. The camera is already awake at this point, so holding
-    // the permit does not extend or cause a wake.
+    // Skipped once saved successfully or once the camera has permanently refused or
+    // ignored SNAP (any error or timeout), to avoid retrying on every wake.
     if !done.snapshot {
-        match instance
-            .run_task_for("wake_reads:snapshot", |cam| {
-                Box::pin(async move { Ok(cam.get_snapshot().await?) })
-            })
-            .await
+        match timeout(
+            WAKE_READ_TIMEOUT,
+            instance
+                .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_snapshot().await?) })),
+        )
+        .await
         {
-            Ok(jpeg) => {
+            Ok(Ok(jpeg)) => {
                 if let Err(e) = state.save_snapshot(&jpeg) {
                     log::warn!("{name}: could not save the snapshot: {e:?}");
                 }
                 done.snapshot = true;
             }
-            // Camera does not respond to or support SNAP — stop trying every wake
-            Err(ref e)
-                if matches!(
-                    e.downcast_ref::<neolink_core::Error>(),
-                    Some(neolink_core::Error::CameraServiceUnavailable { .. })
-                )
-                    || e.to_string().contains("no result within") =>
-            {
+            // Any failure (timeout, error, unsupported) — stop trying every wake
+            Ok(Err(e)) => {
                 done.snapshot = true;
-                done.failed(name, "snapshot", e);
+                done.failed(name, "snapshot", &e);
             }
-            Err(e) => done.failed(name, "snapshot", &e),
+            Err(_) => {
+                done.snapshot = true;
+                done.failed(
+                    name,
+                    "snapshot",
+                    &anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}"),
+                );
+            }
         }
     }
 
