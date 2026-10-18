@@ -627,42 +627,36 @@ async fn wake_reads(
     }
 
     // One snapshot per wake, for the snapshot endpoint and the CLI (SPEC P5).
-    // Skipped once saved successfully or once the camera has permanently refused SNAP
-    // (CameraServiceUnavailable), to avoid retrying a command the camera doesn't support.
+    // Skipped once saved successfully or once the camera has permanently refused SNAP.
+    // Uses run_task_for (with a permit) rather than run_passive_task: some cameras
+    // (e.g. Argus PT Ultra) ignore SNAP when sent passively but answer it when a permit
+    // holds the connection open. The camera is already awake at this point, so holding
+    // the permit does not extend or cause a wake.
     if !done.snapshot {
-        match timeout(
-            WAKE_READ_TIMEOUT,
-            instance
-                .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_snapshot().await?) })),
-        )
-        .await
+        match instance
+            .run_task_for("wake_reads:snapshot", |cam| {
+                Box::pin(async move { Ok(cam.get_snapshot().await?) })
+            })
+            .await
         {
-            Ok(Ok(jpeg)) => {
+            Ok(jpeg) => {
                 if let Err(e) = state.save_snapshot(&jpeg) {
                     log::warn!("{name}: could not save the snapshot: {e:?}");
                 }
                 done.snapshot = true;
             }
             // Camera does not respond to or support SNAP — stop trying every wake
-            Err(_timeout) => {
-                done.snapshot = true;
-                done.failed(
-                    name,
-                    "snapshot",
-                    &anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}"),
-                );
-            }
-            Ok(Err(ref e))
+            Err(ref e)
                 if matches!(
                     e.downcast_ref::<neolink_core::Error>(),
                     Some(neolink_core::Error::CameraServiceUnavailable { .. })
-                ) =>
+                )
+                    || e.to_string().contains("no result within") =>
             {
-                // Camera explicitly refused SNAP; stop trying
                 done.snapshot = true;
                 done.failed(name, "snapshot", e);
             }
-            Ok(Err(e)) => done.failed(name, "snapshot", &e),
+            Err(e) => done.failed(name, "snapshot", &e),
         }
     }
 
