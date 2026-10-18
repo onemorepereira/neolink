@@ -57,6 +57,8 @@ mod rtsp_cmd;
 mod rtsp_native;
 mod services;
 mod snapshot;
+#[cfg(feature = "native-snapshot")]
+mod snap_stream;
 mod statusled;
 #[cfg(feature = "gstreamer")]
 mod talk;

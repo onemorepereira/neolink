@@ -627,35 +627,67 @@ async fn wake_reads(
     }
 
     // One snapshot per wake, for the snapshot endpoint and the CLI (SPEC P5).
-    // Skipped once saved successfully or once the camera has permanently refused or
-    // ignored SNAP (any error or timeout), to avoid retrying on every wake.
+    // First tries MSG_ID_SNAP (fast, passive). Cameras that don't support it
+    // (e.g. Argus PT Ultra) get a second attempt via stream decode when the
+    // native-snapshot feature is enabled. Either way, done.snapshot is set
+    // on the first failure so we stop retrying on subsequent wakes.
     if !done.snapshot {
-        match timeout(
+        let snap_result = timeout(
             WAKE_READ_TIMEOUT,
             instance
                 .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_snapshot().await?) })),
         )
-        .await
-        {
-            Ok(Ok(jpeg)) => {
-                if let Err(e) = state.save_snapshot(&jpeg) {
-                    log::warn!("{name}: could not save the snapshot: {e:?}");
-                }
-                done.snapshot = true;
-            }
-            // Any failure (timeout, error, unsupported) — stop trying every wake
+        .await;
+
+        // Capture the failure reason before snap_result is consumed
+        let snap_fail: Option<anyhow::Error> = match &snap_result {
+            Ok(Ok(_)) => None,
             Ok(Err(e)) => {
-                done.snapshot = true;
-                done.failed(name, "snapshot", &e);
+                log::debug!("{name}: MSG_ID_SNAP failed ({e:#}); trying stream fallback");
+                Some(anyhow::anyhow!("{e:#}"))
             }
             Err(_) => {
-                done.snapshot = true;
-                done.failed(
-                    name,
-                    "snapshot",
-                    &anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}"),
-                );
+                log::debug!("{name}: MSG_ID_SNAP timed out; trying stream fallback");
+                Some(anyhow::anyhow!("timed out after {WAKE_READ_TIMEOUT:?}"))
             }
+        };
+
+        let jpeg = match snap_result {
+            Ok(Ok(jpeg)) => Some(jpeg),
+            _ => None,
+        };
+
+        // Stream-based fallback for cameras that don't support MSG_ID_SNAP
+        #[cfg(feature = "native-snapshot")]
+        let jpeg = if jpeg.is_none() {
+            match crate::snap_stream::snapshot_from_stream(instance).await {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    done.failed(name, "snapshot", &e);
+                    None
+                }
+            }
+        } else {
+            jpeg
+        };
+
+        // Without native-snapshot: report the original failure
+        #[cfg(not(feature = "native-snapshot"))]
+        if let Some(ref e) = snap_fail {
+            done.failed(name, "snapshot", e);
+        }
+
+        // Suppress unused-variable warning when native-snapshot is on
+        #[cfg(feature = "native-snapshot")]
+        let _ = snap_fail;
+
+        if let Some(jpeg) = jpeg {
+            if let Err(e) = state.save_snapshot(&jpeg) {
+                log::warn!("{name}: could not save the snapshot: {e:?}");
+            }
+            done.snapshot = true;
+        } else {
+            done.snapshot = true;
         }
     }
 

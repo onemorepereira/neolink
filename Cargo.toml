@@ -52,6 +52,9 @@ axum = { version = "0.7", features = ["json"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.8.0", features = ["v4"] }
 validator = {version="0.20.0", features = ["derive"] }
+rusty_h264-decoder = { version = "0.16.1", optional = true, default-features = false, features = ["std", "libm"] }
+rusty_h265 = { version = "0.6.2", optional = true }
+jpeg-encoder = { version = "0.7.1", optional = true }
 
 [dev-dependencies]
 neolink_core = { path = "crates/core", version = "0.6.3-rc.3", features = ["test-util"] }
@@ -85,6 +88,10 @@ pushnoti = [
 ]
 # HTTP configuration API (open, no auth; exposure controlled at the k3s layer)
 api = ["dep:reqwest"]
+# Pure-Rust stream-based snapshot for cameras that do not support MSG_ID_SNAP
+# (e.g. Argus PT Ultra). Adds H.264/H.265 decode + JPEG encode via pure-Rust
+# crates; no GStreamer, no FFI, stays FROM-scratch compatible.
+native-snapshot = ["dep:rusty_h264-decoder", "dep:rusty_h265", "dep:jpeg-encoder"]
 
 [profile.release]
 # Smaller binaries (PLAN 1.8)
